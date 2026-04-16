@@ -10,6 +10,6 @@ crossterm = "0.28"   # v3.0+
 md5       = "0.7"
 rayon     = "1.8"
 ratatui   = "0.28"   # v3.0+
-rusqlite  = "0.30"
+rusqlite  = { version = "0.30", features = ["bundled"] }
 structopt = "0.3"
 walkdir   = "2.4"
