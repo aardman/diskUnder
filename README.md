@@ -279,7 +279,10 @@ edit the variable at the top of the script before use.
 diskUnder/
 ├── src/main.rs        # Active Cargo source — currently diskUnder3.rust
 ├── diskUnder3.rust    # Rust v3 — TUI with live progress (primary)
-├── diskunder3         # Compiled macOS ARM64 binary — rebuild if needed (see below)
+├── diskunder-macos    # Compiled macOS binary
+├── diskunder-linux    # Compiled Linux x86_64 binary (statically linked, musl)
+├── Makefile           # Build targets: make, make mac, make linux, make clean
+├── .cargo/config.toml # Cargo cross-compilation config (musl linker)
 ├── Cargo.toml         # Rust project config
 ├── Cargo.lock         # Locked dependency versions — ensures reproducible builds
 ├── setupDB.sh         # Utility: initialise a single-directory database manually
@@ -300,12 +303,21 @@ diskUnder/
 > **Note:** `fileindex.db` is excluded from version control (`.gitignore`) as it contains
 > indexed file paths from your environment. Each user generates their own on first run.
 
-### Rebuilding the binary
+### Building the binaries
 
-`diskunder3` is compiled for macOS ARM64. If you are on a different architecture or OS,
-rebuild from source:
+Pre-built binaries are included for macOS and Linux x86_64. To rebuild:
 
 ```bash
-cargo build --release
-cp target/release/diskunder diskunder3
+make        # builds both diskunder-macos and diskunder-linux
+make mac    # macOS only
+make linux  # Linux only
+make clean  # remove build artifacts and binaries
 ```
+
+**Prerequisites for Linux cross-compilation (macOS host):**
+```bash
+brew install FiloSottile/musl-cross/musl-cross
+rustup target add x86_64-unknown-linux-musl
+```
+
+The Linux binary is statically linked against musl libc — no system dependencies required on the target machine.
