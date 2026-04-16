@@ -30,6 +30,29 @@ diskunder report /nas --cost 0.023          # apply a $/GB/month rate for cost o
 diskunder report /nas --by-directory        # top directories by total size
 ```
 
+#### Duplicate filtering and savings summary
+
+The `--duplicates` report should support filters so large shares don't drown output
+in thousands of trivial matches:
+
+```
+diskunder report /nas --duplicates --min-size 100MB
+diskunder report /nas --duplicates --min-size 1GB --min-copies 3
+diskunder report /nas --duplicates --extension iso,dmg,vhd
+diskunder report /nas --duplicates --min-wasted 500MB   # filter by total wasted per group
+```
+
+Every duplicate report should close with a savings summary:
+
+```
+Duplicate groups found : 47
+Files that are copies  : 183
+Total wasted space     : 142.3 GB
+Reclaimable (1 copy)   : 142.3 GB
+Reclaimable (quarantine): 142.3 GB  ← what dedupe would free
+Storage cost saving    : $3.27/month  (at $0.023/GB/month)
+```
+
 ### `export` subcommand
 Makes the index consumable by BI tools (Tableau, Power BI, Excel) and AI pipelines.
 
@@ -72,6 +95,194 @@ groups, directory trees, and search results without dropping to a SQL prompt.
 ```
 diskunder browse /nas
 ```
+
+---
+
+## Safe deletion
+
+Deletion is the most dangerous operation the tool could perform, especially on a network
+share where mistakes are hard to reverse. All deletion features should be off by default
+and require an explicit flag or confirmation step. The options below are roughly ordered
+from safest to most aggressive.
+
+### Dry run — always available, never touches files
+
+```
+diskunder dedupe /nas --dry-run
+diskunder dedupe /nas --min-size 500MB --dry-run
+```
+
+Shows exactly which copy would be kept, which would be removed, and the total space
+reclaimed — without touching anything. Should arguably be required before any real action
+is allowed.
+
+### Duplicate filtering for targeted deletion
+
+Avoid acting on trivial matches by filtering before any deletion step:
+
+```
+diskunder dedupe /nas --min-size 100MB          # ignore duplicates smaller than 100 MB
+diskunder dedupe /nas --min-copies 3            # only act on files with 3+ copies
+diskunder dedupe /nas --min-wasted 500MB        # only groups wasting more than 500 MB total
+diskunder dedupe /nas --extension iso,dmg,vhd   # restrict to specific file types
+diskunder dedupe /nas --path /nas/backup        # only remove copies under this path
+```
+
+Filters compose — e.g. `--min-size 1GB --min-copies 3 --path /nas/backup` targets only
+large, heavily duplicated files whose redundant copies live under the backup path.
+
+### Default action: quarantine folder
+
+Move duplicates to a dated staging directory rather than deleting in-place. All three
+paths still appear in the DB (tagged `quarantined`) so the quarantine can be reversed.
+
+```
+diskunder dedupe /nas --min-size 500MB
+# default action: quarantine
+
+# Staged copies land at:
+/nas/.diskunder_trash/2026-04-16/nas/backup/video.mp4
+/nas/.diskunder_trash/2026-04-16/nas/temp/video.mp4
+
+# Purge after a grace period (irreversible):
+diskunder purge --older-than 7d
+diskunder purge --older-than 7d --dry-run    # preview first
+```
+
+### Rename to `.bak` (lighter alternative to quarantine)
+
+Renames the redundant copy in-place — no files move, no space is reclaimed, but the
+original name is freed and the data is safe.
+
+```
+diskunder dedupe /nas --min-size 500MB --action bak
+# /nas/backup/video.mp4  →  /nas/backup/video.mp4.bak
+```
+
+Useful when the goal is to free a filename rather than reclaim space.
+
+### Deletion manifest
+
+Written before any file is touched, regardless of action chosen. Records the original
+path, destination (for quarantine/bak), and checksum so the operation can be audited
+or reversed.
+
+```
+# diskunder deletion manifest — 2026-04-16 10:32:01
+# Restore with: diskunder restore --manifest manifest-2026-04-16.log
+QUARANTINE  /nas/backup/video.mp4  →  /nas/.diskunder_trash/2026-04-16/...  blake3:9df4c2…
+QUARANTINE  /nas/temp/video.mp4    →  /nas/.diskunder_trash/2026-04-16/...  blake3:9df4c2…
+```
+
+### Permanent delete — explicit opt-in only
+
+```
+diskunder dedupe /nas --min-size 500MB --action delete
+```
+
+Requires an additional `--confirm` flag (or interactive prompt) on top of `--action delete`.
+Never the default. Always writes a manifest first.
+
+### Reflinks (copy-on-write clones) — best option for BTRFS / ZFS / APFS
+
+A reflink creates a new file that shares the underlying data blocks with the original.
+Both files appear full-size in `ls` but occupy almost no extra disk space. Unlike a hard
+link, the two files are completely independent — writing to one only duplicates the
+changed blocks (copy-on-write), so editing or deleting one has no effect on the other.
+This makes reflinks safer and more flexible than hard links for deduplication.
+
+```
+diskunder dedupe /nas --action reflink
+```
+
+**Filesystem support:**
+| Filesystem | Support | Mechanism |
+|---|---|---|
+| XFS | Yes (kernel 4.16, 2018) | `FICLONE` ioctl |
+| BTRFS | Yes (stable) | `FICLONE` ioctl |
+| ZFS / OpenZFS 2.2+ | Yes (2023+) | `FICLONE` ioctl |
+| APFS (macOS) | Yes | `clonefile()` syscall |
+| ext4, NTFS, FAT | No | Falls back to regular copy |
+
+XFS is the default filesystem on RHEL, Rocky, and most enterprise Linux distributions,
+so reflink support is available on the majority of production Linux file servers without
+any filesystem migration.
+
+**Over Samba — partially viable:**
+SMB3 has a protocol-level equivalent (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`, also called
+server-side copy / ODX). Samba 4.x exposes this when the server filesystem supports
+reflinks — configured with `vfs objects = btrfs` in `smb.conf`. With this in place,
+the reflink operation happens entirely on the server; the data never travels over the
+network. macOS Finder already uses this transparently when copying files on compatible
+SMB3 shares. Requires the Samba server to be explicitly configured — most default
+installations won't have it enabled.
+
+**Implementation:**
+The `reflink-copy` Rust crate handles all platforms with graceful fallback:
+```toml
+reflink-copy = "0.1"
+```
+Tries `FICLONE` on Linux, `clonefile()` on macOS, and falls back to a regular file
+copy if the filesystem doesn't support reflinks — meaning the same code path works
+everywhere without crashing.
+
+---
+
+### Hard links — lossless space reclaim (local filesystem only)
+
+Replace redundant copies with hard links to a single on-disk inode. All paths continue
+to work; only one copy exists on disk. No data is ever at risk.
+
+```
+diskunder dedupe /nas --action hardlink
+```
+
+**Limitations:**
+- Only works within the same filesystem/volume — won't help across different shares or
+  mount points.
+- **Will not work over Samba/SMB.** Hard links are a filesystem-level operation; the SMB
+  protocol does not reliably expose them to network clients. macOS's SMB client returns
+  `Operation not supported` for hard link calls on network mounts. Linux CIFS mounts can
+  support them only if the server has `unix extensions = yes` in `smb.conf`, which most
+  corporate Samba configurations disable for Windows client compatibility.
+- **Only viable if diskunder runs directly on the server** — i.e. as a native binary or
+  package on the NAS itself (e.g. Synology, QNAP), bypassing SMB and operating on the
+  local filesystem directly. In that case, hard links work normally on ext4, XFS, Btrfs,
+  and ZFS.
+
+### TUI selection — choose which copy to keep interactively
+
+Rather than auto-deciding based on rules, surface each duplicate group in the browser TUI
+and let the user pick:
+
+```
+┌─ Duplicate group — 1.6 GB × 3 copies ──────────────────────────────┐
+│                                                                      │
+│  [KEEP]   /nas/projects/2024/final/render.mov   modified 2024-11-01 │
+│  [REMOVE] /nas/backup/render.mov                modified 2023-06-14 │
+│  [REMOVE] /nas/temp/render.mov                  modified 2023-06-14 │
+│                                                                      │
+│  Space reclaimed: 3.2 GB     Action: quarantine                     │
+│                                                                      │
+│  [↑↓] navigate  [Space] toggle  [K] keep all  [A] action  [Enter] apply │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Space to toggle keep/remove per file. `[A]` cycles through quarantine / bak / delete /
+hardlink. `[Enter]` applies to this group and advances to the next.
+
+### Summary of deletion options
+
+| Option | Space reclaimed | Reversible | Notes |
+|---|---|---|---|
+| `--dry-run` | No | — | Should always be available |
+| `--action bak` | No | Yes — rename back | Simple, in-place |
+| `--action quarantine` *(default)* | After `purge` | Yes — restore command | Best default |
+| `--action reflink` | Yes, immediately | No | BTRFS/ZFS/APFS; partial SMB3 support |
+| `--action hardlink` | Yes, immediately | No | Local filesystem only — not over SMB |
+| `--action delete` | Yes, immediately | No | Requires `--confirm` |
+| Manifest | — | Enables restore | Written before any action |
+| TUI selection | Depends | Depends on action | Best UX for interactive use |
 
 ---
 
@@ -127,3 +338,6 @@ Some features above would benefit from schema changes. Notes for when that work 
 - `enriched_at` column — timestamp of last metadata enrichment pass
 - Separate `rules` table — stores rule definitions for the automation engine
 - Separate `tags` table — normalised tag storage if tag querying becomes important
+- `status` column — `active` / `quarantined` / `deleted`; updated by dedupe actions so
+  reports can exclude already-handled files
+- Separate `manifests` table — records every dedupe action for audit and restore support
