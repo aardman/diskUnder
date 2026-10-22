@@ -28,6 +28,8 @@ See [changes.md](changes.md) for a detailed change log and [future.md](future.md
 diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 checksum), and writes it to a SQLite database. Multiple paths can be indexed into the same database — each path gets its own table named `files_<MD5(path)>`, where `path` is the canonical (absolute, symlink-resolved) root. `/nas`, `/nas/`, `./nas` and a symlink to it all share one table, and stored paths are always absolute.
 
 > **Upgrading from v3:** v3 named tables after the path exactly as typed, and stored paths in that spelling (relative if you typed a relative path). The first v4 run with the **same spelling you used before** migrates that table in place — paths are rewritten to absolute and the table renamed — so nothing is re-hashed. If you used several spellings for one directory, only the first one migrated is kept; the others are left untouched.
+>
+> The `change_date` column is also renamed to `birth_date` on first use (it always held the file's creation time). Update any queries or scripts that select `change_date`.
 
 Two modes are supported:
 
@@ -44,7 +46,7 @@ CREATE TABLE files_<MD5_HASH> (
     size          INTEGER NOT NULL,
     modified_date TEXT,
     access_date   TEXT,
-    change_date   TEXT,       -- file birth time where supported, else empty
+    birth_date    TEXT,       -- creation time where the filesystem records one, else empty
     checksum      TEXT,       -- BLAKE3
     extension     TEXT,
     directory     TEXT,

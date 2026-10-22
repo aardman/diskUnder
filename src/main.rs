@@ -332,7 +332,7 @@ struct FileEntry {
     size: u64,
     modified_date: String,
     access_date: String,
-    change_date: String,
+    birth_date: String,
     checksum: String,
     extension: String,
     directory: String,
@@ -360,7 +360,7 @@ impl FileEntry {
                 .ok()
                 .map(fmt_time)
                 .unwrap_or_default(),
-            change_date: metadata
+            birth_date: metadata
                 .created()
                 .ok()
                 .map(fmt_time)
@@ -489,7 +489,7 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
                 size          INTEGER NOT NULL,
                 modified_date TEXT,
                 access_date   TEXT,
-                change_date   TEXT,
+                birth_date    TEXT,       -- creation time where the filesystem has one
                 checksum      TEXT,
                 extension     TEXT,
                 directory     TEXT,
@@ -499,6 +499,19 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
         ),
         [],
     )?;
+    // Before v4 this column was called change_date, but it has always held the birth
+    // (creation) time, not the inode change time. Rename in place; no data is rewritten.
+    let has_old_column: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = 'change_date')", t = table_name),
+        [],
+        |row| row.get(0),
+    )?;
+    if has_old_column {
+        conn.execute(
+            &format!("ALTER TABLE {t} RENAME COLUMN change_date TO birth_date", t = table_name),
+            [],
+        )?;
+    }
     conn.execute(
         &format!(
             "CREATE INDEX IF NOT EXISTS idx_{t}_path ON {t}(path)",
@@ -559,11 +572,11 @@ fn create_indexes(conn: &Connection, t: &str) -> DbResult<()> {
 fn commit_batch(conn: &mut Connection, t: &str, batch: &[FileEntry], upsert: bool) -> DbResult<usize> {
     let sql = if upsert {
         format!(
-            "INSERT INTO {t} (path,filename,size,modified_date,access_date,change_date,checksum,extension,directory)
+            "INSERT INTO {t} (path,filename,size,modified_date,access_date,birth_date,checksum,extension,directory)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(path) DO UPDATE SET
                size=excluded.size, modified_date=excluded.modified_date,
-               access_date=excluded.access_date, change_date=excluded.change_date,
+               access_date=excluded.access_date, birth_date=excluded.birth_date,
                checksum=excluded.checksum, extension=excluded.extension,
                directory=excluded.directory",
             t = t
@@ -571,7 +584,7 @@ fn commit_batch(conn: &mut Connection, t: &str, batch: &[FileEntry], upsert: boo
     } else {
         format!(
             "INSERT OR IGNORE INTO {t}
-             (path,filename,size,modified_date,access_date,change_date,checksum,extension,directory)
+             (path,filename,size,modified_date,access_date,birth_date,checksum,extension,directory)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             t = t
         )
@@ -583,7 +596,7 @@ fn commit_batch(conn: &mut Connection, t: &str, batch: &[FileEntry], upsert: boo
         count += tx.execute(
             &sql,
             params![e.path, e.filename, e.size, e.modified_date, e.access_date,
-                    e.change_date, e.checksum, e.extension, e.directory],
+                    e.birth_date, e.checksum, e.extension, e.directory],
         )?;
     }
     tx.commit()?;

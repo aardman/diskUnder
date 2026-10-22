@@ -97,6 +97,15 @@ reported none.
 stored checksum to duplicate detection, so the live panel and totals cover every file in the
 table that is still on disk. Rows for files no longer on disk are not counted.
 
+### `change_date` column renamed to `birth_date`
+
+**Previous behaviour:** The `change_date` column was filled from `metadata.created()` — the
+file's birth (creation) time — not the inode change time (`ctime`) its name suggests.
+
+**Fix:** The column is now `birth_date`. Existing tables are renamed in place on their next run
+(`ALTER TABLE … RENAME COLUMN`, no data rewritten, values kept). Queries that select
+`change_date` need updating. `setupDB.sh` uses the new name too.
+
 ### Plain mode prints traversal and database warnings
 
 Plain mode previously printed no warnings at all, so a failure showed only as an error count.

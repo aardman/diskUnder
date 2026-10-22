@@ -11,7 +11,7 @@ CREATE TABLE files (
    size INTEGER NOT NULL,
    modified_date TEXT NOT NULL,
    access_date TEXT NOT NULL, 
-   change_date TEXT NOT NULL,
+   birth_date TEXT,
    checksum TEXT NOT NULL,
    extension TEXT,
    directory TEXT,
