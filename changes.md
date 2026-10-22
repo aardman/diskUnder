@@ -1,5 +1,38 @@
 # diskUnder — Change Log
 
+## v4.1 — database maintenance
+
+### `roots` table: which table is which
+
+Table names are an MD5 of the indexed path and the path itself wasn't stored anywhere, so with
+several shares in one database there was no way to tell tables apart, see when each was last
+updated, or spot leftover tables. A `roots` table now records, per table, the canonical path,
+first run, last run start and finish, and mode. It's written at the start and end of every run,
+so a run that was interrupted is visible (`last_finished` is NULL). Existing tables are
+recorded on their next run.
+
+### `diskunder db` subcommands
+
+- `db info` — every indexed path with file count and size, duplicate groups and wasted space
+  (hard-link aware, computed from the whole table), last and first run in local time, and the
+  table's size on disk. Tables with no recorded path (from before v4.1, or leftover v3
+  spellings) are listed with the command to remove them.
+- `db drop <PATH>` / `db drop --table <NAME>` — remove a path's index. Works for paths that no
+  longer exist. Asks for confirmation; refuses without `--yes` when not run from a terminal.
+- `db vacuum` — compact the file after rows or tables are removed (reports before → after).
+- `db check` — `PRAGMA integrity_check` (exit code 2 on problems), plus tables with no
+  recorded path and recorded paths whose table is missing.
+
+None of them create a database if the `--db` path doesn't exist. Eight new tests cover them
+(29 in total).
+
+### Version shown in the TUI comes from Cargo.toml
+
+The TUI header now reads its version from the crate version (`0.4.1` → `v4.1`) instead of a
+hard-coded string.
+
+---
+
 ## v4.0 — fixes
 
 Resumability, change detection and performance fixes on top of v3.0. No new features.
@@ -138,6 +171,12 @@ argument parsing. Run with `cargo test`.
 derive API. Commands, flags and defaults are unchanged, and global flags still work before or
 after the subcommand. `--version` now works, and `--help` describes the `PATH` argument. This
 also drops `atty`, an unmaintained dependency of `structopt` with a known advisory.
+
+### `setupDB.sh` removed
+
+It created a single static `files` table that diskunder never uses — the tool creates its own
+per-path tables on first run — so it suggested a setup step that doesn't exist. The README now
+has an Install section instead.
 
 ### Plain mode prints traversal and database warnings
 

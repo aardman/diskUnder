@@ -645,3 +645,193 @@ fn bad_arguments_are_rejected() {
         assert!(text.contains(word), "--help mentions {}:\n{}", word, text);
     }
 }
+
+// ─── Database maintenance (`db` subcommand, roots table) ─────────────────────
+
+struct DbRun {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs `diskunder db …` with stdin closed (i.e. not interactive)
+fn db_cmd(cwd: &Path, args: &[&str]) -> DbRun {
+    let out = Command::new(BIN)
+        .arg("db")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    DbRun {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn every_run_is_recorded_in_roots() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    distinct_files(&data, 3);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data/", "--db", db_s]);
+
+    let t = table_for(&data);
+    let conn = Connection::open(&db).unwrap();
+    let (root, mode, finished): (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT root, last_mode, last_finished FROM roots WHERE table_name = ?1",
+            [&t],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(root, data.to_string_lossy(), "canonical path recorded, not the spelling typed");
+    assert_eq!(mode, "index");
+    assert!(finished.is_some());
+
+    conn.execute("UPDATE roots SET first_run = '2020-01-01 00:00:00'", []).unwrap();
+    run_in(tmp.path(), &["update", "data", "--db", db_s]);
+    let (first, mode): (String, String) = conn
+        .query_row("SELECT first_run, last_mode FROM roots WHERE table_name = ?1", [&t], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((first.as_str(), mode.as_str()), ("2020-01-01 00:00:00", "update"));
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM roots"), 1);
+}
+
+#[test]
+fn db_info_lists_each_path_with_duplicates() {
+    let tmp = TempDir::new();
+    let (photos, docs) = (tmp.path().join("photos"), tmp.path().join("docs"));
+    write(&photos.join("a"), &"a".repeat(300));
+    write(&photos.join("a_copy"), &"a".repeat(300));
+    write(&photos.join("b"), &"b".repeat(500));
+    fs::hard_link(photos.join("b"), photos.join("b_link")).unwrap();
+    distinct_files(&docs, 1200);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "photos", "--db", db_s]);
+    run_in(tmp.path(), &["index", "docs", "--db", db_s]);
+
+    let info = db_cmd(tmp.path(), &["info", "--db", db_s]);
+    assert_eq!(info.code, 0, "{}", info.stderr);
+    let out = &info.stdout;
+    let (p, d) = (out.find(&*photos.to_string_lossy()).unwrap(), out.find(&*docs.to_string_lossy()).unwrap());
+    assert!(d < p, "paths listed alphabetically");
+    assert!(out.contains("files       4 (1.6 KB)"), "{}", out);
+    assert!(out.contains("1 group, 300 B wasted"), "hard link not counted:\n{}", out);
+    assert!(out.contains("files       1,200 ("), "{}", out);
+    assert!(out.contains("last run    index at "), "{}", out);
+}
+
+#[test]
+fn db_info_handles_tables_with_no_recorded_path() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    write(&data.join("a"), "aaa\n");
+    let db = tmp.path().join("t.db");
+    let legacy = create_v3_table(&db, "data/", &[("data/a", "sum-a")]);
+
+    let info = db_cmd(tmp.path(), &["info", "--db", db.to_str().unwrap()]);
+    assert_eq!(info.code, 0, "{}", info.stderr);
+    assert!(info.stdout.contains("(no recorded path)"), "{}", info.stdout);
+    assert!(info.stdout.contains(&format!("db drop --table {}", legacy)), "{}", info.stdout);
+
+    let check = db_cmd(tmp.path(), &["check", "--db", db.to_str().unwrap()]);
+    assert_eq!(check.code, 0);
+    assert!(check.stdout.contains("integrity: ok"));
+    assert!(check.stdout.contains(&legacy), "{}", check.stdout);
+}
+
+#[test]
+fn db_info_flags_runs_that_did_not_finish() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 2);
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "data", "--db", db.to_str().unwrap()]);
+    Connection::open(&db).unwrap().execute("UPDATE roots SET last_finished = NULL", []).unwrap();
+
+    let info = db_cmd(tmp.path(), &["info", "--db", db.to_str().unwrap()]);
+    assert!(info.stdout.contains("did not finish"), "{}", info.stdout);
+}
+
+#[test]
+fn db_drop_needs_confirmation_unless_yes() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    distinct_files(&data, 3);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s]);
+    let t = table_for(&data);
+
+    let refused = db_cmd(tmp.path(), &["drop", "data", "--db", db_s]);
+    assert_eq!(refused.code, 1);
+    assert!(refused.stderr.contains("--yes"), "{}", refused.stderr);
+    assert_eq!(tables(&db), vec![t.clone()]);
+
+    let dropped = db_cmd(tmp.path(), &["drop", "data", "--yes", "--db", db_s]);
+    assert_eq!(dropped.code, 0, "{}", dropped.stderr);
+    assert!(dropped.stdout.contains("(3 files)"), "{}", dropped.stdout);
+    assert!(tables(&db).is_empty());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM roots"), 0);
+}
+
+#[test]
+fn db_drop_finds_paths_that_no_longer_exist_and_tables_by_name() {
+    let tmp = TempDir::new();
+    let (gone, legacy_dir) = (tmp.path().join("gone"), tmp.path().join("old"));
+    distinct_files(&gone, 2);
+    write(&legacy_dir.join("a"), "aaa\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "gone", "--db", db_s]);
+    let legacy = create_v3_table(&db, "old/", &[("old/a", "sum-a")]);
+    fs::remove_dir_all(&gone).unwrap();
+
+    let by_path = db_cmd(tmp.path(), &["drop", "gone/", "--yes", "--db", db_s]);
+    assert_eq!(by_path.code, 0, "{}", by_path.stderr);
+    let by_name = db_cmd(tmp.path(), &["drop", "--table", &legacy, "--yes", "--db", db_s]);
+    assert_eq!(by_name.code, 0, "{}", by_name.stderr);
+    assert!(tables(&db).is_empty());
+
+    let unknown = db_cmd(tmp.path(), &["drop", "nowhere", "--yes", "--db", db_s]);
+    assert_eq!(unknown.code, 1);
+    assert!(unknown.stderr.contains("no index for"), "{}", unknown.stderr);
+    let not_a_table = db_cmd(tmp.path(), &["drop", "--table", "roots", "--yes", "--db", db_s]);
+    assert_eq!(not_a_table.code, 1, "only files_* tables can be dropped");
+}
+
+#[test]
+fn db_vacuum_shrinks_the_file_after_a_drop() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("big"), 3000);
+    distinct_files(&tmp.path().join("small"), 2);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "big", "--db", db_s]);
+    run_in(tmp.path(), &["index", "small", "--db", db_s]);
+    db_cmd(tmp.path(), &["drop", "big", "--yes", "--db", db_s]);
+
+    let size = || fs::metadata(&db).unwrap().len() + fs::metadata(format!("{}-wal", db_s)).map(|m| m.len()).unwrap_or(0);
+    let before = size();
+    let vacuum = db_cmd(tmp.path(), &["vacuum", "--db", db_s]);
+    assert_eq!(vacuum.code, 0, "{}", vacuum.stderr);
+    assert!(size() < before / 4, "{} → {}", before, size());
+    assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {}", table_for(&tmp.path().join("small")))), 2);
+}
+
+#[test]
+fn db_commands_never_create_a_database() {
+    let tmp = TempDir::new();
+    for action in ["info", "vacuum", "check"] {
+        let r = db_cmd(tmp.path(), &[action, "--db", "missing.db"]);
+        assert_eq!(r.code, 1, "{}", action);
+        assert!(r.stderr.contains("no database at"), "{}", r.stderr);
+    }
+    assert!(!tmp.path().join("missing.db").exists());
+}

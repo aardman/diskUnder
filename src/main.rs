@@ -1,4 +1,4 @@
-// diskUnder v4.0 — TUI progress and live duplicate results
+// diskUnder v4 — TUI progress, live duplicate results and database maintenance
 // See changes.md for full change history
 //
 // Additional entries required in Cargo.toml [dependencies]:
@@ -73,6 +73,38 @@ enum Command {
         /// Directory to update
         path: String,
     },
+    /// Inspect and maintain the index database
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbAction {
+    /// List indexed paths with file counts, duplicates, size and last run
+    Info,
+    /// Remove the index for a path (asks for confirmation)
+    Drop {
+        /// Indexed path to remove, as listed by `db info`
+        #[arg(required_unless_present = "table")]
+        path: Option<String>,
+        /// Remove a table by name instead, e.g. one `db info` lists with no recorded path
+        #[arg(long, conflicts_with = "path")]
+        table: Option<String>,
+        /// Don't ask for confirmation (required when not run from a terminal)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Compact the database file after rows or tables have been removed
+    Vacuum,
+    /// Run SQLite's integrity check and report tables with no recorded path
+    Check,
+}
+
+/// "0.4.1" → "4.1": the project numbers releases v1, v2, … while the crate stays at 0.x
+fn display_version() -> &'static str {
+    env!("CARGO_PKG_VERSION").trim_start_matches("0.")
 }
 
 /// (device, inode) — identifies the underlying file, so hard links to the same data
@@ -594,6 +626,38 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
     Ok(table_name)
 }
 
+/// One row per indexed path: which table holds it and how its last run went. Table names
+/// are an MD5 of the path, so without this there's no way to tell which table is which.
+const ROOTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS roots (
+    table_name    TEXT PRIMARY KEY,
+    root          TEXT NOT NULL,
+    first_run     TEXT NOT NULL,   -- UTC, like the file dates
+    last_started  TEXT NOT NULL,
+    last_finished TEXT,            -- NULL while a run is in progress or if it was interrupted
+    last_mode     TEXT NOT NULL    -- index | update
+)";
+
+fn roots_run_started(conn: &Connection, table: &str, root: &str, mode: &str) -> DbResult<()> {
+    conn.execute(ROOTS_SCHEMA, [])?;
+    conn.execute(
+        "INSERT INTO roots (table_name, root, first_run, last_started, last_finished, last_mode)
+         VALUES (?1, ?2, datetime('now'), datetime('now'), NULL, ?3)
+         ON CONFLICT(table_name) DO UPDATE SET
+           root = excluded.root, last_started = excluded.last_started,
+           last_finished = NULL, last_mode = excluded.last_mode",
+        params![table, root, mode],
+    )?;
+    Ok(())
+}
+
+fn roots_run_finished(conn: &Connection, table: &str) -> DbResult<()> {
+    conn.execute(
+        "UPDATE roots SET last_finished = datetime('now') WHERE table_name = ?1",
+        [table],
+    )?;
+    Ok(())
+}
+
 struct Stored {
     size: u64,
     modified: String,
@@ -763,6 +827,13 @@ fn run_worker(
             return;
         }
     };
+    let mode = if upsert { "update" } else { "index" };
+    if let Err(e) = roots_run_started(&conn, &table_name, &path, mode) {
+        let _ = tx.send(WorkerMsg::Error {
+            context: "db".to_string(),
+            error: format!("could not record run in roots table: {}", e),
+        });
+    }
 
     // Files already in the table are not re-hashed: in index mode any existing path is
     // skipped (so an interrupted run resumes cheaply); in update mode a path is skipped
@@ -948,6 +1019,13 @@ fn run_worker(
         });
     }
 
+    if let Err(e) = roots_run_finished(&conn, &table_name) {
+        let _ = tx.send(WorkerMsg::Error {
+            context: "db".to_string(),
+            error: format!("could not record run in roots table: {}", e),
+        });
+    }
+
     let _ = tx.send(WorkerMsg::Done);
 }
 
@@ -1007,7 +1085,8 @@ fn draw(f: &mut Frame, state: &AppState) {
 
 fn draw_header(f: &mut Frame, state: &AppState, area: Rect) {
     let text = format!(
-        "  diskUnder v4.0   mode: {}   path: {}   db: {}   (q to quit)",
+        "  diskUnder v{}   mode: {}   path: {}   db: {}   (q to quit)",
+        display_version(),
         state.mode, state.target_path, state.db_path
     );
     let p = Paragraph::new(text)
@@ -1299,6 +1378,314 @@ fn run_ui(
     Ok(())
 }
 
+// ─── Database maintenance (`db` subcommand) ──────────────────────────────────
+
+/// 1234567 → "1,234,567"
+fn fmt_count(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{}", out) } else { out }
+}
+
+/// Stored UTC timestamp → local time for display
+fn fmt_local(utc: &str) -> String {
+    chrono::NaiveDateTime::parse_from_str(utc, "%Y-%m-%d %H:%M:%S")
+        .map(|t| {
+            t.and_utc()
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| utc.to_string())
+}
+
+fn file_tables(conn: &Connection) -> DbResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        r"SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'files\_%' ESCAPE '\' ORDER BY name",
+    )?;
+    let names = stmt.query_map([], |row| row.get(0))?.collect();
+    names
+}
+
+struct RootRow {
+    root: String,
+    first_run: String,
+    last_started: String,
+    last_finished: Option<String>,
+    last_mode: String,
+}
+
+/// table name → its roots row (empty if the roots table doesn't exist yet)
+fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>> {
+    if !table_exists(conn, "roots")? {
+        return Ok(HashMap::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT table_name, root, first_run, last_started, last_finished, last_mode FROM roots",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                RootRow {
+                    root: row.get(1)?,
+                    first_run: row.get(2)?,
+                    last_started: row.get(3)?,
+                    last_finished: row.get(4)?,
+                    last_mode: row.get(5)?,
+                },
+            ))
+        })?
+        .collect();
+    rows
+}
+
+/// (duplicate groups, wasted bytes) across every row in the table. Hard links (same
+/// device + inode) count as one copy; rows without an inode each count as their own copy.
+fn table_duplicates(conn: &Connection, t: &str) -> DbResult<(i64, i64)> {
+    // Tables v4 hasn't run against yet (e.g. left over from v3) have no inode column
+    let has_inode: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = 'inode')"),
+        [],
+        |row| row.get(0),
+    )?;
+    let copies = if has_inode {
+        "COUNT(DISTINCT CASE WHEN inode IS NOT NULL THEN device || ':' || inode END) + SUM(inode IS NULL)"
+    } else {
+        "COUNT(*)"
+    };
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(size * (copies - 1)), 0) FROM (
+                 SELECT MAX(size) AS size, {copies} AS copies
+                 FROM {t}
+                 WHERE size > 0 AND checksum IS NOT NULL AND checksum != ''
+                 GROUP BY checksum
+             ) WHERE copies > 1"
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+}
+
+/// Bytes on disk used by a table and its indexes, if SQLite's dbstat is available
+fn table_disk_bytes(conn: &Connection, t: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT SUM(pgsize) FROM dbstat
+         WHERE name = ?1 OR name IN (SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1)",
+        [t],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Main database file plus its WAL, in bytes
+fn db_file_bytes(db_path: &str) -> u64 {
+    let size = |p: &str| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    size(db_path) + size(&format!("{}-wal", db_path))
+}
+
+fn db_info(conn: &Connection, db_path: &str) -> DbResult<()> {
+    let tables = file_tables(conn)?;
+    let roots = load_roots(conn)?;
+    println!("database: {} — {} on disk", db_path, fmt_bytes(db_file_bytes(db_path)));
+    if tables.is_empty() {
+        println!("\nno indexed paths yet");
+    }
+
+    // Recorded paths first (alphabetical), then tables with no recorded path
+    let mut ordered: Vec<&String> = tables.iter().collect();
+    ordered.sort_by_key(|t| (roots.get(*t).is_none(), roots.get(*t).map(|r| r.root.clone())));
+
+    for t in ordered {
+        let (files, bytes): (i64, i64) = conn.query_row(
+            &format!("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM {t}"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (groups, wasted) = table_duplicates(conn, t)?;
+
+        println!();
+        match roots.get(t) {
+            Some(r) => println!("{}", r.root),
+            None => println!("(no recorded path)"),
+        }
+        println!("  files       {} ({})", fmt_count(files), fmt_bytes(bytes as u64));
+        println!(
+            "  duplicates  {} group{}, {} wasted",
+            fmt_count(groups),
+            if groups == 1 { "" } else { "s" },
+            fmt_bytes(wasted as u64)
+        );
+        match roots.get(t) {
+            Some(r) => {
+                let outcome = match &r.last_finished {
+                    Some(end) => format!("finished {}", fmt_local(end)),
+                    None => "did not finish (interrupted, or still running)".to_string(),
+                };
+                println!("  last run    {} at {}, {}", r.last_mode, fmt_local(&r.last_started), outcome);
+                println!("  first run   {}", fmt_local(&r.first_run));
+            }
+            None => println!(
+                "  note        from before v4.1, or a path spelled differently in v3 — runs of its\n              \
+                 path will record it; if unwanted, remove with `diskunder db drop --table {}`",
+                t
+            ),
+        }
+        match table_disk_bytes(conn, t) {
+            Some(b) => println!("  table       {} ({} with indexes)", t, fmt_bytes(b as u64)),
+            None => println!("  table       {}", t),
+        }
+    }
+    Ok(())
+}
+
+fn db_drop(conn: &Connection, path: Option<&str>, table: Option<&str>, yes: bool) -> Result<(), String> {
+    let db = |e: rusqlite::Error| e.to_string();
+    let roots = load_roots(conn).map_err(db)?;
+
+    let (t, label) = match (path, table) {
+        (_, Some(t)) => {
+            if !t.starts_with("files_") || !table_exists(conn, t).map_err(db)? {
+                return Err(format!("no index table named {}", t));
+            }
+            let label = roots.get(t).map(|r| r.root.clone()).unwrap_or_else(|| t.to_string());
+            (t.to_string(), label)
+        }
+        (Some(p), None) => {
+            // The path may no longer exist (e.g. a retired share): fall back to making it
+            // absolute without touching the filesystem
+            let root = fs::canonicalize(p)
+                .or_else(|_| std::path::absolute(p))
+                .map(|c| match c.to_string_lossy().trim_end_matches('/') {
+                    "" => "/".to_string(),
+                    trimmed => trimmed.to_string(),
+                })
+                .unwrap_or_else(|_| p.to_string());
+            let t = roots
+                .iter()
+                .find(|(_, r)| r.root == root)
+                .map(|(t, _)| t.clone())
+                .unwrap_or_else(|| table_name_for(&root));
+            if !table_exists(conn, &t).map_err(db)? {
+                return Err(format!("no index for {} — see `diskunder db info`", root));
+            }
+            (t, root)
+        }
+        (None, None) => unreachable!("clap requires a path or --table"),
+    };
+
+    let files: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |row| row.get(0))
+        .map_err(db)?;
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err("not running interactively — pass --yes to confirm".to_string());
+        }
+        eprint!("Remove the index of {} ({} files)? This can't be undone. [y/N] ", label, fmt_count(files));
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).map_err(|e| e.to_string())?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            return Err("cancelled".to_string());
+        }
+    }
+
+    conn.execute(&format!("DROP TABLE {t}"), []).map_err(db)?;
+    if table_exists(conn, "roots").map_err(db)? {
+        conn.execute("DELETE FROM roots WHERE table_name = ?1", [&t]).map_err(db)?;
+    }
+    println!("removed the index of {} ({} files)", label, fmt_count(files));
+    println!("run `diskunder db vacuum` to shrink the database file");
+    Ok(())
+}
+
+fn db_vacuum(conn: &Connection, db_path: &str) -> DbResult<()> {
+    let before = db_file_bytes(db_path);
+    conn.execute_batch("VACUUM;")?;
+    // Fold the WAL back in and truncate it, so the size reported is the real footprint
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    let after = db_file_bytes(db_path);
+    println!("vacuumed {}: {} → {}", db_path, fmt_bytes(before), fmt_bytes(after));
+    Ok(())
+}
+
+/// Returns false if SQLite reports corruption
+fn db_check(conn: &Connection) -> DbResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    let problems: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<DbResult<Vec<String>>>()?
+        .into_iter()
+        .filter(|line| line != "ok")
+        .collect();
+    if problems.is_empty() {
+        println!("integrity: ok");
+    } else {
+        println!("integrity: {} problem(s)", problems.len());
+        for p in &problems {
+            println!("  {}", p);
+        }
+    }
+
+    let tables = file_tables(conn)?;
+    let roots = load_roots(conn)?;
+    let unrecorded: Vec<&String> = tables.iter().filter(|t| !roots.contains_key(*t)).collect();
+    let missing: Vec<&String> = roots.keys().filter(|t| !tables.contains(t)).collect();
+    if !unrecorded.is_empty() {
+        println!("tables with no recorded path (see `diskunder db info`):");
+        for t in unrecorded {
+            println!("  {}", t);
+        }
+    }
+    if !missing.is_empty() {
+        println!("recorded paths whose table is missing:");
+        for t in missing {
+            println!("  {} ({})", roots[t].root, t);
+        }
+    }
+    Ok(problems.is_empty())
+}
+
+/// Runs a `db` action; returns the process exit code
+fn run_db_command(db_path: &str, action: &DbAction) -> i32 {
+    // Inspecting a database shouldn't create one
+    if !Path::new(db_path).exists() {
+        eprintln!("error: no database at {}", db_path);
+        return 1;
+    }
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {}: {}", db_path, e);
+            return 1;
+        }
+    };
+    let result = match action {
+        DbAction::Info => db_info(&conn, db_path).map_err(|e| e.to_string()),
+        DbAction::Drop { path, table, yes } => db_drop(&conn, path.as_deref(), table.as_deref(), *yes),
+        DbAction::Vacuum => db_vacuum(&conn, db_path).map_err(|e| e.to_string()),
+        DbAction::Check => match db_check(&conn) {
+            Ok(true) => Ok(()),
+            Ok(false) => return 2,
+            Err(e) => Err(e.to_string()),
+        },
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            1
+        }
+    }
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1307,6 +1694,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mode, typed) = match &args.cmd {
         Command::Index { path } => ("index", path.clone()),
         Command::Update { path } => ("update", path.clone()),
+        Command::Db { action } => std::process::exit(run_db_command(&args.db, action)),
     };
 
     // Absolute, symlink-free root, so every spelling of the same directory shares a table

@@ -93,6 +93,9 @@ interrupted), and the summary counts the tool already prints: found, skipped, wr
 removed, errors, duplicate groups and wasted bytes. `jobs show` lists recent runs, and
 `jobs list` shows the latest.
 
+**Builds on:** the `roots` table (v4.1) already records each path's first and last run and
+whether the last run finished — job history extends that with per-run rows and counts.
+
 **Where jobs live:** a job names its own index database (`--db`), so job definitions and
 history can't sit inside an index database. They belong in a small per-user database
 (e.g. `~/.config/diskunder/jobs.db`), overridable with `--jobs-db` or an environment
@@ -376,6 +379,8 @@ Would require an `ANTHROPIC_API_KEY` environment variable and the `anthropic` Ru
 
 Some features above would benefit from schema changes. Notes for when that work starts:
 
+- ~~Per-path run metadata~~ — done in v4.1 as the `roots` table (path, first/last run, mode,
+  whether the last run finished); `diskunder db info` reads it
 - `last_seen` column — timestamp of last successful index pass; enables true stale
   detection and orphan identification (files present in DB but not seen in latest scan)
 - `tags` column — free-text or JSON array; supports the rules engine and manual flagging
