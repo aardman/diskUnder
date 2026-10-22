@@ -2,6 +2,12 @@
 
 Inspired by feature parity with [Diskover](https://diskoverdata.com/). Items are grouped by effort and value. None of these are commitments — just ideas worth revisiting.
 
+**Planned for v5** (small releases — see [v5-plan.md](v5-plan.md) for design, schema changes
+and sizing): 5.0 `search` and `export` · 5.1 `report` with duplicate filtering · 5.2
+include/exclude file types and `--dry-run` preview · 5.3 path patterns (Ignore).
+**Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
+original ideas.
+
 ---
 
 ## High value, low effort
@@ -24,9 +30,8 @@ A proper replacement for the basic `diskReport.sh` scripts. All data is already 
 ```
 diskunder report /nas --top-files 20        # largest files
 diskunder report /nas --by-type             # space consumed per extension
-diskunder report /nas --stale 180d          # files not accessed in N days
+diskunder report /nas --stale 180d          # files not modified in N days (access-based is opt-in)
 diskunder report /nas --duplicates          # duplicate groups by wasted space
-diskunder report /nas --cost 0.023          # apply a $/GB/month rate for cost overlay
 diskunder report /nas --by-directory        # top directories by total size
 ```
 
@@ -38,19 +43,17 @@ in thousands of trivial matches:
 ```
 diskunder report /nas --duplicates --min-size 100MB
 diskunder report /nas --duplicates --min-size 1GB --min-copies 3
-diskunder report /nas --duplicates --extension iso,dmg,vhd
+diskunder report /nas --duplicates --ext iso,dmg,vhd
 diskunder report /nas --duplicates --min-wasted 500MB   # filter by total wasted per group
 ```
 
-Every duplicate report should close with a savings summary:
+Every duplicate report should close with a summary (space only — no cost figures):
 
 ```
-Duplicate groups found : 47
+Duplicate groups       : 47
 Files that are copies  : 183
 Total wasted space     : 142.3 GB
-Reclaimable (1 copy)   : 142.3 GB
-Reclaimable (quarantine): 142.3 GB  ← what dedupe would free
-Storage cost saving    : $3.27/month  (at $0.023/GB/month)
+Largest group          : render.mov — 1.6 GB × 4 copies (4.8 GB wasted)
 ```
 
 ### `export` subcommand
@@ -60,6 +63,33 @@ Makes the index consumable by BI tools (Tableau, Power BI, Excel) and AI pipelin
 diskunder export /nas --format csv  > report.csv
 diskunder export /nas --format json > report.json
 ```
+
+### Include / exclude file types
+Index only the file types you care about, or skip ones you don't — e.g. only media on a
+photo share, or no `tmp`/`log` files anywhere. Excluded files are never read or hashed, so
+runs get faster too.
+
+```
+diskunder index /nas --include-ext jpg,jpeg,png,heic,mov,mp4
+diskunder index /nas --exclude-ext tmp,log,ds_store
+diskunder update /nas                       # reuses the filters stored for /nas
+diskunder index /nas --dry-run --exclude-ext tmp   # preview counts by type, no hashing
+```
+
+**Assessment** (full version in [v5-plan.md](v5-plan.md), release 5.2): the
+filter itself is a one-line check during the walk. The real work is consistency:
+
+- filters are stored per path (in `roots`) so `update` reuses them
+- changing filters must not be confused with files being deleted: rows for newly excluded
+  types are removed deliberately and reported separately
+- matching rules are case-insensitive, use the last extension (`.tar.gz` → `gz`), and use
+  `none` for files without one
+- `db info` and reports show when an index is filtered
+
+Schema: two columns on `roots`. Size: medium — roughly 250–350 lines and 10 tests, including
+the `--dry-run` preview. Skipping folders by path pattern (**Ignore**) follows in 5.3 on the
+same mechanism: `.gitignore`-style patterns such as `.snapshot`, `@eaDir` or
+`projects/*/render-cache`, with excluded folders never walked.
 
 ### Jobs — named, saved runs
 Save a run's settings under a name so it can be repeated without retyping paths and flags,
@@ -147,6 +177,10 @@ diskunder browse /nas
 ---
 
 ## Safe deletion
+
+**Planned for v6, in this order:** quarantine (with manifest, `purge`, `restore` and a
+`status` column), then `dedupe` built on it, with `--dry-run`. Default copy to keep: the
+oldest modified. The `dedupe` design is in [v5-plan.md](v5-plan.md#deferred-to-v6--quarantine-then-dedupe).
 
 Deletion is the most dangerous operation the tool could perform, especially on a network
 share where mistakes are hard to reverse. All deletion features should be off by default
@@ -379,6 +413,9 @@ Would require an `ANTHROPIC_API_KEY` environment variable and the `anthropic` Ru
 
 Some features above would benefit from schema changes. Notes for when that work starts:
 
+- `include_ext` / `exclude_ext` on `roots` — stored file-type filters (5.2, see v5-plan.md)
+- `exclude_paths` on `roots` — stored path patterns (5.3, see v5-plan.md)
+- Lowercase `extension` and `PRAGMA user_version` migrations — see v5-plan.md
 - ~~Per-path run metadata~~ — done in v4.1 as the `roots` table (path, first/last run, mode,
   whether the last run finished); `diskunder db info` reads it
 - `last_seen` column — timestamp of last successful index pass; enables true stale

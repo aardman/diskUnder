@@ -373,14 +373,15 @@ database with SQLite's online backup while nothing is writing to it:
 | Auto plain-text fallback | — | — | — | Yes | Yes | Yes |
 | `--db` flag | No | No | Yes | Yes | Yes | Yes |
 | `--threads` flag | No | No | Yes | Yes | Yes | Yes |
-| `search` — query the index by name, size, age, type | No | No | No | No | No | Planned |
-| `report` — top files/dirs, by type, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Planned |
-| Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--extension` | No | No | No | No | No | Planned |
-| `export` — CSV / JSON for BI tools | No | No | No | No | No | Planned |
-| Dry run — preview dedupe actions without touching files | No | No | No | No | No | Planned |
-| Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned |
-| Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned |
-| Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned |
+| `search` — query the index by name, size, age, type | No | No | No | No | No | Planned (5.0) |
+| `report` — top files/dirs, by type, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Planned (5.1) |
+| Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--ext` | No | No | No | No | No | Planned (5.1) |
+| `export` — CSV / JSON for BI tools | No | No | No | No | No | Planned (5.0) |
+| Dry run — preview indexing (5.2) and dedupe actions (v6) without touching files | No | No | No | No | No | Planned (5.2 / v6) |
+| Include / exclude file types — `--include-ext`, `--exclude-ext` | No | No | No | No | No | Planned (5.2) |
+| Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned (5.3) |
+| Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
+| Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 | Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned |
 
 ---
@@ -398,7 +399,8 @@ diskunder/
 ├── Cargo.toml         # Rust project config
 ├── Cargo.lock         # Locked dependency versions — ensures reproducible builds
 ├── changes.md         # Full change log (v1 → v4)
-└── future.md          # Planned features
+├── future.md          # Feature ideas
+└── v5-plan.md         # v5 plan: search, report, export, file-type and path filters
 ```
 
 > **Note:** `*.db` files are excluded from version control (`.gitignore`) as they contain
