@@ -1,4 +1,4 @@
-// diskUnder v3.0 — TUI progress and live duplicate results
+// diskUnder v4.0 — TUI progress and live duplicate results
 // See changes.md for full change history
 //
 // Additional entries required in Cargo.toml [dependencies]:
@@ -79,10 +79,14 @@ enum WorkerMsg {
         size: u64,
         checksum: String,
     },
-    /// A file or traversal entry that could not be read
+    /// A queued file that could not be read or hashed
     FileError { path: String, error: String },
+    /// A traversal entry or database operation failed (not tied to a queued file)
+    Error { context: String, error: String },
     /// A batch of N rows committed to SQLite
     BatchWritten(usize),
+    /// A batch of `files` hashed files could not be committed
+    BatchFailed { files: usize, error: String },
     /// Directory traversal finished — `to_hash` files queued, `skipped` already in the DB
     /// (index mode) or unchanged since last indexed (update mode)
     TraversalComplete { to_hash: usize, skipped: usize },
@@ -109,7 +113,9 @@ struct AppState {
     files_skipped: usize, // already indexed (index mode) or unchanged (update mode)
     files_hashed: usize,
     files_written: usize,
-    files_errored: usize,
+    files_errored: usize,  // queued files that could not be read or hashed
+    files_unwritten: usize, // hashed files lost to a failed batch commit
+    other_errors: usize,   // traversal and database errors
     total_files: Option<usize>, // set once traversal is complete
 
     current_file: String,
@@ -120,6 +126,7 @@ struct AppState {
     dup_keys: HashSet<String>,                         // checksums with 2+ paths
     dups_dirty: bool,                                  // top_dups needs refreshing
     top_dups: Vec<DupGroup>,                           // top 10 by wasted bytes
+    dup_wasted: u64,                                   // wasted bytes across all groups
 
     log: Vec<String>,
     done: bool,
@@ -136,12 +143,15 @@ impl AppState {
             files_hashed: 0,
             files_written: 0,
             files_errored: 0,
+            files_unwritten: 0,
+            other_errors: 0,
             total_files: None,
             current_file: String::new(),
             checksum_map: HashMap::new(),
             dup_keys: HashSet::new(),
             dups_dirty: false,
             top_dups: Vec::new(),
+            dup_wasted: 0,
             log: Vec::new(),
             done: false,
         }
@@ -151,10 +161,33 @@ impl AppState {
         if self.mode == "update" { "unchanged" } else { "already indexed" }
     }
 
+    fn errors_total(&self) -> usize {
+        self.files_errored + self.files_unwritten + self.other_errors
+    }
+
+    /// e.g. "3 errors (2 unreadable, 1 not written)"; just "0 errors" when clean
+    fn errors_summary(&self) -> String {
+        let parts: Vec<String> = [
+            (self.files_errored, "unreadable"),
+            (self.files_unwritten, "not written"),
+            (self.other_errors, "traversal/db"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{} {}", n, label))
+        .collect();
+        if parts.is_empty() {
+            "0 errors".to_string()
+        } else {
+            format!("{} errors ({})", self.errors_total(), parts.join(", "))
+        }
+    }
+
     fn progress(&self) -> f64 {
         match self.total_files {
-            // Count errors as processed — otherwise permission-denied files on /Users/
-            // or a network share leave the bar stuck below 100% when the run is done.
+            // Count unreadable files as processed — otherwise permission-denied files on
+            // /Users/ or a network share leave the bar stuck below 100% when the run is done.
+            // Traversal errors are not counted: those entries were never queued in `n`.
             Some(n) if n > 0 => (self.files_hashed + self.files_errored) as f64 / n as f64,
             _ => 0.0,
         }
@@ -207,6 +240,7 @@ impl AppState {
                 (size * (paths.len() as u64 - 1), k)
             })
             .collect();
+        self.dup_wasted = ranked.iter().map(|(w, _)| w).sum();
         let by_wasted = |a: &(u64, &String), b: &(u64, &String)| b.0.cmp(&a.0);
         if ranked.len() > 10 {
             ranked.select_nth_unstable_by(9, by_wasted);
@@ -233,7 +267,15 @@ impl AppState {
                 self.files_errored += 1;
                 self.push_log(format!("warn: {} — {}", path, error));
             }
+            WorkerMsg::Error { context, error } => {
+                self.other_errors += 1;
+                self.push_log(format!("warn: {} — {}", context, error));
+            }
             WorkerMsg::BatchWritten(n) => self.files_written += n,
+            WorkerMsg::BatchFailed { files, error } => {
+                self.files_unwritten += files;
+                self.push_log(format!("error: batch of {} files not written — {}", files, error));
+            }
             WorkerMsg::TraversalComplete { to_hash, skipped } => {
                 self.total_files = Some(to_hash);
                 self.files_skipped = skipped;
@@ -250,10 +292,10 @@ impl AppState {
                 self.done = true;
                 self.refresh_top_dups();
                 self.push_log(format!(
-                    "done — {} written, {} errors, {} duplicate groups",
+                    "done — {} written, {}, {} duplicate groups",
                     self.files_written,
-                    self.files_errored,
-                    self.top_dups.len()
+                    self.errors_summary(),
+                    self.dup_keys.len()
                 ));
             }
         }
@@ -433,7 +475,7 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
     let mut conn = match Connection::open(&db_path) {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(WorkerMsg::FileError { path: db_path, error: e.to_string() });
+            let _ = tx.send(WorkerMsg::Error { context: db_path, error: e.to_string() });
             let _ = tx.send(WorkerMsg::Done);
             return;
         }
@@ -446,7 +488,7 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
     let table_name = match create_table(&conn, &path) {
         Ok(t) => t,
         Err(e) => {
-            let _ = tx.send(WorkerMsg::FileError { path, error: e.to_string() });
+            let _ = tx.send(WorkerMsg::Error { context: path, error: e.to_string() });
             let _ = tx.send(WorkerMsg::Done);
             return;
         }
@@ -456,8 +498,8 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
     // skipped (so an interrupted run resumes cheaply); in update mode a path is skipped
     // only if its size and modified time still match what was stored.
     let indexed = load_indexed(&conn, &table_name).unwrap_or_else(|e| {
-        let _ = tx.send(WorkerMsg::FileError {
-            path: "db".to_string(),
+        let _ = tx.send(WorkerMsg::Error {
+            context: "db".to_string(),
             error: format!("could not read existing paths, re-hashing all: {}", e),
         });
         HashMap::new()
@@ -500,8 +542,8 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
             }
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(WorkerMsg::FileError {
-                    path: e.path().map(|p| p.display().to_string()).unwrap_or_default(),
+                let _ = tx.send(WorkerMsg::Error {
+                    context: e.path().map(|p| p.display().to_string()).unwrap_or_default(),
                     error: e.to_string(),
                 });
             }
@@ -541,8 +583,8 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
                     let _ = tx.send(WorkerMsg::BatchWritten(n));
                 }
                 Err(e) => {
-                    let _ = tx.send(WorkerMsg::FileError {
-                        path: "db".to_string(),
+                    let _ = tx.send(WorkerMsg::BatchFailed {
+                        files: batch.len(),
                         error: e.to_string(),
                     });
                 }
@@ -551,7 +593,12 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
     }
 
     if !upsert {
-        let _ = create_indexes(&conn, &table_name);
+        if let Err(e) = create_indexes(&conn, &table_name) {
+            let _ = tx.send(WorkerMsg::Error {
+                context: "db".to_string(),
+                error: format!("could not create indexes: {}", e),
+            });
+        }
     }
 
     let _ = tx.send(WorkerMsg::Done);
@@ -613,7 +660,7 @@ fn draw(f: &mut Frame, state: &AppState) {
 
 fn draw_header(f: &mut Frame, state: &AppState, area: Rect) {
     let text = format!(
-        "  diskUnder v3.0   mode: {}   path: {}   db: {}   (q to quit)",
+        "  diskUnder v4.0   mode: {}   path: {}   db: {}   (q to quit)",
         state.mode, state.target_path, state.db_path
     );
     let p = Paragraph::new(text)
@@ -683,8 +730,8 @@ fn draw_progress(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![
             Span::raw("  Errors  "),
             Span::styled(
-                format!("{:>9}", state.files_errored),
-                Style::default().fg(if state.files_errored > 0 {
+                format!("{:>9}", state.errors_total()),
+                Style::default().fg(if state.errors_total() > 0 {
                     Color::Red
                 } else {
                     Color::DarkGray
@@ -765,12 +812,12 @@ fn draw_duplicates(f: &mut Frame, state: &AppState, area: Rect) {
         }
 
         // Summary footer
-        let total_wasted: u64 = state.top_dups.iter().map(|g| g.wasted).sum();
         items.push(ListItem::new(Span::styled(
             format!(
-                "  top {} groups — {} total wasted (all groups)",
+                "  top {} of {} groups — {} wasted across all groups",
                 state.top_dups.len(),
-                fmt_bytes(total_wasted)
+                state.dup_keys.len(),
+                fmt_bytes(state.dup_wasted)
             ),
             Style::default()
                 .fg(Color::Cyan)
@@ -778,7 +825,7 @@ fn draw_duplicates(f: &mut Frame, state: &AppState, area: Rect) {
         )));
     }
 
-    let dup_count = state.top_dups.len();
+    let dup_count = state.dup_keys.len();
     let title = if dup_count == 0 {
         " Duplicates ".to_string()
     } else {
@@ -824,7 +871,7 @@ fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>) {
     eprintln!("{} {}", state.mode, state.target_path);
 
     for msg in rx {
-        let print_progress = matches!(msg, WorkerMsg::BatchWritten(_));
+        let print_progress = matches!(msg, WorkerMsg::BatchWritten(_) | WorkerMsg::BatchFailed { .. });
         let done = matches!(msg, WorkerMsg::Done);
 
         state.apply(msg);
@@ -836,8 +883,8 @@ fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>) {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "…".into());
             eprintln!(
-                "  {}/{} processed — {} written, {} errors/skipped",
-                processed, total_str, state.files_written, state.files_errored
+                "  {}/{} processed — {} written, {} errors",
+                processed, total_str, state.files_written, state.errors_total()
             );
         }
 
@@ -847,17 +894,16 @@ fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>) {
     }
 
     eprintln!(
-        "complete: {} files — {} {}, {} written, {} errors/skipped, {} duplicate groups",
+        "complete: {} files — {} {}, {} written, {}, {} duplicate groups",
         state.files_found,
         state.files_skipped,
         state.skipped_label(),
         state.files_written,
-        state.files_errored,
-        state.top_dups.len(),
+        state.errors_summary(),
+        state.dup_keys.len(),
     );
-    if !state.top_dups.is_empty() {
-        let wasted: u64 = state.top_dups.iter().map(|g| g.wasted).sum();
-        eprintln!("wasted (top {}): {}", state.top_dups.len(), fmt_bytes(wasted));
+    if !state.dup_keys.is_empty() {
+        eprintln!("wasted: {}", fmt_bytes(state.dup_wasted));
     }
 }
 
@@ -954,11 +1000,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  files found   : {}", state.files_found);
         println!("  skipped       : {} ({})", state.files_skipped, state.skipped_label());
         println!("  files written : {}", state.files_written);
-        println!("  errors        : {}", state.files_errored);
-        println!("  dup groups    : {}", state.top_dups.len());
-        if !state.top_dups.is_empty() {
-            let wasted: u64 = state.top_dups.iter().map(|g| g.wasted).sum();
-            println!("  wasted (top{:2}): {}", state.top_dups.len(), fmt_bytes(wasted));
+        println!("  errors        : {}", state.errors_summary());
+        println!("  dup groups    : {}", state.dup_keys.len());
+        if !state.dup_keys.is_empty() {
+            println!("  wasted        : {}", fmt_bytes(state.dup_wasted));
         }
     }
 

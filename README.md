@@ -13,9 +13,11 @@ The project was developed in multiple languages, each addressing the limitations
 - **Python:** More structured, with multiprocessing and bulk inserts — but ultimately too slow for large network shares
 - **Rust v1:** Best performance, but contained bugs around network share resilience and resumability
 - **Rust v2:** All known bugs fixed, plain-text output only
-- **Rust v3** (current, `src/main.rs`): Full TUI with live progress and duplicate detection, with automatic plain-text fallback
+- **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
+- **Rust v4** (current, `src/main.rs`): Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares
+- **Rust v5+** (planned): Features — see [future.md](future.md)
 
-Only Rust v3 is kept in this repository; the earlier versions were not committed.
+Only the current Rust version is kept in this repository; the earlier versions were not committed.
 
 See [changes.md](changes.md) for a detailed change log and [future.md](future.md) for planned features.
 
@@ -104,11 +106,11 @@ plain mode explicitly in an interactive terminal.
 **Plain text output format:**
 ```
 index /Volumes/NAS
-  1000/772087 processed — 998 written, 2 errors/skipped
-  2000/772087 processed — 1991 written, 9 errors/skipped
+  1000/772087 processed — 998 written, 2 errors
+  2000/772087 processed — 1991 written, 9 errors
   ...
-complete: 772087 files — 0 already indexed, 511597 written, 22683 errors/skipped, 10 duplicate groups
-wasted (top 10): 3.2 GB
+complete: 772087 files — 0 already indexed, 749404 written, 22683 errors (22683 unreadable), 1408 duplicate groups
+wasted: 3.2 GB
 ```
 
 **Dependencies:** `blake3`, `chrono`, `crossterm`, `md5`, `rayon`, `ratatui`, `rusqlite`, `structopt`, `walkdir`
@@ -117,17 +119,28 @@ wasted (top 10): 3.2 GB
 
 ## Comparison with earlier versions
 
-| Feature | Python | Rust v1 | Rust v2 | Rust v3 (TUI) |
-|---|---|---|---|---|
-| Hashing | MD5 | BLAKE3 | BLAKE3 | BLAKE3 |
-| Parallelisation | `multiprocessing` | Rayon | Rayon | Rayon |
-| Batch transactions | Yes (100K) | No (single) | Yes (1K) | Yes (1K) |
-| Resumable after crash | No | No | Yes | Yes |
-| Network share resilience | Partial | Poor | Yes | Yes |
-| TUI progress | No | No | No | Yes |
-| Auto plain-text fallback | — | — | — | Yes |
-| `--db` flag | No | No | Yes | Yes |
-| `--threads` flag | No | No | Yes | Yes |
+| Feature | Python | Rust v1 | Rust v2 | Rust v3 (TUI) | Rust v4 (fixes) | Rust v5+ (planned) |
+|---|---|---|---|---|---|---|
+| Hashing | MD5 | BLAKE3 | BLAKE3 | BLAKE3 | BLAKE3 | BLAKE3 |
+| Parallelisation | `multiprocessing` | Rayon | Rayon | Rayon | Rayon | Rayon |
+| Batch transactions | Yes (100K) | No (single) | Yes (1K) | Yes (1K) | Yes (1K) | Yes (1K) |
+| Resumable after crash | No | No | Yes | Yes | Yes | Yes |
+| Resume skips already-indexed files | — | — | No | No | Yes | Yes |
+| `update` skips unchanged files | — | — | No | No | Yes | Yes |
+| Duplicate tracking scales to large runs | — | — | — | No | Yes | Yes |
+| Network share resilience | Partial | Poor | Yes | Yes | Yes | Yes |
+| TUI progress | No | No | No | Yes | Yes | Yes |
+| Auto plain-text fallback | — | — | — | Yes | Yes | Yes |
+| `--db` flag | No | No | Yes | Yes | Yes | Yes |
+| `--threads` flag | No | No | Yes | Yes | Yes | Yes |
+| `search` — query the index by name, size, age, type | No | No | No | No | No | Planned |
+| `report` — top files/dirs, by type, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Planned |
+| Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--extension` | No | No | No | No | No | Planned |
+| `export` — CSV / JSON for BI tools | No | No | No | No | No | Planned |
+| Dry run — preview dedupe actions without touching files | No | No | No | No | No | Planned |
+| Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned |
+| Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned |
+| Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned |
 
 ---
 
@@ -135,7 +148,7 @@ wasted (top 10): 3.2 GB
 
 ```
 diskunder/
-├── src/main.rs        # Rust v3 source
+├── src/main.rs        # Rust v4 source
 ├── diskunder-macos    # Compiled macOS binary (arm64)
 ├── diskunder-linux    # Compiled Linux x86_64 binary (statically linked, musl)
 ├── Makefile           # Build targets: make, make mac, make linux, make clean
@@ -143,7 +156,7 @@ diskunder/
 ├── Cargo.toml         # Rust project config
 ├── Cargo.lock         # Locked dependency versions — ensures reproducible builds
 ├── setupDB.sh         # Utility: create a single static `files` table manually
-├── changes.md         # Full change log (v1 → v2 → v3)
+├── changes.md         # Full change log (v1 → v4)
 └── future.md          # Planned features
 ```
 

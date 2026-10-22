@@ -1,6 +1,8 @@
 # diskUnder — Change Log
 
-## Unreleased
+## v4.0 — fixes
+
+Resumability, change detection and performance fixes on top of v3.0. No new features.
 
 ### Resume skips already-indexed files
 
@@ -35,6 +37,22 @@ they all share one checksum.
 only over checksums that actually have duplicates, and only the 10 groups displayed have their
 paths cloned. Empty files are no longer tracked as duplicates (they waste no space). The same
 test now takes 1.6 s and 4.6 s respectively.
+
+### Accurate counts
+
+**Previous behaviour:**
+- Directory traversal errors were counted as file errors, but those entries were never part
+  of the file total — so the progress bar could pass 100%.
+- A failed batch commit counted as 1 error even though up to 1,000 files went unwritten.
+- The "duplicate groups" figure and "wasted" total only covered the top 10 groups shown,
+  and the TUI footer mislabelled that top-10 sum as "all groups".
+
+**Fix:** Errors are tracked as three kinds — unreadable files (count toward progress), files
+lost to a failed batch, and traversal/database errors (do not count toward progress). The
+summary reports the total with a breakdown, e.g. `504 errors (1 unreadable, 502 not written,
+1 traversal/db)`. Duplicate group count and wasted bytes now cover every group found; the TUI
+footer reads `top 10 of N groups — X wasted across all groups`. Failure to create the
+secondary indexes at the end of a run is now reported instead of silently ignored.
 
 ---
 
