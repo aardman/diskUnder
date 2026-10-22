@@ -121,7 +121,7 @@ complete: 772087 files — 0 already indexed, 749404 written, 0 removed, 22683 e
 wasted: 3.2 GB
 ```
 
-**Dependencies:** `blake3`, `chrono`, `crossterm`, `md5`, `rayon`, `ratatui`, `rusqlite`, `structopt`, `walkdir`
+**Dependencies:** `blake3`, `chrono`, `clap`, `crossterm`, `md5`, `rayon`, `ratatui`, `rusqlite`, `walkdir`
 
 ---
 
@@ -142,6 +142,7 @@ wasted: 3.2 GB
 | Duplicate totals cover all groups (not just the top 10) | — | — | — | No | Yes | Yes |
 | Duplicates found across the whole table (not just files hashed this run) | — | — | — | No | Yes | Yes |
 | Hard links not counted as wasted space | — | — | — | No | Yes | Yes |
+| Automated test suite (`cargo test`) | No | No | No | No | Yes | Yes |
 | Error breakdown (unreadable / not written / traversal) | No | No | No | No | Yes | Yes |
 | Network share resilience | Partial | Poor | Yes | Yes | Yes | Yes |
 | TUI progress | No | No | No | Yes | Yes | Yes |
@@ -165,6 +166,7 @@ wasted: 3.2 GB
 ```
 diskunder/
 ├── src/main.rs        # Rust v4 source
+├── tests/cli.rs       # End-to-end tests (cargo test)
 ├── diskunder-macos    # Compiled macOS binary (arm64)
 ├── diskunder-linux    # Compiled Linux x86_64 binary (statically linked, musl)
 ├── Makefile           # Build targets: make, make mac, make linux, make clean
@@ -197,3 +199,14 @@ rustup target add x86_64-unknown-linux-musl
 ```
 
 The Linux binary is statically linked against musl libc — no system dependencies required on the target machine.
+
+### Running the tests
+
+```bash
+cargo test
+```
+
+[tests/cli.rs](tests/cli.rs) runs the real binary in plain mode against throwaway directories and
+checks both its summary output and the database it writes: resume, change detection, deletions,
+path normalisation and v3 migration, error counting, duplicate totals, hard links and argument
+parsing. Two tests rely on file permissions and skip themselves when run as root.

@@ -31,7 +31,7 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
     time::{Duration, SystemTime},
 };
-use structopt::StructOpt;
+use clap::{Parser, Subcommand};
 use walkdir::WalkDir;
 
 const BATCH_SIZE: usize = 1_000;
@@ -40,32 +40,39 @@ const TICK: Duration = Duration::from_millis(100); // UI refresh rate
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
-#[derive(StructOpt)]
-#[structopt(name = "diskunder", about = "File indexer with live TUI progress")]
+#[derive(Parser)]
+#[command(name = "diskunder", about = "File indexer with live TUI progress", version)]
 struct Cli {
-    #[structopt(subcommand)]
+    #[command(subcommand)]
     cmd: Command,
 
     /// SQLite database file (created if absent)
-    #[structopt(long, default_value = "fileindex.db", global = true)]
+    #[arg(long, default_value = "fileindex.db", global = true)]
     db: String,
 
     /// Parallel hashing threads — keep low for network shares (e.g. --threads 4)
-    #[structopt(long, default_value = "4", global = true)]
+    #[arg(long, default_value_t = 4, global = true)]
     threads: usize,
 
     /// Disable the TUI and print plain progress lines instead.
     /// Enabled automatically when stdout is not a terminal (cron, SSH, pipes).
-    #[structopt(long, global = true)]
+    #[arg(long, global = true)]
     no_tui: bool,
 }
 
-#[derive(StructOpt)]
+#[derive(Subcommand)]
 enum Command {
-    /// Full index of PATH
-    Index { path: String },
+    /// Index every file under PATH; files already in the database are skipped,
+    /// so an interrupted run can simply be restarted
+    Index {
+        /// Directory to index
+        path: String,
+    },
     /// Re-index new and changed files under PATH, and drop rows for deleted files
-    Update { path: String },
+    Update {
+        /// Directory to update
+        path: String,
+    },
 }
 
 /// (device, inode) — identifies the underlying file, so hard links to the same data
@@ -1295,7 +1302,7 @@ fn run_ui(
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Cli::from_args();
+    let args = Cli::parse();
 
     let (mode, typed) = match &args.cmd {
         Command::Index { path } => ("index", path.clone()),

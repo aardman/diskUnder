@@ -11,5 +11,5 @@ md5       = "0.7"
 rayon     = "1.8"
 ratatui   = "0.28"   # v3.0+
 rusqlite  = { version = "0.30", features = ["bundled"] }
-structopt = "0.3"
+clap      = { version = "4.5", features = ["derive"] }
 walkdir   = "2.4"

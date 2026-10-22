@@ -122,6 +122,23 @@ rows without re-hashing; `index` does not (it doesn't read file metadata for row
 so until an `update` runs, older rows fall back to counting every path. Over SMB, hard links
 usually aren't visible as such, so this matters most when running on the file server itself.
 
+### Automated tests
+
+**Previous behaviour:** No tests; changes were checked by hand.
+
+**Fix:** `tests/cli.rs` — 21 end-to-end tests that run the built binary against temporary
+directories and check its output and database: resume, update change detection (including
+back-dated edits), deletions and their safeguards, path normalisation, v3 table migration and
+its failure path, error counts by kind, duplicate totals, hard links, inode backfill and
+argument parsing. Run with `cargo test`.
+
+### `structopt` replaced with `clap` v4
+
+`structopt` is in maintenance mode (it was merged into `clap`). The CLI now uses `clap`'s
+derive API. Commands, flags and defaults are unchanged, and global flags still work before or
+after the subcommand. `--version` now works, and `--help` describes the `PATH` argument. This
+also drops `atty`, an unmaintained dependency of `structopt` with a known advisory.
+
 ### Plain mode prints traversal and database warnings
 
 Plain mode previously printed no warnings at all, so a failure showed only as an error count.
