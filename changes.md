@@ -70,6 +70,39 @@ skipped as unchanged. Rows for paths not seen on disk are removed, with two safe
 Secondary indexes are now created at the end of every run (`IF NOT EXISTS`). The summary
 reports `N removed`. `index` mode never removes rows.
 
+### One table per directory, however the path is typed
+
+**Previous behaviour:** The table name was the MD5 of the path exactly as typed, so `/nas`,
+`/nas/`, `./nas` and a symlink to it each got a separate table (and a full re-hash). Stored
+paths kept the typed spelling, including relative paths that only made sense from the
+directory the tool was run in.
+
+**Fix:** The root is canonicalised (absolute, symlinks resolved) before use, so all spellings
+share one table and stored paths are always absolute.
+
+**Migration:** If a table exists for the path as typed but not for the canonical path, its
+paths and `directory` values are rewritten onto the canonical root and it is renamed, in a
+single transaction — no re-hashing. Old-named indexes are dropped and recreated. If any row
+can't be mapped, the transaction is rolled back and the run stops with an error rather than
+re-hashing into a new table. Only the spelling used on the first v4 run is migrated.
+
+### Duplicates found across the whole table
+
+**Previous behaviour:** Duplicate detection only saw files hashed in the current run. Once
+resume and `update` started skipping already-indexed files, a resumed run or an `update`
+reported only duplicates among the few files it re-hashed — a re-run of a fully indexed share
+reported none.
+
+**Fix:** Files skipped as already indexed (`index`) or unchanged (`update`) contribute their
+stored checksum to duplicate detection, so the live panel and totals cover every file in the
+table that is still on disk. Rows for files no longer on disk are not counted.
+
+### Plain mode prints traversal and database warnings
+
+Plain mode previously printed no warnings at all, so a failure showed only as an error count.
+Traversal and database errors (and informational lines such as migrations) are now printed to
+stderr. Per-file read errors are still only counted.
+
 ---
 
 ## v3.0 — `diskUnder3.rust`

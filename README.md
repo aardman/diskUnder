@@ -25,7 +25,9 @@ See [changes.md](changes.md) for a detailed change log and [future.md](future.md
 
 ## How It Works
 
-diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 checksum), and writes it to a SQLite database. Multiple paths can be indexed into the same database — each path gets its own table named `files_<MD5(path)>`.
+diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 checksum), and writes it to a SQLite database. Multiple paths can be indexed into the same database — each path gets its own table named `files_<MD5(path)>`, where `path` is the canonical (absolute, symlink-resolved) root. `/nas`, `/nas/`, `./nas` and a symlink to it all share one table, and stored paths are always absolute.
+
+> **Upgrading from v3:** v3 named tables after the path exactly as typed, and stored paths in that spelling (relative if you typed a relative path). The first v4 run with the **same spelling you used before** migrates that table in place — paths are rewritten to absolute and the table renamed — so nothing is re-hashed. If you used several spellings for one directory, only the first one migrated is kept; the others are left untouched.
 
 Two modes are supported:
 
@@ -129,8 +131,10 @@ wasted: 3.2 GB
 | `update` skips unchanged files | — | — | No | No | Yes | Yes |
 | `update` catches all changes (not just the last 24 hours) | No | No | No | No | Yes | Yes |
 | `update` removes rows for deleted files | No | No | No | No | Yes | Yes |
+| One table per directory however it's typed (`/nas`, `/nas/`, `./nas`) | No | No | No | No | Yes | Yes |
 | Duplicate tracking scales to large runs | — | — | — | No | Yes (empty files excluded) | Yes |
 | Duplicate totals cover all groups (not just the top 10) | — | — | — | No | Yes | Yes |
+| Duplicates found across the whole table (not just files hashed this run) | — | — | — | No | Yes | Yes |
 | Error breakdown (unreadable / not written / traversal) | No | No | No | No | Yes | Yes |
 | Network share resilience | Partial | Poor | Yes | Yes | Yes | Yes |
 | TUI progress | No | No | No | Yes | Yes | Yes |

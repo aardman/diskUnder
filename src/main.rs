@@ -83,12 +83,17 @@ enum WorkerMsg {
     FileError { path: String, error: String },
     /// A traversal entry or database operation failed (not tied to a queued file)
     Error { context: String, error: String },
+    /// Informational line for the activity log (also printed in plain mode)
+    Info(String),
     /// A batch of N rows committed to SQLite
     BatchWritten(usize),
     /// N rows removed for files no longer on disk (update mode)
     Removed(usize),
     /// A batch of `files` hashed files could not be committed
     BatchFailed { files: usize, error: String },
+    /// Checksums of files skipped this run (already indexed / unchanged), sent once after
+    /// traversal so duplicate detection covers the whole table, not just files hashed now
+    Seed(Vec<(String, u64, String)>), // (path, size, checksum)
     /// Directory traversal finished — `to_hash` files queued, `skipped` already in the DB
     /// (index mode) or unchanged since last indexed (update mode)
     TraversalComplete { to_hash: usize, skipped: usize },
@@ -207,7 +212,10 @@ impl AppState {
     fn record_hashed(&mut self, path: String, size: u64, checksum: String) {
         self.files_hashed += 1;
         self.current_file = path.clone();
+        self.track_checksum(path, size, checksum);
+    }
 
+    fn track_checksum(&mut self, path: String, size: u64, checksum: String) {
         // Empty files all share one checksum and waste nothing — not worth tracking
         if size == 0 {
             return;
@@ -274,6 +282,12 @@ impl AppState {
             WorkerMsg::Error { context, error } => {
                 self.other_errors += 1;
                 self.push_log(format!("warn: {} — {}", context, error));
+            }
+            WorkerMsg::Info(line) => self.push_log(line),
+            WorkerMsg::Seed(entries) => {
+                for (path, size, checksum) in entries {
+                    self.track_checksum(path, size, checksum);
+                }
             }
             WorkerMsg::BatchWritten(n) => self.files_written += n,
             WorkerMsg::Removed(n) => {
@@ -385,8 +399,87 @@ fn fmt_time(t: SystemTime) -> String {
 
 // ─── Database ────────────────────────────────────────────────────────────────
 
+fn table_name_for(root: &str) -> String {
+    format!("files_{:x}", md5::compute(root))
+}
+
+fn table_exists(conn: &Connection, t: &str) -> DbResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [t],
+        |row| row.get(0),
+    )
+}
+
+/// Before v4 the table name came from the path exactly as typed, so `/nas`, `/nas/` and
+/// `./nas` got separate tables, with stored paths in that spelling (possibly relative).
+/// If a table exists for the typed spelling but not for the canonical root, rewrite its
+/// paths onto the canonical root and rename it, so nothing needs re-hashing.
+/// Returns the number of rows migrated, or None if there was nothing to do.
+fn migrate_legacy_table(conn: &mut Connection, typed: &str, root: &str) -> Result<Option<usize>, String> {
+    let old = table_name_for(typed);
+    let new = table_name_for(root);
+    let db = |e: rusqlite::Error| e.to_string();
+    if old == new || !table_exists(conn, &old).map_err(db)? || table_exists(conn, &new).map_err(db)? {
+        return Ok(None);
+    }
+
+    let tx = conn.transaction().map_err(db)?;
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare(&format!("SELECT id, path FROM {old}")).map_err(db)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(db)?
+            .collect::<DbResult<_>>()
+            .map_err(db)?;
+        rows
+    };
+    {
+        let mut update = tx
+            .prepare(&format!("UPDATE {old} SET path = ?1, directory = ?2 WHERE id = ?3"))
+            .map_err(db)?;
+        for (id, path) in &rows {
+            // Component-wise, so `./nas`, `nas//` and `nas/` prefixes all strip cleanly
+            let rel = Path::new(path)
+                .strip_prefix(typed)
+                .map_err(|_| format!("row path {} is not under {}", path, typed))?;
+            let new_path = if rel.as_os_str().is_empty() {
+                PathBuf::from(root)
+            } else {
+                Path::new(root).join(rel)
+            };
+            let directory = new_path
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            update
+                .execute(params![new_path.to_string_lossy(), directory, id])
+                .map_err(db)?;
+        }
+    }
+
+    // Index names embed the table name; drop the old ones; they're recreated under the new name
+    let old_indexes: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?1 AND name LIKE 'idx_%'")
+            .map_err(db)?;
+        let names = stmt
+            .query_map([&old], |row| row.get(0))
+            .map_err(db)?
+            .collect::<DbResult<_>>()
+            .map_err(db)?;
+        names
+    };
+    for name in old_indexes {
+        tx.execute(&format!("DROP INDEX {name}"), []).map_err(db)?;
+    }
+    tx.execute(&format!("ALTER TABLE {old} RENAME TO {new}"), []).map_err(db)?;
+    tx.commit().map_err(db)?;
+    Ok(Some(rows.len()))
+}
+
 fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
-    let table_name = format!("files_{:x}", md5::compute(path));
+    let table_name = table_name_for(path);
     conn.execute(
         &format!(
             "CREATE TABLE IF NOT EXISTS {t} (
@@ -417,13 +510,25 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
 }
 
 /// path → (size, modified_date) for every row already in the table
-fn load_indexed(conn: &Connection, t: &str) -> DbResult<HashMap<String, (u64, String)>> {
+struct Stored {
+    size: u64,
+    modified: String,
+    checksum: String,
+}
+
+/// path → stored size, modified date and checksum for every row already in the table
+fn load_indexed(conn: &Connection, t: &str) -> DbResult<HashMap<String, Stored>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT path, size, COALESCE(modified_date, '') FROM {t}",
+        "SELECT path, size, COALESCE(modified_date, ''), COALESCE(checksum, '') FROM {t}",
         t = t
     ))?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                Stored { size: row.get(1)?, modified: row.get(2)?, checksum: row.get(3)? },
+            ))
+        })?
         .collect();
     rows
 }
@@ -487,7 +592,16 @@ fn commit_batch(conn: &mut Connection, t: &str, batch: &[FileEntry], upsert: boo
 
 // ─── Worker thread ───────────────────────────────────────────────────────────
 
-fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: Sender<WorkerMsg>) {
+/// `path` is the canonical root; `typed` is the root as given on the command line,
+/// used only to find a table created by an earlier version.
+fn run_worker(
+    path: String,
+    typed: String,
+    db_path: String,
+    threads: usize,
+    upsert: bool,
+    tx: Sender<WorkerMsg>,
+) {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
@@ -505,6 +619,25 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
          PRAGMA temp_store=MEMORY; PRAGMA cache_size=100000;",
     );
+
+    match migrate_legacy_table(&mut conn, &typed, &path) {
+        Ok(Some(n)) => {
+            let _ = tx.send(WorkerMsg::Info(format!(
+                "migrated {} rows from the table for \"{}\" to {}",
+                n, typed, path
+            )));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Carrying on would re-hash everything into a new table — stop instead
+            let _ = tx.send(WorkerMsg::Error {
+                context: "db".to_string(),
+                error: format!("could not migrate table for \"{}\": {}", typed, e),
+            });
+            let _ = tx.send(WorkerMsg::Done);
+            return;
+        }
+    }
 
     let table_name = match create_table(&conn, &path) {
         Ok(t) => t,
@@ -529,6 +662,7 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
     // ── Traversal ──
     let mut files: Vec<PathBuf> = Vec::new();
     let mut skipped = 0usize;
+    let mut seed: Vec<(String, u64, String)> = Vec::new();
     // Paths that could not be traversed; rows beneath them are not treated as deleted.
     // None means an error had no path, so no deletions are safe.
     let mut unreadable: Option<Vec<PathBuf>> = Some(Vec::new());
@@ -536,25 +670,31 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
     for entry in WalkDir::new(&path) {
         match entry {
             Ok(e) if e.file_type().is_file() => {
-                if upsert {
-                    // update mode: re-hash unless size and modified time match the stored row.
-                    // Seen paths are removed from `indexed`; whatever remains has been deleted.
-                    let _ = tx.send(WorkerMsg::FileFound);
-                    let stored = indexed.remove(e.path().to_string_lossy().as_ref());
-                    let current = e.metadata().ok().map(|m| {
-                        (m.len(), m.modified().ok().map(fmt_time).unwrap_or_default())
-                    });
-                    match (stored, current) {
-                        (Some(s), Some(c)) if s == c => skipped += 1,
-                        _ => files.push(e.path().to_owned()),
+                let _ = tx.send(WorkerMsg::FileFound);
+                // Seen paths are removed from `indexed`; in update mode whatever remains
+                // afterwards has been deleted from disk.
+                let stored = indexed.remove_entry(e.path().to_string_lossy().as_ref());
+                let keep = match stored {
+                    // index mode: any existing row is kept as-is
+                    Some(row) if !upsert => Some(row),
+                    // update mode: kept only if size and modified time still match
+                    Some((p, s)) => {
+                        let unchanged = e.metadata().ok().map_or(false, |m| {
+                            m.len() == s.size
+                                && m.modified().ok().map(fmt_time).unwrap_or_default() == s.modified
+                        });
+                        unchanged.then_some((p, s))
                     }
-                } else {
-                    let _ = tx.send(WorkerMsg::FileFound);
-                    if indexed.contains_key(e.path().to_string_lossy().as_ref()) {
+                    None => None,
+                };
+                match keep {
+                    Some((p, s)) => {
                         skipped += 1;
-                    } else {
-                        files.push(e.path().to_owned());
+                        if !s.checksum.is_empty() {
+                            seed.push((p, s.size, s.checksum));
+                        }
                     }
+                    None => files.push(e.path().to_owned()),
                 }
             }
             Ok(_) => {}
@@ -573,6 +713,7 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
 
     let found_any = !files.is_empty() || skipped > 0;
     let _ = tx.send(WorkerMsg::TraversalComplete { to_hash: files.len(), skipped });
+    let _ = tx.send(WorkerMsg::Seed(seed));
 
     // ── Drop rows for deleted files (update mode) ──
     if upsert && !indexed.is_empty() {
@@ -934,6 +1075,13 @@ fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>) {
     eprintln!("{} {}", state.mode, state.target_path);
 
     for msg in rx {
+        // Per-file read errors are only counted (there can be thousands); traversal and
+        // database errors are rare and need explaining, so print them
+        match &msg {
+            WorkerMsg::Info(line) => eprintln!("{}", line),
+            WorkerMsg::Error { context, error } => eprintln!("warn: {} — {}", context, error),
+            _ => {}
+        }
         let print_progress = matches!(msg, WorkerMsg::BatchWritten(_) | WorkerMsg::BatchFailed { .. });
         let done = matches!(msg, WorkerMsg::Done);
 
@@ -1008,15 +1156,19 @@ fn run_ui(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::from_args();
 
-    let (mode, path) = match &args.cmd {
+    let (mode, typed) = match &args.cmd {
         Command::Index { path } => ("index", path.clone()),
         Command::Update { path } => ("update", path.clone()),
     };
 
-    if !Path::new(&path).exists() {
-        eprintln!("error: path not found: {}", path);
-        std::process::exit(1);
-    }
+    // Absolute, symlink-free root, so every spelling of the same directory shares a table
+    let path = match fs::canonicalize(&typed) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => {
+            eprintln!("error: path not found: {} ({})", typed, e);
+            std::process::exit(1);
+        }
+    };
 
     let upsert = matches!(args.cmd, Command::Update { .. });
     let db_path = args.db.clone();
@@ -1030,7 +1182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<WorkerMsg>();
     let path_w = path.clone();
     let db_w = db_path.clone();
-    std::thread::spawn(move || run_worker(path_w, db_w, threads, upsert, tx));
+    std::thread::spawn(move || run_worker(path_w, typed, db_w, threads, upsert, tx));
 
     let mut state = AppState::new(mode, &path, &db_path);
 
