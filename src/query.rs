@@ -9,7 +9,7 @@ use std::{collections::HashMap, fs};
 use crate::db::{file_tables, load_roots, schema_version, table_exists, table_name_for, RootRow};
 use crate::fmt::fmt_local;
 
-#[derive(Args, Default)]
+#[derive(Args, Clone, Default)]
 pub(crate) struct FilterArgs {
     /// File name pattern, e.g. "*.log" (* ? and [..] wildcards)
     #[arg(long, value_name = "GLOB")]
@@ -264,6 +264,20 @@ fn source_select(conn: &Connection, scope: &Scope, t: &str, lowercase_ext: bool)
     ))
 }
 
+/// The pieces every query is built from: a `files` CTE over the tables in scope, and the
+/// filter conditions with their bound parameters
+pub(crate) struct Parts {
+    pub(crate) with: String,             // "WITH files AS …"
+    pub(crate) conds: Option<String>,    // "a AND b …", or None when nothing is filtered
+    pub(crate) params: Vec<Value>,
+}
+
+impl Parts {
+    pub(crate) fn where_sql(&self) -> String {
+        self.conds.as_ref().map_or(String::new(), |c| format!(" WHERE {}", c))
+    }
+}
+
 pub(crate) fn build_query(
     conn: &Connection,
     scope: &Scope,
@@ -271,6 +285,26 @@ pub(crate) fn build_query(
     sort: SortKey,
     limit: Option<usize>,
 ) -> rusqlite::Result<Query> {
+    let Parts { with, conds, params } = build_parts(conn, scope, filters)?;
+    let where_sql = conds.map_or(String::new(), |c| format!(" WHERE {}", c));
+    let order = match sort {
+        SortKey::Path => "path",
+        SortKey::Size => "size DESC, path",
+        SortKey::Modified => "modified_date DESC, path",
+        SortKey::Name => "filename, path",
+    };
+    let limit_sql = limit.map_or(String::new(), |n| format!(" LIMIT {}", n));
+    Ok(Query {
+        sql: format!(
+            "{with} SELECT root, path, filename, directory, extension, size, modified_date, access_date, \
+             birth_date, checksum, device, inode FROM files{where_sql} ORDER BY {order}{limit_sql}"
+        ),
+        count_sql: format!("{with} SELECT COUNT(*) FROM files{where_sql}"),
+        params,
+    })
+}
+
+pub(crate) fn build_parts(conn: &Connection, scope: &Scope, filters: &FilterArgs) -> rusqlite::Result<Parts> {
     let lowercase_ext = schema_version(conn)? < 1;
     let sources: Vec<String> = scope
         .tables
@@ -333,22 +367,8 @@ pub(crate) fn build_query(
         );
     }
 
-    let where_sql = if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) };
-    let order = match sort {
-        SortKey::Path => "path",
-        SortKey::Size => "size DESC, path",
-        SortKey::Modified => "modified_date DESC, path",
-        SortKey::Name => "filename, path",
-    };
-    let limit_sql = limit.map_or(String::new(), |n| format!(" LIMIT {}", n));
-    Ok(Query {
-        sql: format!(
-            "{with} SELECT root, path, filename, directory, extension, size, modified_date, access_date, \
-             birth_date, checksum, device, inode FROM files{where_sql} ORDER BY {order}{limit_sql}"
-        ),
-        count_sql: format!("{with} SELECT COUNT(*) FROM files{where_sql}"),
-        params,
-    })
+    let conds = (!conds.is_empty()).then(|| conds.join(" AND "));
+    Ok(Parts { with, conds, params })
 }
 
 #[cfg(test)]

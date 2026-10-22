@@ -1,5 +1,47 @@
 # diskUnder — Change Log
 
+## v5.1 — report
+
+### `report`
+
+Summaries of an index. With no options, an overview: totals, duplicates, files not modified in a
+year, then the largest files, space by type, space by folder and the largest duplicate groups.
+Sections can also be asked for individually and combined:
+
+- `--top-files [N]` — the largest files
+- `--by-type` — files, size and share of the space per extension
+- `--by-directory [--depth N]` — files, size and share per folder, rolled up N levels below
+  the path given (a folder inside an indexed path reports relative to that folder)
+- `--stale AGE` — files not modified within AGE: the total and share of the space, which
+  folders hold them, and the largest; `--stale-by access` uses access times instead
+- `--duplicates` — groups by wasted space, each with its copies (first 5, `--all-paths` for all,
+  hard links marked), and a summary over every matching group: groups, files that are copies,
+  total wasted, largest group. No cost figures.
+
+Duplicate filters: `--min-size`, `--min-copies` (hard links count once), `--min-wasted`. The
+shared filters (`--ext`, `--under`, `--name`, …) select groups with at least one matching copy;
+every copy is still listed.
+
+`--limit` sets rows per section (default 20, 10 in the overview); `--format csv|tsv|json` works
+for a single section. Read-only, like `search`. On a synthetic million-row index each section
+takes 0.2–1.1 s and the full overview 2.8 s.
+
+Sizes and counts in the overview, by-type and by-folder sections add up every path, so a
+hard-linked file counts once per link; duplicate figures count hard links as one copy.
+
+### Sizes of a terabyte or more show as TB
+
+The size formatter stopped at GB ("23260.6 GB"); it now goes to TB everywhere — TUI, plain
+output, `search`, `db info` and reports.
+
+### Tests
+
+56 in total (was 48): new end-to-end tests cover every report section, duplicate filters and
+their group-level matching, hard links within groups, the summary, path capping, formats and
+argument rules.
+
+---
+
 ## v5.0 — search, export and a run log
 
 First of the small v5 releases (plan: [v5-plan.md](v5-plan.md)).

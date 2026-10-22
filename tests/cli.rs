@@ -2,6 +2,7 @@
 // then check its summary output and the SQLite database it wrote.
 
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1237,4 +1238,228 @@ fn queries_read_v3_tables() {
     assert_eq!(q.code, 0, "{}", q.stderr);
     assert_eq!(names(&q.stdout), ["a", "b"]);
     assert!(q.stderr.contains("has no recorded runs"), "{}", q.stderr);
+}
+
+// ─── report (5.1) ────────────────────────────────────────────────────────────
+
+fn report(tmp: &TempDir, db: &Path, extra: &[&str]) -> Query {
+    let mut args = vec!["report"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--db", db.to_str().unwrap()]);
+    query(tmp.path(), &args)
+}
+
+/// CSV body rows (header dropped), split into fields — only for fields without commas
+fn csv_rows(stdout: &str) -> Vec<Vec<String>> {
+    stdout.lines().skip(1).map(|l| l.split(',').map(str::to_string).collect()).collect()
+}
+
+#[test]
+fn report_overview() {
+    let tmp = TempDir::new();
+    let (_, db) = sample_share(&tmp);
+    let r = report(&tmp, &db, &["nas"]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("  Files                  7 · 6.9 KB"), "{}", r.stdout);
+    assert!(r.stdout.contains("  Duplicates             1 group · 2.9 KB wasted"), "{}", r.stdout);
+    assert!(r.stdout.contains("  Not modified in 1y     1 file · 4 B"), "{}", r.stdout);
+    for heading in ["Largest files", "Space by type", "Space by folder (depth 1)", "Duplicates"] {
+        assert!(r.stdout.contains(&format!("\n{}\n", heading)), "missing {}:\n{}", heading, r.stdout);
+    }
+    assert!(r.stderr.starts_with("index as of"), "notes go to stderr: {}", r.stderr);
+    assert!(!tmp.path().join("t.db.log").exists() || log_lines(&db).len() == 2, "reports aren't logged");
+}
+
+#[test]
+fn report_space_by_type_and_folder() {
+    let tmp = TempDir::new();
+    let (_, db) = sample_share(&tmp);
+
+    let types = report(&tmp, &db, &["nas", "--by-type", "--format", "csv"]);
+    assert_eq!(types.stdout.lines().next(), Some("type,files,size,share_percent"));
+    let rows = csv_rows(&types.stdout);
+    let by: HashMap<&str, (&str, &str)> = rows.iter().map(|r| (r[0].as_str(), (r[1].as_str(), r[2].as_str()))).collect();
+    assert_eq!(by["mov"], ("2", "6000"), "JPG/jpg-style case differences are one type");
+    assert_eq!(by["pdf"], ("2", "1000"));
+    assert_eq!(by["log"], ("2", "8"));
+    assert_eq!(by[""], ("1", "7"), "no extension");
+    assert_eq!(rows[0][0], "mov", "largest first");
+    let table = report(&tmp, &db, &["nas", "--by-type"]);
+    assert!(table.stdout.contains("(none)"), "{}", table.stdout);
+
+    let folders = report(&tmp, &db, &["nas", "--by-directory", "--format", "csv"]);
+    let names: Vec<String> = csv_rows(&folders.stdout)
+        .iter()
+        .map(|r| Path::new(&r[0]).file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["projects", "backup", "logs", "nas"], "depth 1, largest first; nas = files directly in it");
+
+    let folder = report(&tmp, &db, &["nas/projects", "--by-directory", "--format", "csv"]);
+    assert_eq!(csv_rows(&folder.stdout).len(), 1, "relative to the folder given:\n{}", folder.stdout);
+}
+
+#[test]
+fn report_by_folder_depth() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    write(&data.join("a/b/c/deep.txt"), &"x".repeat(100));
+    write(&data.join("a/b/mid.txt"), &"x".repeat(10));
+    write(&data.join("a/top.txt"), "x");
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "data", "--db", db.to_str().unwrap()]);
+    let folders = |depth: &str| -> Vec<(String, String)> {
+        let r = report(&tmp, &db, &["data", "--by-directory", "--depth", depth, "--format", "csv"]);
+        csv_rows(&r.stdout)
+            .into_iter()
+            .map(|f| (f[0].trim_start_matches(&*data.to_string_lossy()).to_string(), f[2].clone()))
+            .collect()
+    };
+    assert_eq!(folders("1"), [("/a".to_string(), "111".to_string())]);
+    assert_eq!(folders("2"), [("/a/b".to_string(), "110".to_string()), ("/a".to_string(), "1".to_string())]);
+    assert_eq!(folders("3")[0], ("/a/b/c".to_string(), "100".to_string()));
+    assert_eq!(report(&tmp, &db, &["data", "--by-directory", "--depth", "0"]).code, 2, "depth starts at 1");
+}
+
+#[test]
+fn report_stale_by_modified_or_access() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    write(&data.join("old-modified.txt"), "old\n");
+    write(&data.join("old-accessed.txt"), "acc\n");
+    write(&data.join("fresh.txt"), "new\n");
+    set_mtime(&data.join("old-modified.txt"), days_ago(400));
+    let times = fs::FileTimes::new().set_accessed(days_ago(400));
+    File::options().write(true).open(data.join("old-accessed.txt")).unwrap().set_times(times).unwrap();
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "data", "--db", db.to_str().unwrap()]);
+
+    let modified = report(&tmp, &db, &["data", "--stale", "1y"]);
+    assert!(modified.stdout.starts_with("Not modified in 1y: 1 of 3 files"), "{}", modified.stdout);
+    assert!(modified.stdout.contains("old-modified.txt") && !modified.stdout.contains("old-accessed.txt"));
+    assert!(modified.stdout.contains("— by folder (depth 1)") && modified.stdout.contains("— largest files"));
+
+    let accessed = report(&tmp, &db, &["data", "--stale", "1y", "--stale-by", "access", "--format", "csv"]);
+    let names: Vec<String> = csv_rows(&accessed.stdout).iter().map(|r| r[2].clone()).collect();
+    assert!(names.contains(&"old-accessed.txt".to_string()), "{:?}", names);
+    assert!(!names.contains(&"fresh.txt".to_string()));
+}
+
+/// Duplicate groups of known sizes: big (3 copies), mid (2 copies, one under backup/),
+/// small (2 copies, .txt), wide (7 copies), and a pair that are only hard links
+fn duplicate_share(tmp: &TempDir) -> PathBuf {
+    let d = tmp.path().join("dups");
+    for i in 0..3 {
+        write(&d.join(format!("big{}.iso", i)), &"B".repeat(4000));
+    }
+    write(&d.join("mid.mov"), &"M".repeat(2000));
+    write(&d.join("backup/mid-copy.mov"), &"M".repeat(2000));
+    write(&d.join("small.txt"), &"s".repeat(100));
+    write(&d.join("small-copy.TXT"), &"s".repeat(100));
+    for i in 0..7 {
+        write(&d.join(format!("wide/w{}.dat", i)), &"w".repeat(10));
+    }
+    write(&d.join("linked.bin"), &"L".repeat(5000));
+    fs::hard_link(d.join("linked.bin"), d.join("linked-too.bin")).unwrap();
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "dups", "--db", db.to_str().unwrap()]);
+    db
+}
+
+#[test]
+fn report_duplicates_and_filters() {
+    let tmp = TempDir::new();
+    let db = duplicate_share(&tmp);
+    let groups = |extra: &[&str]| -> Vec<(String, String, String)> {
+        let mut args = vec!["dups", "--duplicates", "--format", "csv"];
+        args.extend_from_slice(extra);
+        let r = report(&tmp, &db, &args);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let mut seen = Vec::new();
+        for f in csv_rows(&r.stdout) {
+            let g = (f[2].clone(), f[3].clone(), f[4].clone()); // size, copies, wasted
+            if !seen.contains(&g) {
+                seen.push(g);
+            }
+        }
+        seen
+    };
+    let g = |size: &str, copies: &str, wasted: &str| (size.to_string(), copies.to_string(), wasted.to_string());
+
+    assert_eq!(
+        groups(&[]),
+        [g("4000", "3", "8000"), g("2000", "2", "2000"), g("100", "2", "100"), g("10", "7", "60")],
+        "largest waste first; the hard-linked pair isn't a group"
+    );
+    assert_eq!(groups(&["--min-size", "1K"]), [g("4000", "3", "8000"), g("2000", "2", "2000")]);
+    assert_eq!(groups(&["--min-copies", "3"]), [g("4000", "3", "8000"), g("10", "7", "60")]);
+    assert_eq!(groups(&["--min-wasted", "2000"]), [g("4000", "3", "8000"), g("2000", "2", "2000")]);
+    assert_eq!(groups(&["--ext", "txt"]), [g("100", "2", "100")], "extension match ignores case");
+
+    // --under picks groups with a copy there, but lists every copy
+    let under = report(&tmp, &db, &["dups", "--duplicates", "--under", "dups/backup", "--format", "csv"]);
+    let paths: Vec<String> = csv_rows(&under.stdout).iter().map(|r| r[5].clone()).collect();
+    assert_eq!(paths.len(), 2);
+    assert!(paths.iter().any(|p| p.ends_with("/dups/mid.mov")), "copy outside backup/ still listed: {:?}", paths);
+}
+
+#[test]
+fn report_duplicates_table_paths_and_summary() {
+    let tmp = TempDir::new();
+    let db = duplicate_share(&tmp);
+    let r = report(&tmp, &db, &["dups", "--duplicates"]);
+    let out = &r.stdout;
+    assert!(out.starts_with("Duplicates\n  7.8 KB wasted   big0.iso — 3.9 KB × 3 copies\n"), "{}", out);
+    assert!(out.contains("    … and 2 more\n"), "7-copy group capped at 5 paths:\n{}", out);
+    assert!(out.contains("  Duplicate groups       : 4\n"), "{}", out);
+    assert!(out.contains("  Files that are copies  : 10\n"), "2 + 1 + 1 + 6:\n{}", out);
+    assert!(out.contains("  Total wasted space     : 9.9 KB\n"), "8000 + 2000 + 100 + 60 bytes:\n{}", out);
+    assert!(out.contains("  Largest group          : big0.iso — 3.9 KB × 3 copies (7.8 KB wasted)\n"), "{}", out);
+
+    let all = report(&tmp, &db, &["dups", "--duplicates", "--all-paths"]);
+    assert!(!all.stdout.contains("… and"), "{}", all.stdout);
+    let limited = report(&tmp, &db, &["dups", "--duplicates", "--limit", "1"]);
+    assert!(limited.stdout.starts_with("Duplicates — largest 1 of 4 groups\n"), "{}", limited.stdout);
+    assert!(limited.stdout.contains("Duplicate groups       : 4"), "summary still covers every group");
+}
+
+#[test]
+fn report_duplicates_mark_hard_links_within_a_group() {
+    let tmp = TempDir::new();
+    let d = tmp.path().join("d");
+    write(&d.join("a.bin"), &"x".repeat(300));
+    fs::hard_link(d.join("a.bin"), d.join("b-link.bin")).unwrap();
+    write(&d.join("c-copy.bin"), &"x".repeat(300));
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "d", "--db", db.to_str().unwrap()]);
+    let r = report(&tmp, &db, &["d", "--duplicates"]);
+    assert!(r.stdout.contains("300 B wasted   a.bin — 300 B × 2 copies"), "{}", r.stdout);
+    assert!(r.stdout.contains("b-link.bin  (hard link)"), "{}", r.stdout);
+    assert!(!r.stdout.contains("c-copy.bin  (hard link)"), "{}", r.stdout);
+}
+
+#[test]
+fn report_options_and_formats() {
+    let tmp = TempDir::new();
+    let (_, db) = sample_share(&tmp);
+
+    let top = report(&tmp, &db, &["nas", "--top-files", "2"]);
+    assert_eq!(top.stdout.lines().count(), 4, "heading, column header, 2 rows:\n{}", top.stdout);
+    let top_default = report(&tmp, &db, &["nas", "--top-files", "--limit", "3"]);
+    assert_eq!(top_default.stdout.lines().count(), 5, "{}", top_default.stdout);
+    let both = report(&tmp, &db, &["nas", "--by-type", "--duplicates"]);
+    assert!(both.stdout.contains("Space by type") && both.stdout.contains("Duplicate groups"));
+
+    let overview_csv = report(&tmp, &db, &["nas", "--format", "csv"]);
+    assert_eq!(overview_csv.code, 1);
+    assert!(overview_csv.stderr.contains("choose one section"), "{}", overview_csv.stderr);
+    let two_csv = report(&tmp, &db, &["nas", "--by-type", "--duplicates", "--format", "csv"]);
+    assert_eq!(two_csv.code, 1);
+
+    let json = report(&tmp, &db, &["nas", "--top-files", "1", "--format", "json"]);
+    assert!(json.stdout.starts_with("{\"root\":") && json.stdout.contains("\"size\":3000,"), "{}", json.stdout);
+
+    let needs = report(&tmp, &db, &["nas", "--min-size", "1MB"]);
+    assert_eq!(needs.code, 2, "--min-size needs --duplicates");
+    let missing = report(&tmp, &db, &["/nowhere"]);
+    assert_eq!(missing.code, 1);
 }

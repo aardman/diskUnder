@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 0.5.0`:
+**Check it worked** — this should print `diskunder 0.5.1`:
 
 ```bash
 diskunder --version
@@ -235,6 +235,67 @@ checksum, device, inode`. Dates are ISO 8601 in UTC (`2024-11-01T10:22:05Z`); si
 
 ---
 
+## Reports
+
+`report` summarises an index. With no options it prints an overview — totals, duplicates,
+files not modified in a year, then the largest files, space by type, space by folder and the
+largest duplicate groups:
+
+```bash
+diskunder report /Volumes/NAS
+```
+
+```text
+  Files                  772,087 · 4.1 TB
+  Duplicates             1,408 groups · 3.2 GB wasted
+  Not modified in 1y     210,334 files · 1.9 TB (46.3% of the space)
+
+Largest files
+     SIZE  MODIFIED          PATH
+   1.6 GB  2024-11-01 10:22  /Volumes/NAS/projects/2024/final/render.mov
+…
+```
+
+Or ask for specific sections (they can be combined):
+
+| Section | Shows |
+|---|---|
+| `--top-files [N]` | the largest files (default 20) |
+| `--by-type` | files, size and share of the space per extension |
+| `--by-directory [--depth N]` | files, size and share per folder, rolled up N levels below the path (default 1) |
+| `--stale AGE` | files not modified within AGE (`180d`, `1y`): the total, which folders hold them, and the largest. `--stale-by access` uses access times instead — unreliable on many file servers |
+| `--duplicates` | duplicate groups, most wasted space first, each listing its copies (first 5; `--all-paths` for all, hard links marked), then a summary |
+
+```bash
+diskunder report /Volumes/NAS --by-type --by-directory --depth 2
+diskunder report /Volumes/NAS/projects --stale 1y
+diskunder report /Volumes/NAS --duplicates --min-size 1GB --min-copies 3
+diskunder report --duplicates --ext iso,dmg,vhd
+```
+
+**Duplicate filters:** `--min-size SIZE` (each copy at least SIZE), `--min-copies N` (distinct
+copies, hard links counting once), `--min-wasted SIZE` (size × (copies − 1)). The shared
+filters from `search` (`--ext`, `--under`, `--name`, …) pick groups with **at least one**
+matching copy, and every copy is still listed — so `--under /Volumes/NAS/backup` shows each
+backup copy alongside the original elsewhere. The summary covers every matching group, even
+when `--limit` shows fewer:
+
+```text
+  Duplicate groups       : 47
+  Files that are copies  : 183
+  Total wasted space     : 142.3 GB
+  Largest group          : render.mov — 1.6 GB × 4 copies (4.8 GB wasted)
+```
+
+**Options:** `--limit N` rows per section (default 20, or 10 in the overview; `0` for all),
+and `--format csv|tsv|json` for a single section — e.g. `--by-type --format csv` for a
+spreadsheet. Like `search`, notes go to stderr and reports never change the database.
+
+Sizes and file counts add up every path, so a hard-linked file counts once per link;
+duplicate groups and wasted space count hard links as one copy.
+
+---
+
 ## Database maintenance
 
 `diskunder db` looks after the index database. It never creates a database — pass the same
@@ -362,8 +423,8 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | `--threads` flag | No | No | Yes | Yes | Yes | Yes |
 | Run log — each command that changes the database, its outcome, a summary and any errors (`<database>.log`) | No | No | No | No | No | Yes (5.0) |
 | `search` — query the index by name, size, age, type, duplicates; table / CSV / TSV / JSON / paths | No | No | No | No | No | Yes (5.0) |
-| `report` — top files/dirs, by type, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Planned (5.1) |
-| Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--ext` | No | No | No | No | No | Planned (5.1) |
+| `report` — overview, top files, by type, by folder, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Yes (5.1) |
+| Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--ext`, `--under` | No | No | No | No | No | Yes (5.1) |
 | `export` — CSV / TSV / JSON for BI tools | No | No | No | No | No | Yes (5.0) |
 | Dry run — preview indexing (5.2) and dedupe actions (v6) without touching files | No | No | No | No | No | Planned (5.2 / v6) |
 | Include / exclude file types — `--include-ext`, `--exclude-ext` | No | No | No | No | No | Planned (5.2) |
@@ -384,7 +445,7 @@ The project was developed in multiple languages, each addressing the limitations
 - **Rust v2:** All known bugs fixed, plain-text output only
 - **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
 - **Rust v4:** Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
-- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log; the rest is planned in [v5-plan.md](v5-plan.md)
+- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`; the rest is planned in [v5-plan.md](v5-plan.md)
 
 Only the current Rust version is kept in this repository; the earlier versions were not committed.
 
@@ -408,6 +469,7 @@ diskunder/
 │   ├── query.rs       #   filters and SQL for search/export
 │   ├── output.rs      #   table, CSV, TSV, JSON, paths
 │   ├── search.rs      #   search and export commands
+│   ├── report.rs      #   report command
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
@@ -453,6 +515,6 @@ cargo test
 [tests/cli.rs](tests/cli.rs) runs the real binary in plain mode against throwaway directories and
 checks both its summary output and the database it writes: resume, change detection, deletions,
 path normalisation and v3 migration, error counting, duplicate totals, hard links, argument
-parsing, the `db` maintenance commands, schema migrations, the run log, and `search`/`export`
-filters, scopes and formats. Unit tests in `src/query.rs` cover size, age and extension parsing.
+parsing, the `db` maintenance commands, schema migrations, the run log, `search`/`export`
+filters, scopes and formats, and every `report` section and duplicate filter. Unit tests in `src/query.rs` cover size, age and extension parsing.
 Tests that rely on file permissions skip themselves when run as root.

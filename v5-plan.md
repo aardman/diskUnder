@@ -188,7 +188,10 @@ format. Kept as its own command because "export" is what people look for. **Size
 
 ---
 
-## 5.1 — `report`
+## 5.1 — `report` ✅
+
+**Done.** As designed below, plus `--format csv|tsv|json` for single sections and a fuller
+`--stale` (total, by folder, largest files). See [changes.md](changes.md).
 
 ```text
 diskunder report /nas                   # overview: totals, top files, top types, duplicates summary
@@ -532,7 +535,7 @@ Before the new commands:
 | Release | Contents | Size |
 |---|---|---|
 | 5.0 ✅ | Phase 0, run log, `search`, `export` | M |
-| 5.1 | `report`, including duplicate filtering and the summary | M |
+| 5.1 ✅ | `report`, including duplicate filtering and the summary | M |
 | 5.2 | Include / exclude file types; `index` / `update --dry-run` | M |
 | 5.3 | Path patterns (Ignore) | S–M |
 | 5.4 | Jobs: saved runs, `run NAME`, test (`--dry-run`), run history | M |

@@ -3,7 +3,8 @@
 use clap::{Parser, Subcommand};
 
 use crate::output::Format;
-use crate::query::{FilterArgs, SortKey};
+use crate::query::{parse_size, FilterArgs, SortKey};
+use crate::report::{parse_age_arg, Age, StaleBy};
 
 #[derive(Parser)]
 #[command(name = "diskunder", about = "File indexer with live TUI progress", version)]
@@ -70,6 +71,52 @@ pub(crate) enum Command {
         /// Also show access and creation dates and checksum (table format)
         #[arg(long)]
         long: bool,
+    },
+    /// Summaries: largest files, space by type and folder, stale files, duplicate groups
+    Report {
+        /// Indexed path, or a folder inside one (default: every indexed path)
+        path: Option<String>,
+        #[command(flatten)]
+        filters: FilterArgs,
+        /// Largest files (optionally how many, e.g. --top-files 50)
+        #[arg(long, value_name = "N", num_args = 0..=1)]
+        top_files: Option<Option<usize>>,
+        /// Space used per file type
+        #[arg(long)]
+        by_type: bool,
+        /// Space used per folder
+        #[arg(long)]
+        by_directory: bool,
+        /// Folder levels below the path for --by-directory and --stale
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+        depth: u16,
+        /// Files not modified within AGE, e.g. 180d, 1y: total, by folder, largest
+        #[arg(long, value_name = "AGE", value_parser = parse_age_arg)]
+        stale: Option<Age>,
+        /// What --stale measures
+        #[arg(long, value_enum, default_value_t = StaleBy::Modified, requires = "stale")]
+        stale_by: StaleBy,
+        /// Duplicate groups, most wasted space first, with a summary
+        #[arg(long)]
+        duplicates: bool,
+        /// Only groups whose files are at least SIZE
+        #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "duplicates")]
+        min_size: Option<u64>,
+        /// Only groups with at least N distinct copies (hard links count once)
+        #[arg(long, value_name = "N", default_value_t = 2, requires = "duplicates")]
+        min_copies: usize,
+        /// Only groups wasting at least SIZE in total
+        #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "duplicates")]
+        min_wasted: Option<u64>,
+        /// List every path in each duplicate group (default: first 5)
+        #[arg(long, requires = "duplicates")]
+        all_paths: bool,
+        /// Rows per section (default 20, or 10 in the overview); 0 for all
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Output format — csv, tsv and json need a single section
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
     },
     /// Write indexed files to CSV, TSV or JSON — every column, no row limit
     Export {

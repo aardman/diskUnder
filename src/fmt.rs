@@ -11,10 +11,13 @@ pub(crate) fn fmt_time(t: SystemTime) -> String {
 // ─── UI helpers ──────────────────────────────────────────────────────────────
 
 pub(crate) fn fmt_bytes(b: u64) -> String {
+    const TB: u64 = 1 << 40;
     const GB: u64 = 1 << 30;
     const MB: u64 = 1 << 20;
     const KB: u64 = 1 << 10;
-    if b >= GB {
+    if b >= TB {
+        format!("{:.1} TB", b as f64 / TB as f64)
+    } else if b >= GB {
         format!("{:.1} GB", b as f64 / GB as f64)
     } else if b >= MB {
         format!("{:.1} MB", b as f64 / MB as f64)

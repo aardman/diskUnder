@@ -9,6 +9,7 @@ mod output;
 mod plain;
 mod progress;
 mod query;
+mod report;
 mod runlog;
 mod scan;
 mod search;
@@ -32,6 +33,7 @@ use crate::fmt::fmt_bytes;
 use crate::maintenance::run_db_command;
 use crate::plain::run_plain;
 use crate::progress::AppState;
+use crate::report::{run_report, ReportOptions};
 use crate::runlog::RunLog;
 use crate::scan::{WorkerMsg, run_worker};
 use crate::search::{run_export, run_search, SearchOptions};
@@ -65,6 +67,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 long: *long,
             };
             std::process::exit(run_search(&args.db, &options));
+        }
+        Command::Report {
+            path, filters, top_files, by_type, by_directory, depth, stale, stale_by, duplicates,
+            min_size, min_copies, min_wasted, all_paths, limit, format,
+        } => {
+            let options = ReportOptions {
+                path: path.as_deref(),
+                filters,
+                top_files: *top_files,
+                by_type: *by_type,
+                by_directory: *by_directory,
+                depth: *depth as usize,
+                stale: stale.as_ref(),
+                stale_by: *stale_by,
+                duplicates: *duplicates,
+                min_size: *min_size,
+                min_copies: *min_copies,
+                min_wasted: *min_wasted,
+                all_paths: *all_paths,
+                limit: *limit,
+                format: *format,
+            };
+            std::process::exit(run_report(&args.db, &options));
         }
         Command::Export { path, filters, sort, format } => {
             std::process::exit(run_export(&args.db, path.as_deref(), filters, *sort, (*format).into()));

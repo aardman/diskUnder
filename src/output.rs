@@ -207,3 +207,90 @@ pub(crate) fn write_table(out: &mut Out, rows: &[FileRow], long: bool, width: Op
         out.write(&line);
     }
 }
+
+// ─── Generic rows (report sections that aren't plain file lists) ─────────────
+
+/// A value in a report row. Numbers stay numbers in JSON; `Text` is quoted.
+pub(crate) enum Cell {
+    Text(String),
+    Int(i64),
+    Dec(f64), // one decimal place, e.g. a percentage
+    Null,
+}
+
+impl Cell {
+    fn plain(&self) -> String {
+        match self {
+            Cell::Text(s) => s.clone(),
+            Cell::Int(n) => n.to_string(),
+            Cell::Dec(x) => format!("{:.1}", x),
+            Cell::Null => String::new(),
+        }
+    }
+
+    fn json(&self) -> String {
+        match self {
+            Cell::Text(s) => json_string(s),
+            Cell::Null => "null".to_string(),
+            other => other.plain(),
+        }
+    }
+}
+
+/// Rows in a machine format, with `headers` as the CSV/TSV header row and JSON keys
+pub(crate) fn write_cells(out: &mut Out, format: Format, headers: &[&str], rows: &[Vec<Cell>]) {
+    match format {
+        Format::Csv => out.write(&format!("{}\n", headers.join(","))),
+        Format::Tsv => out.write(&format!("{}\n", headers.join("\t"))),
+        Format::Json | Format::Table => {}
+    }
+    for row in rows {
+        let line = match format {
+            Format::Csv => row.iter().map(|c| csv_field(&c.plain())).collect::<Vec<_>>().join(","),
+            Format::Tsv => row.iter().map(|c| tsv_field(&c.plain())).collect::<Vec<_>>().join("\t"),
+            Format::Json => {
+                let fields: Vec<String> =
+                    headers.iter().zip(row).map(|(k, c)| format!("{}:{}", json_string(k), c.json())).collect();
+                format!("{{{}}}", fields.join(","))
+            }
+            Format::Table => unreachable!("tables are written with write_text_table"),
+        };
+        out.write(&line);
+        out.write("\n");
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Align {
+    Left,
+    Right,
+}
+
+/// An indented, aligned text table of already-formatted values. The last column is left
+/// unpadded so long paths don't push lines wider than they need to be.
+pub(crate) fn write_text_table(out: &mut Out, headers: &[&str], aligns: &[Align], rows: &[Vec<String>]) {
+    let widths: Vec<usize> = (0..headers.len())
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).chain([headers[i].len()]).max().unwrap_or(0))
+        .collect();
+    let line = |cells: Vec<&str>| {
+        let mut s = String::from("  ");
+        for (i, c) in cells.iter().enumerate() {
+            let last = i + 1 == cells.len();
+            let pad = widths[i].saturating_sub(c.chars().count());
+            match aligns[i] {
+                Align::Right => s.push_str(&format!("{}{}", " ".repeat(pad), c)),
+                Align::Left if last => s.push_str(c),
+                Align::Left => s.push_str(&format!("{}{}", c, " ".repeat(pad))),
+            }
+            if !last {
+                s.push_str("  ");
+            }
+        }
+        s.push('\n');
+        s
+    };
+    out.write(&line(headers.to_vec()));
+    for r in rows {
+        out.write(&line(r.iter().map(String::as_str).collect()));
+    }
+}
