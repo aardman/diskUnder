@@ -68,6 +68,21 @@ enum Command {
     Update { path: String },
 }
 
+/// (device, inode) — identifies the underlying file, so hard links to the same data
+/// are recognised as one copy. None where the platform or filesystem doesn't provide it.
+type FileId = (u64, u64);
+
+#[cfg(unix)]
+fn file_id(m: &fs::Metadata) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    Some((m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_: &fs::Metadata) -> Option<FileId> {
+    None
+}
+
 // ─── Worker → UI messages ────────────────────────────────────────────────────
 
 enum WorkerMsg {
@@ -78,6 +93,7 @@ enum WorkerMsg {
         path: String,
         size: u64,
         checksum: String,
+        file_id: Option<FileId>,
     },
     /// A queued file that could not be read or hashed
     FileError { path: String, error: String },
@@ -93,7 +109,7 @@ enum WorkerMsg {
     BatchFailed { files: usize, error: String },
     /// Checksums of files skipped this run (already indexed / unchanged), sent once after
     /// traversal so duplicate detection covers the whole table, not just files hashed now
-    Seed(Vec<(String, u64, String)>), // (path, size, checksum)
+    Seed(Vec<(String, u64, String, Option<FileId>)>), // (path, size, checksum, file_id)
     /// Directory traversal finished — `to_hash` files queued, `skipped` already in the DB
     /// (index mode) or unchanged since last indexed (update mode)
     TraversalComplete { to_hash: usize, skipped: usize },
@@ -106,7 +122,23 @@ enum WorkerMsg {
 struct DupGroup {
     size: u64,
     paths: Vec<String>,
-    wasted: u64, // size × (copies − 1)
+    copies: usize, // distinct files; paths.len() − copies are extra hard links
+    wasted: u64,   // size × (copies − 1)
+}
+
+/// Every path seen with one checksum. Paths sharing a FileId are hard links to the same
+/// data, so they count as one copy; paths with no FileId each count as their own copy.
+struct ChecksumGroup {
+    size: u64,
+    paths: Vec<String>,
+    ids: HashSet<FileId>,
+    unknown_ids: usize,
+}
+
+impl ChecksumGroup {
+    fn copies(&self) -> usize {
+        self.ids.len() + self.unknown_ids
+    }
 }
 
 // ─── Application state ───────────────────────────────────────────────────────
@@ -130,8 +162,8 @@ struct AppState {
 
     // In-memory checksum index for live duplicate detection.
     // For very large runs (millions of files) this will grow proportionally.
-    checksum_map: HashMap<String, (u64, Vec<String>)>, // checksum → (size, paths)
-    dup_keys: HashSet<String>,                         // checksums with 2+ paths
+    checksum_map: HashMap<String, ChecksumGroup>,
+    dup_keys: HashSet<String>,                         // checksums with 2+ distinct copies
     dups_dirty: bool,                                  // top_dups needs refreshing
     top_dups: Vec<DupGroup>,                           // top 10 by wasted bytes
     dup_wasted: u64,                                   // wasted bytes across all groups
@@ -209,28 +241,46 @@ impl AppState {
         }
     }
 
-    fn record_hashed(&mut self, path: String, size: u64, checksum: String) {
+    fn record_hashed(&mut self, path: String, size: u64, checksum: String, id: Option<FileId>) {
         self.files_hashed += 1;
         self.current_file = path.clone();
-        self.track_checksum(path, size, checksum);
+        self.track_checksum(path, size, checksum, id);
     }
 
-    fn track_checksum(&mut self, path: String, size: u64, checksum: String) {
+    fn track_checksum(&mut self, path: String, size: u64, checksum: String, id: Option<FileId>) {
         // Empty files all share one checksum and waste nothing — not worth tracking
         if size == 0 {
             return;
         }
 
-        match self.checksum_map.get_mut(&checksum) {
-            Some((_, paths)) => {
-                paths.push(path);
-                if paths.len() == 2 {
-                    self.dup_keys.insert(checksum);
+        let add = |g: &mut ChecksumGroup, path: String| {
+            g.paths.push(path);
+            match id {
+                Some(id) => {
+                    g.ids.insert(id);
                 }
-                self.dups_dirty = true;
+                None => g.unknown_ids += 1,
+            }
+        };
+        match self.checksum_map.get_mut(&checksum) {
+            Some(group) => {
+                add(group, path);
+                if group.copies() >= 2 {
+                    self.dups_dirty = true;
+                    if !self.dup_keys.contains(&checksum) {
+                        self.dup_keys.insert(checksum);
+                    }
+                }
             }
             None => {
-                self.checksum_map.insert(checksum, (size, vec![path]));
+                let mut group = ChecksumGroup {
+                    size,
+                    paths: Vec::new(),
+                    ids: HashSet::new(),
+                    unknown_ids: 0,
+                };
+                add(&mut group, path);
+                self.checksum_map.insert(checksum, group);
             }
         }
     }
@@ -248,8 +298,8 @@ impl AppState {
             .dup_keys
             .iter()
             .map(|k| {
-                let (size, paths) = &self.checksum_map[k];
-                (size * (paths.len() as u64 - 1), k)
+                let g = &self.checksum_map[k];
+                (g.size * (g.copies() as u64 - 1), k)
             })
             .collect();
         self.dup_wasted = ranked.iter().map(|(w, _)| w).sum();
@@ -263,8 +313,8 @@ impl AppState {
         self.top_dups = ranked
             .into_iter()
             .map(|(wasted, k)| {
-                let (size, paths) = &self.checksum_map[k];
-                DupGroup { size: *size, paths: paths.clone(), wasted }
+                let g = &self.checksum_map[k];
+                DupGroup { size: g.size, paths: g.paths.clone(), copies: g.copies(), wasted }
             })
             .collect();
     }
@@ -272,8 +322,8 @@ impl AppState {
     fn apply(&mut self, msg: WorkerMsg) {
         match msg {
             WorkerMsg::FileFound => self.files_found += 1,
-            WorkerMsg::FileHashed { path, size, checksum } => {
-                self.record_hashed(path, size, checksum);
+            WorkerMsg::FileHashed { path, size, checksum, file_id } => {
+                self.record_hashed(path, size, checksum, file_id);
             }
             WorkerMsg::FileError { path, error } => {
                 self.files_errored += 1;
@@ -285,8 +335,8 @@ impl AppState {
             }
             WorkerMsg::Info(line) => self.push_log(line),
             WorkerMsg::Seed(entries) => {
-                for (path, size, checksum) in entries {
-                    self.track_checksum(path, size, checksum);
+                for (path, size, checksum, file_id) in entries {
+                    self.track_checksum(path, size, checksum, file_id);
                 }
             }
             WorkerMsg::BatchWritten(n) => self.files_written += n,
@@ -336,6 +386,7 @@ struct FileEntry {
     checksum: String,
     extension: String,
     directory: String,
+    file_id: Option<FileId>,
 }
 
 impl FileEntry {
@@ -374,6 +425,7 @@ impl FileEntry {
                 .parent()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            file_id: file_id(&metadata),
         })
     }
 }
@@ -493,7 +545,9 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
                 checksum      TEXT,
                 extension     TEXT,
                 directory     TEXT,
-                created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                device        INTEGER,    -- with inode, identifies hard links
+                inode         INTEGER
             )",
             t = table_name
         ),
@@ -512,6 +566,17 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
             [],
         )?;
     }
+    // Added in v4; existing rows stay NULL until re-hashed or backfilled by `update`
+    for col in ["device", "inode"] {
+        let exists: bool = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = '{col}')", t = table_name),
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute(&format!("ALTER TABLE {t} ADD COLUMN {col} INTEGER", t = table_name), [])?;
+        }
+    }
     conn.execute(
         &format!(
             "CREATE INDEX IF NOT EXISTS idx_{t}_path ON {t}(path)",
@@ -522,28 +587,58 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
     Ok(table_name)
 }
 
-/// path → (size, modified_date) for every row already in the table
 struct Stored {
     size: u64,
     modified: String,
     checksum: String,
+    file_id: Option<FileId>,
+}
+
+// SQLite integers are signed 64-bit; device and inode numbers are stored bit-for-bit
+fn id_to_db(id: Option<FileId>) -> (Option<i64>, Option<i64>) {
+    (id.map(|(d, _)| d as i64), id.map(|(_, i)| i as i64))
+}
+
+fn id_from_db(device: Option<i64>, inode: Option<i64>) -> Option<FileId> {
+    Some((device? as u64, inode? as u64))
 }
 
 /// path → stored size, modified date and checksum for every row already in the table
 fn load_indexed(conn: &Connection, t: &str) -> DbResult<HashMap<String, Stored>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT path, size, COALESCE(modified_date, ''), COALESCE(checksum, '') FROM {t}",
+        "SELECT path, size, COALESCE(modified_date, ''), COALESCE(checksum, ''), device, inode FROM {t}",
         t = t
     ))?;
     let rows = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
-                Stored { size: row.get(1)?, modified: row.get(2)?, checksum: row.get(3)? },
+                Stored {
+                    size: row.get(1)?,
+                    modified: row.get(2)?,
+                    checksum: row.get(3)?,
+                    file_id: id_from_db(row.get(4)?, row.get(5)?),
+                },
             ))
         })?
         .collect();
     rows
+}
+
+/// Record device/inode for rows that predate those columns, without re-hashing
+fn update_file_ids(conn: &mut Connection, t: &str, rows: &[(String, Option<FileId>)]) -> DbResult<usize> {
+    let tx = conn.transaction()?;
+    let mut count = 0usize;
+    {
+        let mut stmt =
+            tx.prepare(&format!("UPDATE {t} SET device = ?1, inode = ?2 WHERE path = ?3", t = t))?;
+        for (path, id) in rows {
+            let (device, inode) = id_to_db(*id);
+            count += stmt.execute(params![device, inode, path])?;
+        }
+    }
+    tx.commit()?;
+    Ok(count)
 }
 
 fn delete_paths(conn: &mut Connection, t: &str, paths: &[String]) -> DbResult<usize> {
@@ -572,20 +667,20 @@ fn create_indexes(conn: &Connection, t: &str) -> DbResult<()> {
 fn commit_batch(conn: &mut Connection, t: &str, batch: &[FileEntry], upsert: bool) -> DbResult<usize> {
     let sql = if upsert {
         format!(
-            "INSERT INTO {t} (path,filename,size,modified_date,access_date,birth_date,checksum,extension,directory)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            "INSERT INTO {t} (path,filename,size,modified_date,access_date,birth_date,checksum,extension,directory,device,inode)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(path) DO UPDATE SET
                size=excluded.size, modified_date=excluded.modified_date,
                access_date=excluded.access_date, birth_date=excluded.birth_date,
                checksum=excluded.checksum, extension=excluded.extension,
-               directory=excluded.directory",
+               directory=excluded.directory, device=excluded.device, inode=excluded.inode",
             t = t
         )
     } else {
         format!(
             "INSERT OR IGNORE INTO {t}
-             (path,filename,size,modified_date,access_date,birth_date,checksum,extension,directory)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+             (path,filename,size,modified_date,access_date,birth_date,checksum,extension,directory,device,inode)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             t = t
         )
     };
@@ -593,10 +688,11 @@ fn commit_batch(conn: &mut Connection, t: &str, batch: &[FileEntry], upsert: boo
     let tx = conn.transaction()?;
     let mut count = 0usize;
     for e in batch {
+        let (device, inode) = id_to_db(e.file_id);
         count += tx.execute(
             &sql,
             params![e.path, e.filename, e.size, e.modified_date, e.access_date,
-                    e.birth_date, e.checksum, e.extension, e.directory],
+                    e.birth_date, e.checksum, e.extension, e.directory, device, inode],
         )?;
     }
     tx.commit()?;
@@ -675,7 +771,8 @@ fn run_worker(
     // ── Traversal ──
     let mut files: Vec<PathBuf> = Vec::new();
     let mut skipped = 0usize;
-    let mut seed: Vec<(String, u64, String)> = Vec::new();
+    let mut seed: Vec<(String, u64, String, Option<FileId>)> = Vec::new();
+    let mut backfill: Vec<(String, Option<FileId>)> = Vec::new(); // unchanged rows missing device/inode
     // Paths that could not be traversed; rows beneath them are not treated as deleted.
     // None means an error had no path, so no deletions are safe.
     let mut unreadable: Option<Vec<PathBuf>> = Some(Vec::new());
@@ -691,11 +788,19 @@ fn run_worker(
                     // index mode: any existing row is kept as-is
                     Some(row) if !upsert => Some(row),
                     // update mode: kept only if size and modified time still match
-                    Some((p, s)) => {
-                        let unchanged = e.metadata().ok().map_or(false, |m| {
+                    Some((p, mut s)) => {
+                        let meta = e.metadata().ok();
+                        let unchanged = meta.as_ref().map_or(false, |m| {
                             m.len() == s.size
                                 && m.modified().ok().map(fmt_time).unwrap_or_default() == s.modified
                         });
+                        if unchanged {
+                            let current = meta.as_ref().and_then(file_id);
+                            if current.is_some() && current != s.file_id {
+                                backfill.push((p.clone(), current));
+                                s.file_id = current;
+                            }
+                        }
                         unchanged.then_some((p, s))
                     }
                     None => None,
@@ -704,7 +809,7 @@ fn run_worker(
                     Some((p, s)) => {
                         skipped += 1;
                         if !s.checksum.is_empty() {
-                            seed.push((p, s.size, s.checksum));
+                            seed.push((p, s.size, s.checksum, s.file_id));
                         }
                     }
                     None => files.push(e.path().to_owned()),
@@ -727,6 +832,23 @@ fn run_worker(
     let found_any = !files.is_empty() || skipped > 0;
     let _ = tx.send(WorkerMsg::TraversalComplete { to_hash: files.len(), skipped });
     let _ = tx.send(WorkerMsg::Seed(seed));
+
+    if !backfill.is_empty() {
+        match update_file_ids(&mut conn, &table_name, &backfill) {
+            Ok(n) => {
+                let _ = tx.send(WorkerMsg::Info(format!(
+                    "recorded device/inode for {} existing rows (no re-hash needed)",
+                    n
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error {
+                    context: "db".to_string(),
+                    error: format!("could not record device/inode: {}", e),
+                });
+            }
+        }
+    }
 
     // ── Drop rows for deleted files (update mode) ──
     if upsert && !indexed.is_empty() {
@@ -785,6 +907,7 @@ fn run_worker(
                         path: entry.path.clone(),
                         size: entry.size,
                         checksum: entry.checksum.clone(),
+                        file_id: entry.file_id,
                     });
                     batch.push(entry);
                 }
@@ -1004,9 +1127,14 @@ fn draw_duplicates(f: &mut Frame, state: &AppState, area: Rect) {
                 ),
                 Span::styled(
                     format!(
-                        "   {} × {} copies",
+                        "   {} × {} copies{}",
                         fmt_bytes(group.size),
-                        group.paths.len()
+                        group.copies,
+                        match group.paths.len() - group.copies {
+                            0 => String::new(),
+                            1 => " (+1 hard link)".to_string(),
+                            n => format!(" (+{} hard links)", n),
+                        }
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),

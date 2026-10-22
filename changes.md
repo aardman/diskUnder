@@ -106,6 +106,22 @@ file's birth (creation) time — not the inode change time (`ctime`) its name su
 (`ALTER TABLE … RENAME COLUMN`, no data rewritten, values kept). Queries that select
 `change_date` need updating. `setupDB.sh` uses the new name too.
 
+### Hard links are not counted as wasted space
+
+**Previous behaviour:** Every path with a matching checksum counted as a separate copy, so
+hard links — several paths to the same data on disk — were reported as duplicates wasting
+space, even though removing one frees nothing.
+
+**Fix:** Each file's device and inode are recorded in new `device` and `inode` columns.
+Within a duplicate group, paths sharing a device and inode count as one copy; wasted space is
+`size × (distinct copies − 1)`, and a group made only of hard links is not a duplicate. The
+TUI shows e.g. `1 KB × 2 copies (+1 hard link)`.
+
+Existing tables get the columns added automatically. `update` fills them in for unchanged
+rows without re-hashing; `index` does not (it doesn't read file metadata for rows it skips),
+so until an `update` runs, older rows fall back to counting every path. Over SMB, hard links
+usually aren't visible as such, so this matters most when running on the file server itself.
+
 ### Plain mode prints traversal and database warnings
 
 Plain mode previously printed no warnings at all, so a failure showed only as an error count.

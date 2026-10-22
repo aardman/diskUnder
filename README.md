@@ -30,6 +30,8 @@ diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 
 > **Upgrading from v3:** v3 named tables after the path exactly as typed, and stored paths in that spelling (relative if you typed a relative path). The first v4 run with the **same spelling you used before** migrates that table in place — paths are rewritten to absolute and the table renamed — so nothing is re-hashed. If you used several spellings for one directory, only the first one migrated is kept; the others are left untouched.
 >
 > The `change_date` column is also renamed to `birth_date` on first use (it always held the file's creation time). Update any queries or scripts that select `change_date`.
+>
+> v4 also adds `device` and `inode` columns. Existing rows get them on the next `update` run without re-hashing; until then, hard links in those rows are counted as duplicates as before.
 
 Two modes are supported:
 
@@ -50,7 +52,9 @@ CREATE TABLE files_<MD5_HASH> (
     checksum      TEXT,       -- BLAKE3
     extension     TEXT,
     directory     TEXT,
-    created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+    device        INTEGER,    -- device + inode identify hard links to the same data
+    inode         INTEGER
 );
 ```
 
@@ -137,6 +141,7 @@ wasted: 3.2 GB
 | Duplicate tracking scales to large runs | — | — | — | No | Yes (empty files excluded) | Yes |
 | Duplicate totals cover all groups (not just the top 10) | — | — | — | No | Yes | Yes |
 | Duplicates found across the whole table (not just files hashed this run) | — | — | — | No | Yes | Yes |
+| Hard links not counted as wasted space | — | — | — | No | Yes | Yes |
 | Error breakdown (unreadable / not written / traversal) | No | No | No | No | Yes | Yes |
 | Network share resilience | Partial | Poor | Yes | Yes | Yes | Yes |
 | TUI progress | No | No | No | Yes | Yes | Yes |
