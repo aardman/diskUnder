@@ -1,5 +1,70 @@
 # diskUnder — Change Log
 
+## v5.0 — search, export and a run log
+
+First of the small v5 releases (plan: [v5-plan.md](v5-plan.md)).
+
+### `search`
+
+Query the index without re-indexing: `--name` (glob, `--ignore-case`), `--ext` (case-insensitive,
+`none` for no extension), `--larger-than` / `--smaller-than` (`500MB`, `1.5GB`), `--older-than` /
+`--newer-than` (`90d`, `6w`, `3m`, `1y`, or a date), `--not-accessed`, `--under PATH`, and
+`--duplicate` (hard-link aware). The path argument can be an indexed path, a folder inside one,
+or omitted to search every indexed path — which also finds duplicates across shares.
+
+Output is a readable table by default (`--limit`, default 100; `--sort path|size|modified|name`;
+`--long` for access/creation dates and checksum), or `--format csv|tsv|json`, `--paths`, or `-0`
+for `xargs -0`. The table is the same whether or not output is piped; only data goes to stdout,
+and notes ("index as of …", "… N more") go to stderr. Output stops quietly when a pipe closes
+(`| head`).
+
+### `export`
+
+Every column (root, path, filename, directory, extension, size, modified, accessed, created,
+checksum, device, inode) with no row limit, as CSV (default), TSV or newline-delimited JSON.
+Dates are ISO 8601 UTC; rows are streamed, so a million-row export doesn't sit in memory
+(1.4 s as CSV on a synthetic million-row index).
+
+`search` and `export` never modify the database: they don't run migrations, aren't logged, and
+read older layouts (v3 tables, mixed-case extensions) as they are.
+
+### Run log
+
+Commands that change a database (`index`, `update`, `db drop`, `db vacuum`) write `start`,
+`error`, `info` and `end` lines to `<database>.log`: the command line, user, host and version;
+errors with running it (traversal and database errors, failed batches, fatal errors — capped at
+50 per run; per-file read errors stay as counts); and an end line with outcome, duration, exit
+code and the run's summary. `--log FILE` and `--no-log` change or disable it. The log rotates to
+`.log.1` at 10 MB, lines from concurrent runs never interleave, and a log that can't be written
+never fails the run. `db drop` and `db vacuum` are only logged once they act — an unknown path or
+a declined confirmation writes nothing.
+
+### Fatal errors exit non-zero
+
+A run that stops before indexing anything — the database can't be opened, a migration fails,
+or the database is from a newer diskunder — now exits with status 1 (it exited 0), so cron and
+scripts can tell. Per-file errors still exit 0.
+
+### Schema versioning and lowercase extensions
+
+Migrations are numbered with SQLite's `PRAGMA user_version`. Schema 1 stores file extensions
+lowercase, so `JPG` and `jpg` are one type and the extension index is usable; `index` / `update`
+convert existing rows once. A database with a higher version than the running diskunder
+supports is refused rather than modified.
+
+### Source split into modules
+
+`src/main.rs` (1,764 lines) is now `cli`, `scan`, `db`, `progress`, `tui`, `plain`,
+`maintenance`, `fmt`, plus the new `runlog`, `query`, `output` and `search`. Behaviour-neutral;
+the existing tests passed unchanged across the split.
+
+### Tests
+
+48 in total (was 29): 3 unit tests for size, age and extension parsing, and new end-to-end
+tests for schema migration, the run log, and `search` / `export` filters, scopes and formats.
+
+---
+
 ## v4.1 — database maintenance
 
 ### `roots` table: which table is which

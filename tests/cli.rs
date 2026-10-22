@@ -76,6 +76,15 @@ struct Run {
 }
 
 fn run_in(cwd: &Path, args: &[&str]) -> Run {
+    run_expecting(cwd, args, 0)
+}
+
+/// For runs that stop on a fatal error, which exit with status 1
+fn run_failing(cwd: &Path, args: &[&str]) -> Run {
+    run_expecting(cwd, args, 1)
+}
+
+fn run_expecting(cwd: &Path, args: &[&str], code: i32) -> Run {
     let out = Command::new(BIN)
         .args(args)
         .arg("--no-tui")
@@ -83,7 +92,7 @@ fn run_in(cwd: &Path, args: &[&str]) -> Run {
         .output()
         .expect("failed to run diskunder");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(out.status.success(), "diskunder failed:\n{}", stderr);
+    assert_eq!(out.status.code(), Some(code), "unexpected exit status:\n{}", stderr);
     let summary = parse_summary(&stderr);
     Run { stderr, summary }
 }
@@ -449,7 +458,7 @@ fn failed_migration_stops_the_run_and_leaves_the_table() {
         .execute(&format!("UPDATE {} SET path = 'elsewhere/x'", legacy), [])
         .unwrap();
 
-    let run = run_in(tmp.path(), &["index", "./data", "--db", db.to_str().unwrap()]);
+    let run = run_failing(tmp.path(), &["index", "./data", "--db", db.to_str().unwrap()]);
     assert!(run.stderr.contains("could not migrate"), "{}", run.stderr);
     assert_eq!(run.summary.written, 0);
     assert_eq!(tables(&db), vec![legacy.clone()]);
@@ -834,4 +843,398 @@ fn db_commands_never_create_a_database() {
         assert!(r.stderr.contains("no database at"), "{}", r.stderr);
     }
     assert!(!tmp.path().join("missing.db").exists());
+}
+
+// ─── Schema versioning (v5) ──────────────────────────────────────────────────
+
+fn user_version(db: &Path) -> i64 {
+    count(db, "PRAGMA user_version")
+}
+
+#[test]
+fn extensions_are_stored_lowercase_and_older_databases_migrated() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    write(&data.join("a.JPG"), "a\n");
+    write(&data.join("b.Mov"), "b\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s]);
+    assert_eq!(user_version(&db), 1);
+    let t = table_for(&data);
+    assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension IN ('jpg', 'mov')", t)), 2);
+
+    // Turn it back into a v4 database: mixed-case extensions, schema version 0
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(&format!("UPDATE {} SET extension = 'JPG' WHERE extension = 'jpg'", t), []).unwrap();
+    conn.pragma_update(None, "user_version", 0).unwrap();
+    drop(conn);
+
+    write(&data.join("c.PNG"), "c\n");
+    let run = run_in(tmp.path(), &["update", "data", "--db", db_s]);
+    assert!(run.stderr.contains("schema 1: stored 1 file extensions in lowercase"), "{}", run.stderr);
+    assert_eq!(user_version(&db), 1);
+    assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension != lower(extension)", t)), 0);
+    assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension = 'png'", t)), 1);
+
+    let again = run_in(tmp.path(), &["update", "data", "--db", db_s]);
+    assert!(!again.stderr.contains("schema 1"), "migration runs once:\n{}", again.stderr);
+}
+
+#[test]
+fn database_from_a_newer_version_is_not_written() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 2);
+    let db = tmp.path().join("t.db");
+    Connection::open(&db).unwrap().pragma_update(None, "user_version", 99).unwrap();
+
+    let run = run_failing(tmp.path(), &["index", "data", "--db", db.to_str().unwrap()]);
+    assert!(run.stderr.contains("newer than this diskunder supports"), "{}", run.stderr);
+    assert_eq!(run.summary.written, 0);
+    assert!(tables(&db).is_empty());
+    assert_eq!(user_version(&db), 99);
+}
+
+// ─── Run log (v5) ────────────────────────────────────────────────────────────
+
+/// Lines of the run log next to `db`, as (run id, kind, text)
+fn log_lines(db: &Path) -> Vec<(String, String, String)> {
+    let path = format!("{}.log", db.display());
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            // 2026-10-23T02:00:01+01:00 run=7f3a2c start  text…
+            let mut parts = l.splitn(3, ' ');
+            let (_ts, id, rest) = (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap());
+            let (kind, text) = rest.split_once(' ').unwrap();
+            (id.trim_start_matches("run=").to_string(), kind.to_string(), text.trim_start().to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn index_and_update_are_logged_with_a_summary() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("my data"), 3);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "my data", "--db", db_s]);
+    run_in(tmp.path(), &["update", "my data", "--db", db_s]);
+
+    let lines = log_lines(&db);
+    let kinds: Vec<&str> = lines.iter().map(|(_, k, _)| k.as_str()).collect();
+    assert_eq!(kinds, ["start", "end", "start", "end"], "{:?}", lines);
+    assert_eq!(lines[0].0, lines[1].0, "start and end share a run id");
+    assert_ne!(lines[0].0, lines[2].0, "each run has its own id");
+    assert!(lines[0].2.starts_with(&format!("index 'my data' --db {} --no-tui  (user=", db_s)), "{}", lines[0].2);
+    assert!(lines[0].2.contains("version=5."), "{}", lines[0].2);
+    assert!(lines[1].2.starts_with("completed in "), "{}", lines[1].2);
+    assert!(lines[1].2.contains("— 3 found, 0 already indexed, 3 written, 0 removed, 0 errors, 0 duplicate groups"), "{}", lines[1].2);
+    assert!(lines[3].2.contains("3 unchanged, 0 written"), "{}", lines[3].2);
+}
+
+#[test]
+fn run_errors_are_logged_and_capped_but_file_errors_are_not() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    for i in 0..60 {
+        distinct_files(&data.join(format!("locked{:02}", i)), 1);
+        chmod(&data.join(format!("locked{:02}", i)), "000");
+    }
+    write(&data.join("unreadable"), "secret\n");
+    chmod(&data.join("unreadable"), "000");
+    if permissions_ignored(&data.join("locked00")) {
+        eprintln!("skipping: permissions not enforced (running as root?)");
+        return;
+    }
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "data", "--db", db.to_str().unwrap()]);
+
+    let lines = log_lines(&db);
+    let errors: Vec<&String> = lines.iter().filter(|(_, k, _)| k == "error").map(|(_, _, t)| t).collect();
+    assert_eq!(errors.len(), 51, "50 errors, then a count of the rest");
+    assert!(errors.iter().take(50).all(|t| t.contains("locked")), "{:?}", errors);
+    assert_eq!(errors[50], "… and 10 more errors (not logged)");
+    assert!(!errors.iter().any(|t| t.contains("unreadable")), "per-file errors stay out of the log");
+}
+
+#[test]
+fn failed_runs_are_logged_with_their_exit_code() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 1);
+    let db = tmp.path().join("t.db");
+    Connection::open(&db).unwrap().pragma_update(None, "user_version", 99).unwrap();
+    run_failing(tmp.path(), &["index", "data", "--db", db.to_str().unwrap()]);
+
+    let lines = log_lines(&db);
+    let end = &lines.last().unwrap().2;
+    assert!(end.starts_with("failed in ") && end.contains("(exit 1) — db — could not update database schema"), "{}", end);
+    assert!(lines.iter().any(|(_, k, t)| k == "error" && t.contains("newer than this diskunder")));
+}
+
+#[test]
+fn log_location_can_be_changed_or_turned_off() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 1);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+
+    run_in(tmp.path(), &["index", "data", "--db", db_s, "--no-log"]);
+    assert!(!tmp.path().join("t.db.log").exists());
+
+    let custom = tmp.path().join("logs-here.txt");
+    run_in(tmp.path(), &["update", "data", "--db", db_s, "--log", custom.to_str().unwrap()]);
+    assert!(!tmp.path().join("t.db.log").exists());
+    assert_eq!(fs::read_to_string(&custom).unwrap().lines().count(), 2);
+}
+
+#[test]
+fn an_unwritable_log_never_fails_the_run() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 2);
+    let db = tmp.path().join("t.db");
+    let run = run_in(
+        tmp.path(),
+        &["index", "data", "--db", db.to_str().unwrap(), "--log", "/nonexistent-dir/x.log"],
+    );
+    assert_eq!(run.summary.written, 2);
+    assert!(run.stderr.contains("warning: could not write run log /nonexistent-dir/x.log"), "{}", run.stderr);
+}
+
+#[test]
+fn large_logs_are_rotated() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 1);
+    let db = tmp.path().join("t.db");
+    let log = tmp.path().join("t.db.log");
+    File::create(&log).unwrap().set_len(10 * 1024 * 1024).unwrap();
+
+    run_in(tmp.path(), &["index", "data", "--db", db.to_str().unwrap()]);
+    assert_eq!(fs::metadata(tmp.path().join("t.db.log.1")).unwrap().len(), 10 * 1024 * 1024);
+    assert_eq!(log_lines(&db).len(), 2, "a fresh log holds just this run");
+}
+
+#[test]
+fn db_drop_and_vacuum_are_logged_only_when_they_act() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 2);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s, "--no-log"]);
+
+    db_cmd(tmp.path(), &["drop", "data", "--db", db_s]); // refused: no --yes
+    db_cmd(tmp.path(), &["drop", "elsewhere", "--yes", "--db", db_s]); // no such index
+    db_cmd(tmp.path(), &["info", "--db", db_s]);
+    db_cmd(tmp.path(), &["check", "--db", db_s]);
+    assert!(log_lines(&db).is_empty(), "nothing changed, so nothing logged: {:?}", log_lines(&db));
+
+    db_cmd(tmp.path(), &["drop", "data", "--yes", "--db", db_s]);
+    db_cmd(tmp.path(), &["vacuum", "--db", db_s]);
+    let lines = log_lines(&db);
+    let kinds: Vec<&str> = lines.iter().map(|(_, k, _)| k.as_str()).collect();
+    assert_eq!(kinds, ["start", "end", "start", "end"], "{:?}", lines);
+    assert!(lines[0].2.starts_with("db drop data --yes --db "), "{}", lines[0].2);
+    assert!(lines[1].2.contains("— removed the index of") && lines[1].2.contains("(2 files)"), "{}", lines[1].2);
+    assert!(lines[3].2.contains("— vacuumed "), "{}", lines[3].2);
+}
+
+// ─── search and export (5.0) ─────────────────────────────────────────────────
+
+struct Query {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn query(cwd: &Path, args: &[&str]) -> Query {
+    let out = Command::new(BIN).args(args).current_dir(cwd).output().unwrap();
+    Query {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// File names (not full paths) from `--paths` output, in output order
+fn names(stdout: &str) -> Vec<String> {
+    stdout.lines().map(|l| Path::new(l).file_name().unwrap().to_string_lossy().into_owned()).collect()
+}
+
+/// A small indexed share: varied sizes, types, ages, a duplicate and a hard link
+fn sample_share(tmp: &TempDir) -> (PathBuf, PathBuf) {
+    let nas = tmp.path().join("nas");
+    write(&nas.join("projects/render.MOV"), &"m".repeat(3000));
+    write(&nas.join("backup/render.mov"), &"m".repeat(3000));
+    write(&nas.join("projects/notes.pdf"), &"p".repeat(500));
+    write(&nas.join("projects/notes-link.pdf"), "");
+    fs::remove_file(nas.join("projects/notes-link.pdf")).unwrap();
+    fs::hard_link(nas.join("projects/notes.pdf"), nas.join("projects/notes-link.pdf")).unwrap();
+    write(&nas.join("logs/app1.log"), "one\n");
+    write(&nas.join("logs/app2.log"), "two\n");
+    write(&nas.join("README"), "readme\n");
+    set_mtime(&nas.join("logs/app1.log"), days_ago(400));
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "nas", "--db", db.to_str().unwrap()]);
+    (nas, db)
+}
+
+#[test]
+fn search_filters() {
+    let tmp = TempDir::new();
+    let (_, db) = sample_share(&tmp);
+    let db_s = db.to_str().unwrap();
+    let find = |extra: &[&str]| {
+        let mut args = vec!["search", "nas", "--paths", "--db", db_s];
+        args.extend_from_slice(extra);
+        let q = query(tmp.path(), &args);
+        assert_eq!(q.code, 0, "{}", q.stderr);
+        let mut n = names(&q.stdout);
+        n.sort();
+        n
+    };
+    assert_eq!(find(&["--ext", "MOV"]), ["render.MOV", "render.mov"], "extension match ignores case");
+    assert_eq!(find(&["--ext", "none"]), ["README"]);
+    assert_eq!(find(&["--name", "app*"]), ["app1.log", "app2.log"]);
+    assert_eq!(find(&["--name", "RENDER.*"]), Vec::<String>::new(), "--name is case-sensitive");
+    assert_eq!(find(&["--name", "RENDER.*", "--ignore-case"]), ["render.MOV", "render.mov"]);
+    assert_eq!(find(&["--larger-than", "1K"]), ["render.MOV", "render.mov"]);
+    assert_eq!(find(&["--smaller-than", "10"]), ["README", "app1.log", "app2.log"]);
+    assert_eq!(find(&["--older-than", "1y"]), ["app1.log"]);
+    assert_eq!(find(&["--newer-than", "30d", "--ext", "log"]), ["app2.log"]);
+    assert_eq!(find(&["--under", "nas/logs"]), ["app1.log", "app2.log"]);
+    assert_eq!(find(&["--duplicate"]), ["render.MOV", "render.mov"], "hard links are not duplicates");
+}
+
+#[test]
+fn search_sorting_and_limit() {
+    let tmp = TempDir::new();
+    let (_, db) = sample_share(&tmp);
+    let db_s = db.to_str().unwrap();
+
+    let by_size = query(tmp.path(), &["search", "nas", "--sort", "size", "--paths", "--db", db_s]);
+    assert_eq!(names(&by_size.stdout)[2..4], ["notes-link.pdf", "notes.pdf"]);
+    let by_name = query(tmp.path(), &["search", "nas", "--sort", "name", "--paths", "--db", db_s]);
+    assert_eq!(names(&by_name.stdout)[0], "README");
+
+    let limited = query(tmp.path(), &["search", "nas", "--limit", "2", "--db", db_s]);
+    assert_eq!(limited.stdout.lines().count(), 3, "header + 2 rows:\n{}", limited.stdout);
+    assert!(limited.stdout.starts_with("     SIZE  MODIFIED          PATH\n"), "{}", limited.stdout);
+    assert!(limited.stderr.contains("… 5 more — use --limit"), "note goes to stderr:\n{}", limited.stderr);
+    assert!(limited.stderr.starts_with("index as of "), "{}", limited.stderr);
+    assert!(!limited.stdout.contains("more") && !limited.stdout.contains("index as of"));
+
+    let none = query(tmp.path(), &["search", "nas", "--ext", "xyz", "--db", db_s]);
+    assert_eq!((none.code, none.stdout.as_str()), (0, ""));
+    assert!(none.stderr.contains("no matching files"));
+}
+
+#[test]
+fn search_scope_folder_all_paths_and_cross_share_duplicates() {
+    let tmp = TempDir::new();
+    let (nas, db) = sample_share(&tmp);
+    let db_s = db.to_str().unwrap();
+    let other = tmp.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    fs::copy(nas.join("projects/notes.pdf"), other.join("notes-copy.pdf")).unwrap();
+    run_in(tmp.path(), &["index", "other", "--db", db_s]);
+
+    let folder = query(tmp.path(), &["search", "nas/projects", "--paths", "--db", db_s]);
+    assert_eq!(names(&folder.stdout).len(), 3, "a folder inside an index searches just that folder");
+
+    let one = query(tmp.path(), &["search", "nas", "--duplicate", "--ext", "pdf", "--paths", "--db", db_s]);
+    assert!(one.stdout.is_empty(), "within /nas the pdfs are hard links, not copies");
+    let all = query(tmp.path(), &["search", "--duplicate", "--ext", "pdf", "--paths", "--db", db_s]);
+    assert_eq!(names(&all.stdout).len(), 3, "across shares the copy in other/ makes them duplicates");
+    assert!(all.stderr.contains("2 indexed paths"), "{}", all.stderr);
+
+    let missing = query(tmp.path(), &["search", "/nowhere", "--db", db_s]);
+    assert_eq!(missing.code, 1);
+    assert!(missing.stderr.contains("no index covers /nowhere"), "{}", missing.stderr);
+}
+
+#[test]
+fn search_and_export_formats() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    write(&data.join("plain.txt"), "plain\n");
+    write(&data.join("comma, \"quoted\".txt"), "odd\n");
+    write(&data.join("tab\there.txt"), "tab\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s]);
+
+    let csv = query(tmp.path(), &["export", "data", "--db", db_s]);
+    let mut lines = csv.stdout.lines();
+    assert_eq!(lines.next().unwrap(), "root,path,filename,directory,extension,size,modified,accessed,created,checksum,device,inode");
+    assert!(csv.stdout.contains(",\"comma, \"\"quoted\"\".txt\","), "CSV quoting:\n{}", csv.stdout);
+    assert!(csv.stdout.contains(",txt,6,"), "{}", csv.stdout);
+    assert!(csv.stderr.contains("exported 3 files"));
+
+    let tsv = query(tmp.path(), &["export", "data", "--format", "tsv", "--db", db_s]);
+    assert!(tsv.stdout.contains("\ttab\\there.txt\t"), "TSV escapes tabs:\n{}", tsv.stdout);
+    assert_eq!(tsv.stdout.lines().count(), 4);
+
+    let json = query(tmp.path(), &["search", "data", "--name", "plain*", "--format", "json", "--db", db_s]);
+    let obj = json.stdout.trim_end();
+    assert_eq!(json.stdout.lines().count(), 1, "one object per line");
+    assert!(obj.starts_with("{\"root\":\"") && obj.ends_with('}'), "{}", obj);
+    assert!(obj.contains("\"filename\":\"plain.txt\"") && obj.contains("\"size\":6,"), "{}", obj);
+    assert!(obj.contains("\"modified\":\"") && obj.contains("Z\",\"accessed\""), "ISO 8601 UTC dates: {}", obj);
+
+    let nul = query(tmp.path(), &["search", "data", "-0", "--db", db_s]);
+    assert_eq!(nul.stdout.matches('\0').count(), 3);
+    assert!(!nul.stdout.contains('\n'), "NUL-separated, no newlines");
+}
+
+#[test]
+fn export_has_no_row_limit() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 250);
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "data", "--db", db.to_str().unwrap()]);
+    let search = query(tmp.path(), &["search", "data", "--paths", "--db", db.to_str().unwrap()]);
+    assert_eq!(search.stdout.lines().count(), 100, "search defaults to 100 rows");
+    let export = query(tmp.path(), &["export", "data", "--db", db.to_str().unwrap()]);
+    assert_eq!(export.stdout.lines().count(), 251, "header + every row");
+}
+
+#[test]
+fn queries_never_log_migrate_or_create_anything() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    write(&data.join("a.JPG"), "a\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s, "--no-log"]);
+    // Back to a v4 database: mixed-case extension, schema version 0
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(&format!("UPDATE {} SET extension = 'JPG'", table_for(&data)), []).unwrap();
+    conn.pragma_update(None, "user_version", 0).unwrap();
+    drop(conn);
+
+    let q = query(tmp.path(), &["search", "--ext", "jpg", "--paths", "--db", db_s]);
+    assert_eq!(names(&q.stdout), ["a.JPG"], "un-migrated databases still match case-insensitively");
+    query(tmp.path(), &["export", "--db", db_s]);
+    assert_eq!(user_version(&db), 0, "queries don't migrate");
+    assert!(!tmp.path().join("t.db.log").exists(), "queries aren't logged");
+
+    let missing = query(tmp.path(), &["search", "--db", "missing.db"]);
+    assert_eq!(missing.code, 1);
+    assert!(!tmp.path().join("missing.db").exists());
+}
+
+#[test]
+fn queries_read_v3_tables() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    write(&data.join("a"), "aaa\n");
+    write(&data.join("b"), "aaa\n");
+    let db = tmp.path().join("t.db");
+    create_v3_table(&db, "data/", &[("data/a", "same"), ("data/b", "same")]);
+
+    let q = query(tmp.path(), &["search", "--duplicate", "--paths", "--db", db.to_str().unwrap()]);
+    assert_eq!(q.code, 0, "{}", q.stderr);
+    assert_eq!(names(&q.stdout), ["a", "b"]);
+    assert!(q.stderr.contains("has no recorded runs"), "{}", q.stderr);
 }

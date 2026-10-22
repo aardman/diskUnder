@@ -1,0 +1,286 @@
+//! Run state shared by both displays: counters, errors and live duplicate tracking
+
+use std::collections::{HashMap, HashSet};
+
+use crate::fmt::{fmt_bytes, fmt_count};
+use crate::scan::{FileId, WorkerMsg};
+
+pub(crate) struct DupGroup {
+    pub(crate) size: u64,
+    pub(crate) paths: Vec<String>,
+    pub(crate) copies: usize, // distinct files; paths.len() − copies are extra hard links
+    pub(crate) wasted: u64,   // size × (copies − 1)
+}
+
+/// Every path seen with one checksum. Paths sharing a FileId are hard links to the same
+/// data, so they count as one copy; paths with no FileId each count as their own copy.
+pub(crate) struct ChecksumGroup {
+    pub(crate) size: u64,
+    pub(crate) paths: Vec<String>,
+    pub(crate) ids: HashSet<FileId>,
+    pub(crate) unknown_ids: usize,
+}
+
+impl ChecksumGroup {
+    pub(crate) fn copies(&self) -> usize {
+        self.ids.len() + self.unknown_ids
+    }
+}
+
+// ─── Application state ───────────────────────────────────────────────────────
+
+pub(crate) struct AppState {
+    pub(crate) mode: String,
+    pub(crate) target_path: String,
+    pub(crate) db_path: String,
+
+    pub(crate) files_found: usize,
+    pub(crate) files_skipped: usize, // already indexed (index mode) or unchanged (update mode)
+    pub(crate) files_hashed: usize,
+    pub(crate) files_written: usize,
+    pub(crate) files_removed: usize, // rows dropped for deleted files (update mode)
+    pub(crate) files_errored: usize,  // queued files that could not be read or hashed
+    pub(crate) files_unwritten: usize, // hashed files lost to a failed batch commit
+    pub(crate) other_errors: usize,   // traversal and database errors
+    pub(crate) fatal: Option<String>, // set if the run stopped before indexing anything
+    pub(crate) total_files: Option<usize>, // set once traversal is complete
+
+    pub(crate) current_file: String,
+
+    // In-memory checksum index for live duplicate detection.
+    // For very large runs (millions of files) this will grow proportionally.
+    pub(crate) checksum_map: HashMap<String, ChecksumGroup>,
+    pub(crate) dup_keys: HashSet<String>,                         // checksums with 2+ distinct copies
+    pub(crate) dups_dirty: bool,                                  // top_dups needs refreshing
+    pub(crate) top_dups: Vec<DupGroup>,                           // top 10 by wasted bytes
+    pub(crate) dup_wasted: u64,                                   // wasted bytes across all groups
+
+    pub(crate) log: Vec<String>,
+    pub(crate) done: bool,
+}
+
+impl AppState {
+    pub(crate) fn new(mode: &str, target_path: &str, db_path: &str) -> Self {
+        AppState {
+            mode: mode.to_owned(),
+            target_path: target_path.to_owned(),
+            db_path: db_path.to_owned(),
+            files_found: 0,
+            files_skipped: 0,
+            files_hashed: 0,
+            files_written: 0,
+            files_removed: 0,
+            files_errored: 0,
+            files_unwritten: 0,
+            other_errors: 0,
+            fatal: None,
+            total_files: None,
+            current_file: String::new(),
+            checksum_map: HashMap::new(),
+            dup_keys: HashSet::new(),
+            dups_dirty: false,
+            top_dups: Vec::new(),
+            dup_wasted: 0,
+            log: Vec::new(),
+            done: false,
+        }
+    }
+
+    pub(crate) fn skipped_label(&self) -> &'static str {
+        if self.mode == "update" { "unchanged" } else { "already indexed" }
+    }
+
+    pub(crate) fn errors_total(&self) -> usize {
+        self.files_errored + self.files_unwritten + self.other_errors
+    }
+
+    /// One-line summary of the run for the run log
+    pub(crate) fn log_summary(&self) -> String {
+        if let Some(fatal) = &self.fatal {
+            return fatal.clone();
+        }
+        format!(
+            "{} found, {} {}, {} written, {} removed, {}, {} duplicate groups, {} wasted",
+            fmt_count(self.files_found as i64),
+            fmt_count(self.files_skipped as i64),
+            self.skipped_label(),
+            fmt_count(self.files_written as i64),
+            fmt_count(self.files_removed as i64),
+            self.errors_summary(),
+            fmt_count(self.dup_keys.len() as i64),
+            fmt_bytes(self.dup_wasted)
+        )
+    }
+
+    /// e.g. "3 errors (2 unreadable, 1 not written)"; just "0 errors" when clean
+    pub(crate) fn errors_summary(&self) -> String {
+        let parts: Vec<String> = [
+            (self.files_errored, "unreadable"),
+            (self.files_unwritten, "not written"),
+            (self.other_errors, "traversal/db"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{} {}", n, label))
+        .collect();
+        if parts.is_empty() {
+            "0 errors".to_string()
+        } else {
+            format!("{} errors ({})", self.errors_total(), parts.join(", "))
+        }
+    }
+
+    pub(crate) fn progress(&self) -> f64 {
+        match self.total_files {
+            // Count unreadable files as processed — otherwise permission-denied files on
+            // /Users/ or a network share leave the bar stuck below 100% when the run is done.
+            // Traversal errors are not counted: those entries were never queued in `n`.
+            Some(n) if n > 0 => (self.files_hashed + self.files_errored) as f64 / n as f64,
+            _ => 0.0,
+        }
+    }
+
+    pub(crate) fn push_log(&mut self, msg: String) {
+        self.log.push(msg);
+        if self.log.len() > 500 {
+            self.log.remove(0);
+        }
+    }
+
+    pub(crate) fn record_hashed(&mut self, path: String, size: u64, checksum: String, id: Option<FileId>) {
+        self.files_hashed += 1;
+        self.current_file = path.clone();
+        self.track_checksum(path, size, checksum, id);
+    }
+
+    pub(crate) fn track_checksum(&mut self, path: String, size: u64, checksum: String, id: Option<FileId>) {
+        // Empty files all share one checksum and waste nothing — not worth tracking
+        if size == 0 {
+            return;
+        }
+
+        let add = |g: &mut ChecksumGroup, path: String| {
+            g.paths.push(path);
+            match id {
+                Some(id) => {
+                    g.ids.insert(id);
+                }
+                None => g.unknown_ids += 1,
+            }
+        };
+        match self.checksum_map.get_mut(&checksum) {
+            Some(group) => {
+                add(group, path);
+                if group.copies() >= 2 {
+                    self.dups_dirty = true;
+                    if !self.dup_keys.contains(&checksum) {
+                        self.dup_keys.insert(checksum);
+                    }
+                }
+            }
+            None => {
+                let mut group = ChecksumGroup {
+                    size,
+                    paths: Vec::new(),
+                    ids: HashSet::new(),
+                    unknown_ids: 0,
+                };
+                add(&mut group, path);
+                self.checksum_map.insert(checksum, group);
+            }
+        }
+    }
+
+    /// Recompute the top-10 duplicate groups if anything changed since the last call.
+    /// Called once per UI tick rather than per file, and only scans groups that have
+    /// duplicates, so cost doesn't grow with the number of files hashed.
+    pub(crate) fn refresh_top_dups(&mut self) {
+        if !self.dups_dirty {
+            return;
+        }
+        self.dups_dirty = false;
+
+        let mut ranked: Vec<(u64, &String)> = self
+            .dup_keys
+            .iter()
+            .map(|k| {
+                let g = &self.checksum_map[k];
+                (g.size * (g.copies() as u64 - 1), k)
+            })
+            .collect();
+        self.dup_wasted = ranked.iter().map(|(w, _)| w).sum();
+        let by_wasted = |a: &(u64, &String), b: &(u64, &String)| b.0.cmp(&a.0);
+        if ranked.len() > 10 {
+            ranked.select_nth_unstable_by(9, by_wasted);
+            ranked.truncate(10);
+        }
+        ranked.sort_unstable_by(by_wasted);
+
+        self.top_dups = ranked
+            .into_iter()
+            .map(|(wasted, k)| {
+                let g = &self.checksum_map[k];
+                DupGroup { size: g.size, paths: g.paths.clone(), copies: g.copies(), wasted }
+            })
+            .collect();
+    }
+
+    pub(crate) fn apply(&mut self, msg: WorkerMsg) {
+        match msg {
+            WorkerMsg::FileFound => self.files_found += 1,
+            WorkerMsg::FileHashed { path, size, checksum, file_id } => {
+                self.record_hashed(path, size, checksum, file_id);
+            }
+            WorkerMsg::FileError { path, error } => {
+                self.files_errored += 1;
+                self.push_log(format!("warn: {} — {}", path, error));
+            }
+            WorkerMsg::Error { context, error } => {
+                self.other_errors += 1;
+                self.push_log(format!("warn: {} — {}", context, error));
+            }
+            WorkerMsg::Fatal { context, error } => {
+                self.other_errors += 1;
+                self.push_log(format!("error: {} — {}", context, error));
+                self.fatal = Some(format!("{} — {}", context, error));
+            }
+            WorkerMsg::Info(line) => self.push_log(line),
+            WorkerMsg::Seed(entries) => {
+                for (path, size, checksum, file_id) in entries {
+                    self.track_checksum(path, size, checksum, file_id);
+                }
+            }
+            WorkerMsg::BatchWritten(n) => self.files_written += n,
+            WorkerMsg::Removed(n) => {
+                self.files_removed = n;
+                self.push_log(format!("removed {} rows for files no longer on disk", n));
+            }
+            WorkerMsg::BatchFailed { files, error } => {
+                self.files_unwritten += files;
+                self.push_log(format!("error: batch of {} files not written — {}", files, error));
+            }
+            WorkerMsg::TraversalComplete { to_hash, skipped } => {
+                self.total_files = Some(to_hash);
+                self.files_skipped = skipped;
+                if skipped > 0 {
+                    self.push_log(format!(
+                        "traversal complete — {} files found, {} {}, {} to hash",
+                        self.files_found, skipped, self.skipped_label(), to_hash
+                    ));
+                } else {
+                    self.push_log(format!("traversal complete — {} files found", to_hash));
+                }
+            }
+            WorkerMsg::Done => {
+                self.done = true;
+                self.refresh_top_dups();
+                self.push_log(format!(
+                    "done — {} written, {}, {} duplicate groups",
+                    self.files_written,
+                    self.errors_summary(),
+                    self.dup_keys.len()
+                ));
+            }
+        }
+    }
+}

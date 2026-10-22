@@ -334,12 +334,13 @@ dependencies = [
 
 [[package]]
 name = "diskunder"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "md5",
  "ratatui",
  "rayon",

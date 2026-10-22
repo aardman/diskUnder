@@ -4,3 +4,5 @@
 *.db
 *.db-wal
 *.db-shm
+*.db.log
+*.db.log.1

@@ -4,86 +4,14 @@ A command-line tool for indexing file metadata and detecting duplicate files/fol
 
 ---
 
-## Background
-
-The project was developed in multiple languages, each addressing the limitations of the previous:
-
-- **Bash (v1):** Initial proof-of-concept — simple but slow due to sequential per-file processing
-- **Bash (v2):** Optimised with parallel `xargs`, deferred index creation, and SQL batching
-- **Python:** More structured, with multiprocessing and bulk inserts — but ultimately too slow for large network shares
-- **Rust v1:** Best performance, but contained bugs around network share resilience and resumability
-- **Rust v2:** All known bugs fixed, plain-text output only
-- **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
-- **Rust v4** (current, `src/main.rs`): Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
-- **Rust v5+** (planned): Features — see [future.md](future.md)
-
-Only the current Rust version is kept in this repository; the earlier versions were not committed.
-
-See [changes.md](changes.md) for a detailed change log and [future.md](future.md) for planned features.
-
----
-
 ## How It Works
 
 diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 checksum), and writes it to a SQLite database. Multiple paths can be indexed into the same database — each path gets its own table named `files_<MD5(path)>`, where `path` is the canonical (absolute, symlink-resolved) root. `/nas`, `/nas/`, `./nas` and a symlink to it all share one table, and stored paths are always absolute.
-
-> **Upgrading from v3:** v3 named tables after the path exactly as typed, and stored paths in that spelling (relative if you typed a relative path). The first v4 run with the **same spelling you used before** migrates that table in place — paths are rewritten to absolute and the table renamed — so nothing is re-hashed. If you used several spellings for one directory, only the first one migrated is kept; the others are left untouched.
->
-> The `change_date` column is also renamed to `birth_date` on first use (it always held the file's creation time). Update any queries or scripts that select `change_date`.
->
-> v4 also adds `device` and `inode` columns. Existing rows get them on the next `update` run without re-hashing; until then, hard links in those rows are counted as duplicates as before.
->
-> **Upgrading to v4.1:** the `roots` table is created automatically, and each path is recorded the next time it's indexed or updated. Until then `diskunder db info` lists its table as having no recorded path.
 
 Two modes are supported:
 
 - **`index`** — full traversal of the target path. Files already in the database are skipped without being re-hashed, so an interrupted run can simply be restarted
 - **`update`** — full traversal that brings the table in line with disk: new files and files whose size or modified time differ from the database are hashed, unchanged files are skipped without being re-hashed, and rows for files no longer on disk are removed. Rows under a directory that could not be read are kept, and nothing is removed if the walk finds no files at all (e.g. an unmounted share)
-
-### Database Schema
-
-```sql
-CREATE TABLE files_<MD5_HASH> (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    path          TEXT NOT NULL UNIQUE,
-    filename      TEXT NOT NULL,
-    size          INTEGER NOT NULL,
-    modified_date TEXT,
-    access_date   TEXT,
-    birth_date    TEXT,       -- creation time where the filesystem records one, else empty
-    checksum      TEXT,       -- BLAKE3
-    extension     TEXT,
-    directory     TEXT,
-    created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
-    device        INTEGER,    -- device + inode identify hard links to the same data
-    inode         INTEGER
-);
-```
-
-Indexes are created on `size`, `filename`, `checksum`, `extension`, `directory`, `access_date`, and `modified_date`.
-
-Since table names are a hash, a `roots` table (v4.1+) records which path each table belongs to
-and how its last run went. It is updated at the start and end of every run:
-
-```sql
-CREATE TABLE roots (
-    table_name    TEXT PRIMARY KEY,   -- files_<MD5_HASH>
-    root          TEXT NOT NULL,      -- canonical path
-    first_run     TEXT NOT NULL,      -- UTC
-    last_started  TEXT NOT NULL,
-    last_finished TEXT,               -- NULL if the last run was interrupted (or is still running)
-    last_mode     TEXT NOT NULL       -- index | update
-);
-```
-
-### SQLite Optimisations
-
-```sql
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA temp_store = MEMORY;
-PRAGMA cache_size = 100000;
-```
 
 ---
 
@@ -113,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 0.4.1`:
+**Check it worked** — this should print `diskunder 0.5.0`:
 
 ```bash
 diskunder --version
@@ -189,7 +117,7 @@ complete: 772087 files — 0 already indexed, 749404 written, 0 removed, 22683 e
 wasted: 3.2 GB
 ```
 
-**Dependencies:** `blake3`, `chrono`, `clap`, `crossterm`, `md5`, `rayon`, `ratatui`, `rusqlite`, `walkdir`
+**Dependencies:** `blake3`, `chrono`, `clap`, `crossterm`, `libc`, `md5`, `rayon`, `ratatui`, `rusqlite`, `walkdir`
 
 ---
 
@@ -249,6 +177,64 @@ rm -rf /tmp/diskunder-demo
 
 ---
 
+## Searching and exporting
+
+`search` and `export` read the index — they never touch the files themselves, so they're
+instant even on a share that's slow or offline. Run `update` first for current answers; both
+commands start by noting how old the index is.
+
+Give an indexed path, a folder inside one, or nothing to search every indexed path (which
+also finds duplicates *across* shares):
+
+```bash
+diskunder search /Volumes/NAS --ext mov,mp4 --larger-than 1GB
+diskunder search /Volumes/NAS/projects --older-than 1y --sort size
+diskunder search --duplicate --larger-than 500MB
+diskunder search /Volumes/NAS --name "*.log" --ignore-case --paths
+```
+
+```text
+index as of 2026-10-23 02:14
+     SIZE  MODIFIED          PATH
+   2.9 GB  2024-11-01 10:22  /Volumes/NAS/backup/render.mov
+   2.9 GB  2024-11-01 10:22  /Volumes/NAS/projects/film one/render.mov
+```
+
+| Filter | Matches |
+|---|---|
+| `--name GLOB` | file name, e.g. `"*.log"` (`--ignore-case` to ignore case) |
+| `--ext LIST` | extensions, case-insensitive, e.g. `jpg,mov`; `none` for files without one |
+| `--larger-than SIZE` / `--smaller-than SIZE` | `500MB`, `1.5GB`, `200K` (1024-based) |
+| `--older-than AGE` / `--newer-than AGE` | modified date: `90d`, `6w`, `3m`, `1y`, or `2024-01-01` |
+| `--not-accessed AGE` | access date (unreliable on many servers) |
+| `--under PATH` | only files under this folder |
+| `--duplicate` | files with at least one other copy (hard links don't count) |
+
+**Output.** A readable table by default, the same whether or not it's piped. Only data goes
+to stdout — notes such as "index as of …" and "… 340 more" go to stderr, so `| grep` and
+`> file` get clean rows.
+
+| Option | Effect |
+|---|---|
+| `--limit N` | rows to show (default 100; `0` for all) |
+| `--sort path\|size\|modified\|name` | order (size and modified are largest/newest first) |
+| `--long` | add access and creation dates and checksum to the table |
+| `--format csv\|tsv\|json` | machine-readable, every column; JSON is one object per line |
+| `--paths` / `-0` | bare paths, one per line or NUL-separated for `xargs -0` |
+
+**`export`** is `search` for spreadsheets and BI tools: every column, no row limit, CSV by
+default (`--format tsv` or `json` also work), streamed so a million rows don't sit in memory.
+
+```bash
+diskunder export /Volumes/NAS > nas.csv
+diskunder export /Volumes/NAS --ext mov,mp4 --format json > video.ndjson
+```
+
+Columns: `root, path, filename, directory, extension, size, modified, accessed, created,
+checksum, device, inode`. Dates are ISO 8601 in UTC (`2024-11-01T10:22:05Z`); sizes are bytes.
+
+---
+
 ## Database maintenance
 
 `diskunder db` looks after the index database. It never creates a database — pass the same
@@ -274,11 +260,83 @@ interrupted (or is still running); re-running it resumes where it stopped. Back 
 database with SQLite's online backup while nothing is writing to it:
 `sqlite3 /data/index.db ".backup /backups/index.db"`.
 
+### Database Schema
+
+```sql
+CREATE TABLE files_<MD5_HASH> (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    path          TEXT NOT NULL UNIQUE,
+    filename      TEXT NOT NULL,
+    size          INTEGER NOT NULL,
+    modified_date TEXT,
+    access_date   TEXT,
+    birth_date    TEXT,       -- creation time where the filesystem records one, else empty
+    checksum      TEXT,       -- BLAKE3
+    extension     TEXT,
+    directory     TEXT,
+    created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+    device        INTEGER,    -- device + inode identify hard links to the same data
+    inode         INTEGER
+);
+```
+
+Indexes are created on `size`, `filename`, `checksum`, `extension`, `directory`, `access_date`, and `modified_date`.
+
+Since table names are a hash, a `roots` table (v4.1+) records which path each table belongs to
+and how its last run went. It is updated at the start and end of every run:
+
+```sql
+CREATE TABLE roots (
+    table_name    TEXT PRIMARY KEY,   -- files_<MD5_HASH>
+    root          TEXT NOT NULL,      -- canonical path
+    first_run     TEXT NOT NULL,      -- UTC
+    last_started  TEXT NOT NULL,
+    last_finished TEXT,               -- NULL if the last run was interrupted (or is still running)
+    last_mode     TEXT NOT NULL       -- index | update
+);
+```
+
+The layout version is kept in SQLite's `PRAGMA user_version` (v5.0+: `1`). `index` and
+`update` bring an older database up to date; a database written by a newer diskunder is
+refused rather than modified.
+
+### SQLite Optimisations
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA temp_store = MEMORY;
+PRAGMA cache_size = 100000;
+```
+
+---
+
+## Run log
+
+Every command that changes a database — `index`, `update`, `db drop`, `db vacuum` — is
+recorded in `<database>.log` next to it (`fileindex.db.log` by default): what was run, by whom,
+how it ended, a one-line summary, and any errors with running it. Per-file read errors are
+counted in the summary, not listed. Read-only commands (`search`, `export`, `db info`,
+`db check`) aren't logged.
+
+```text
+2026-10-23T02:00:01+01:00 run=7f3a2c start  update /Volumes/NAS --db /data/index.db  (user=svc-diskunder host=nas-util01 version=5.0)
+2026-10-23T02:00:09+01:00 run=7f3a2c error  /Volumes/NAS/Finance — IO error for operation on /Volumes/NAS/Finance: Permission denied (os error 13)
+2026-10-23T02:14:34+01:00 run=7f3a2c end    completed in 14m33s — 772,087 found, 771,950 unchanged, 137 written, 12 removed, 22,684 errors (22,683 unreadable, 1 traversal/db), 1,408 duplicate groups, 3.2 GB wasted
+```
+
+- **Outcomes:** `completed`, `failed` (with the exit code — fatal errors exit 1), or
+  `stopped by user` (`q` in the TUI). A `start` with no `end` means the process was killed.
+- **Errors** are capped at 50 per run, then `… and N more errors (not logged)`.
+- **`--log FILE`** writes elsewhere; **`--no-log`** turns it off.
+- At 10 MB the log is renamed to `<database>.log.1` and a new one started.
+- If the log can't be written, the run carries on and prints one warning.
+
 ---
 
 ## Comparison with earlier versions
 
-| Feature | Python | Rust v1 | Rust v2 | Rust v3 (TUI) | Rust v4 (fixes) | Rust v5+ (planned) |
+| Feature | Python | Rust v1 | Rust v2 | Rust v3 (TUI) | Rust v4 (fixes) | Rust v5 (features) |
 |---|---|---|---|---|---|---|
 | Hashing | MD5 | BLAKE3 | BLAKE3 | BLAKE3 | BLAKE3 | BLAKE3 |
 | Parallelisation | `multiprocessing` | Rayon | Rayon | Rayon | Rayon | Rayon |
@@ -302,11 +360,11 @@ database with SQLite's online backup while nothing is writing to it:
 | Auto plain-text fallback | — | — | — | Yes | Yes | Yes |
 | `--db` flag | No | No | Yes | Yes | Yes | Yes |
 | `--threads` flag | No | No | Yes | Yes | Yes | Yes |
-| Run log — each command that changes the database, its outcome, a summary and any errors (`<database>.log`) | No | No | No | No | No | Planned (5.0) |
-| `search` — query the index by name, size, age, type | No | No | No | No | No | Planned (5.0) |
+| Run log — each command that changes the database, its outcome, a summary and any errors (`<database>.log`) | No | No | No | No | No | Yes (5.0) |
+| `search` — query the index by name, size, age, type, duplicates; table / CSV / TSV / JSON / paths | No | No | No | No | No | Yes (5.0) |
 | `report` — top files/dirs, by type, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Planned (5.1) |
 | Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--ext` | No | No | No | No | No | Planned (5.1) |
-| `export` — CSV / JSON for BI tools | No | No | No | No | No | Planned (5.0) |
+| `export` — CSV / TSV / JSON for BI tools | No | No | No | No | No | Yes (5.0) |
 | Dry run — preview indexing (5.2) and dedupe actions (v6) without touching files | No | No | No | No | No | Planned (5.2 / v6) |
 | Include / exclude file types — `--include-ext`, `--exclude-ext` | No | No | No | No | No | Planned (5.2) |
 | Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned (5.3) |
@@ -315,13 +373,43 @@ database with SQLite's online backup while nothing is writing to it:
 | Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned (5.4) |
 | Interactive app — main window plus Jobs / Results / Database / Settings menus | No | No | No | No | No | Planned (5.5) |
 
+### Background
+
+The project was developed in multiple languages, each addressing the limitations of the previous:
+
+- **Bash (v1):** Initial proof-of-concept — simple but slow due to sequential per-file processing
+- **Bash (v2):** Optimised with parallel `xargs`, deferred index creation, and SQL batching
+- **Python:** More structured, with multiprocessing and bulk inserts — but ultimately too slow for large network shares
+- **Rust v1:** Best performance, but contained bugs around network share resilience and resumability
+- **Rust v2:** All known bugs fixed, plain-text output only
+- **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
+- **Rust v4:** Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
+- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log; the rest is planned in [v5-plan.md](v5-plan.md)
+
+Only the current Rust version is kept in this repository; the earlier versions were not committed.
+
+See [changes.md](changes.md) for a detailed change log and [future.md](future.md) for planned features.
+
 ---
 
 ## Files
 
 ```
 diskunder/
-├── src/main.rs        # Rust v4 source
+├── src/               # Rust v5 source
+│   ├── main.rs        #   entry point
+│   ├── cli.rs         #   command-line arguments
+│   ├── scan.rs        #   walking, hashing, the indexing worker
+│   ├── db.rs          #   schema, migrations, roots, queries
+│   ├── progress.rs    #   run state and live duplicate tracking
+│   ├── tui.rs         #   full-screen progress display
+│   ├── plain.rs       #   plain-text progress
+│   ├── runlog.rs      #   run log
+│   ├── query.rs       #   filters and SQL for search/export
+│   ├── output.rs      #   table, CSV, TSV, JSON, paths
+│   ├── search.rs      #   search and export commands
+│   ├── maintenance.rs #   db info / drop / vacuum / check
+│   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
 ├── diskunder-macos    # Compiled macOS binary (arm64)
 ├── diskunder-linux    # Compiled Linux x86_64 binary (statically linked, musl)
@@ -329,7 +417,7 @@ diskunder/
 ├── .cargo/config.toml # Cargo cross-compilation config (musl linker)
 ├── Cargo.toml         # Rust project config
 ├── Cargo.lock         # Locked dependency versions — ensures reproducible builds
-├── changes.md         # Full change log (v1 → v4)
+├── changes.md         # Full change log (v1 → v5)
 ├── future.md          # Feature ideas
 └── v5-plan.md         # v5 plan: search, report, export, filters, jobs, interactive app
 ```
@@ -365,4 +453,6 @@ cargo test
 [tests/cli.rs](tests/cli.rs) runs the real binary in plain mode against throwaway directories and
 checks both its summary output and the database it writes: resume, change detection, deletions,
 path normalisation and v3 migration, error counting, duplicate totals, hard links, argument
-parsing, and the `db` maintenance commands. Two tests rely on file permissions and skip themselves when run as root.
+parsing, the `db` maintenance commands, schema migrations, the run log, and `search`/`export`
+filters, scopes and formats. Unit tests in `src/query.rs` cover size, age and extension parsing.
+Tests that rely on file permissions skip themselves when run as root.

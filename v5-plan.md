@@ -98,7 +98,10 @@ Run `update` first for current answers.
 
 ---
 
-## 5.0 — run log, `search` and `export`
+## 5.0 — run log, `search` and `export` ✅
+
+**Done.** As designed below, plus: a run that stops on a fatal error now exits with status 1.
+See [changes.md](changes.md).
 
 ### Run log
 
@@ -528,7 +531,7 @@ Before the new commands:
 
 | Release | Contents | Size |
 |---|---|---|
-| 5.0 | Phase 0, run log, `search`, `export` | M |
+| 5.0 ✅ | Phase 0, run log, `search`, `export` | M |
 | 5.1 | `report`, including duplicate filtering and the summary | M |
 | 5.2 | Include / exclude file types; `index` / `update --dry-run` | M |
 | 5.3 | Path patterns (Ignore) | S–M |
