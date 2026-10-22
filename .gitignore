@@ -1,0 +1,6 @@
+/target/
+
+# Index databases contain paths from the local environment
+*.db
+*.db-wal
+*.db-shm
