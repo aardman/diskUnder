@@ -92,19 +92,31 @@ PRAGMA cache_size = 100000;
 The binaries are self-contained — no runtime dependencies, and the database is created on
 first run, so installing is just copying the right one onto your `PATH` as `diskunder`:
 
+**macOS (Apple Silicon):**
+
 ```bash
-# macOS (Apple Silicon)
 sudo mkdir -p /usr/local/bin
 sudo install -m 755 diskunder-macos /usr/local/bin/diskunder
+```
 
-# Linux (x86_64 — statically linked, any distribution)
+**Linux (x86_64 — statically linked, any distribution):**
+
+```bash
 sudo install -m 755 diskunder-linux /usr/local/bin/diskunder
+```
 
-# Or without sudo, for your user only (make sure ~/.local/bin is on your PATH)
+**Or without sudo, for your user only** — make sure `~/.local/bin` is on your `PATH`, and use
+`diskunder-macos` instead on a Mac:
+
+```bash
 mkdir -p ~/.local/bin
-install -m 755 diskunder-linux ~/.local/bin/diskunder     # or diskunder-macos
+install -m 755 diskunder-linux ~/.local/bin/diskunder
+```
 
-diskunder --version     # → diskunder 0.4.1
+**Check it worked** — this should print `diskunder 0.4.1`:
+
+```bash
+diskunder --version
 ```
 
 - **macOS:** if you downloaded the binary through a browser rather than cloning the repo,
@@ -125,7 +137,7 @@ pipes).
 
 Examples below assume it's installed as `diskunder` (see [Install](#install)); otherwise run `./diskunder-macos` or `./diskunder-linux` from the repository root.
 
-```bash
+```text
 diskunder index <PATH> [OPTIONS]
 diskunder update <PATH> [OPTIONS]
 ```
@@ -143,17 +155,27 @@ The TUI is skipped automatically when stdout is not an interactive terminal, so 
 needed for cron jobs, piped output, or SSH sessions without a TTY. Use `--no-tui` to force
 plain mode explicitly in an interactive terminal.
 
+Interactive, with the full TUI:
+
 ```bash
-# Interactive — full TUI
 diskunder index /Volumes/NAS --db /data/index.db --threads 4
+```
 
-# Headless / scripted — auto plain text (progress is written to stderr)
+Headless or scripted — plain text is used automatically, and progress goes to stderr:
+
+```bash
 diskunder index /Volumes/NAS --db /data/index.db 2>&1 | tee run.log
+```
 
-# Explicit plain text in an interactive terminal
+Plain text in an interactive terminal:
+
+```bash
 diskunder --no-tui index /Volumes/NAS --db /data/index.db
+```
 
-# Update mode — pick up new, changed and deleted files
+Update mode — pick up new, changed and deleted files:
+
+```bash
 diskunder update /Volumes/NAS --db /data/index.db
 ```
 
@@ -178,10 +200,11 @@ touched. Run it from the repository root. Steps 2–4 use `--no-tui` so your out
 what's shown here; leave it off to watch the live TUI instead (press `q` when it finishes).
 
 **1. Make some fake data** — three 200 KB "photos", a backup folder holding two real copies
-and one hard link, and a small text file:
+and one hard link, and a small text file. On Linux, change the first line to
+`BIN=$PWD/diskunder-linux`; if you've installed it, `BIN=diskunder` works on either.
 
 ```bash
-BIN=$PWD/diskunder-macos        # on Linux: BIN=$PWD/diskunder-linux  (or BIN=diskunder if installed)
+BIN=$PWD/diskunder-macos
 DEMO=/tmp/diskunder-demo
 rm -rf "$DEMO" && mkdir -p "$DEMO/data/photos" "$DEMO/data/backup"
 
@@ -238,18 +261,23 @@ duplicate group remains.
 
 **5. Query the database** (needs the `sqlite3` command — preinstalled on macOS; `apt install sqlite3` on Debian/Ubuntu):
 
+First find the table name, then list the largest files:
+
 ```bash
 T=$(sqlite3 "$DEMO/demo.db" "SELECT name FROM sqlite_master WHERE name LIKE 'files_%' AND type='table'")
-
-# Largest files
 sqlite3 -header -column "$DEMO/demo.db" \
   "SELECT filename, size, directory FROM $T ORDER BY size DESC LIMIT 3"
+```
 
-# Checksums seen more than once: paths vs distinct copies on disk
+Then checksums seen more than once — paths versus distinct copies on disk:
+
+```bash
 sqlite3 -header -column "$DEMO/demo.db" \
   "SELECT substr(checksum,1,12) AS checksum, COUNT(*) AS paths, COUNT(DISTINCT inode) AS copies, size
    FROM $T GROUP BY checksum HAVING COUNT(*) > 1"
 ```
+
+Output from both:
 ```
 filename  size    directory
 --------  ------  ---------------------------------------
@@ -380,12 +408,12 @@ diskunder/
 
 Pre-built binaries are included for macOS and Linux x86_64. To rebuild:
 
-```bash
-make        # builds both diskunder-macos and diskunder-linux
-make mac    # macOS only
-make linux  # Linux only
-make clean  # remove build artifacts and binaries
-```
+| Command | Builds |
+|---|---|
+| `make` | both `diskunder-macos` and `diskunder-linux` |
+| `make mac` | macOS only |
+| `make linux` | Linux only |
+| `make clean` | removes build artifacts and binaries |
 
 **Prerequisites for Linux cross-compilation (macOS host):**
 ```bash
