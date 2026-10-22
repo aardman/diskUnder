@@ -24,7 +24,7 @@ use ratatui::{
 use rayon::prelude::*;
 use rusqlite::{params, Connection, Result as DbResult};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufReader, IsTerminal, Read, Stdout},
     path::{Path, PathBuf},
@@ -117,6 +117,8 @@ struct AppState {
     // In-memory checksum index for live duplicate detection.
     // For very large runs (millions of files) this will grow proportionally.
     checksum_map: HashMap<String, (u64, Vec<String>)>, // checksum → (size, paths)
+    dup_keys: HashSet<String>,                         // checksums with 2+ paths
+    dups_dirty: bool,                                  // top_dups needs refreshing
     top_dups: Vec<DupGroup>,                           // top 10 by wasted bytes
 
     log: Vec<String>,
@@ -137,6 +139,8 @@ impl AppState {
             total_files: None,
             current_file: String::new(),
             checksum_map: HashMap::new(),
+            dup_keys: HashSet::new(),
+            dups_dirty: false,
             top_dups: Vec::new(),
             log: Vec::new(),
             done: false,
@@ -167,36 +171,56 @@ impl AppState {
         self.files_hashed += 1;
         self.current_file = path.clone();
 
-        let entry = self
-            .checksum_map
-            .entry(checksum)
-            .or_insert_with(|| (size, Vec::new()));
-        entry.1.push(path);
+        // Empty files all share one checksum and waste nothing — not worth tracking
+        if size == 0 {
+            return;
+        }
 
-        // Rebuild top-10 list whenever a new duplicate group is created or grows
-        if entry.1.len() >= 2 {
-            self.rebuild_top_dups();
+        match self.checksum_map.get_mut(&checksum) {
+            Some((_, paths)) => {
+                paths.push(path);
+                if paths.len() == 2 {
+                    self.dup_keys.insert(checksum);
+                }
+                self.dups_dirty = true;
+            }
+            None => {
+                self.checksum_map.insert(checksum, (size, vec![path]));
+            }
         }
     }
 
-    fn rebuild_top_dups(&mut self) {
-        let mut groups: Vec<DupGroup> = self
-            .checksum_map
-            .values()
-            .filter(|(_, paths)| paths.len() >= 2)
-            .map(|(size, paths)| {
-                let wasted = size * (paths.len() as u64 - 1);
-                DupGroup {
-                    size: *size,
-                    paths: paths.clone(),
-                    wasted,
-                }
+    /// Recompute the top-10 duplicate groups if anything changed since the last call.
+    /// Called once per UI tick rather than per file, and only scans groups that have
+    /// duplicates, so cost doesn't grow with the number of files hashed.
+    fn refresh_top_dups(&mut self) {
+        if !self.dups_dirty {
+            return;
+        }
+        self.dups_dirty = false;
+
+        let mut ranked: Vec<(u64, &String)> = self
+            .dup_keys
+            .iter()
+            .map(|k| {
+                let (size, paths) = &self.checksum_map[k];
+                (size * (paths.len() as u64 - 1), k)
             })
             .collect();
+        let by_wasted = |a: &(u64, &String), b: &(u64, &String)| b.0.cmp(&a.0);
+        if ranked.len() > 10 {
+            ranked.select_nth_unstable_by(9, by_wasted);
+            ranked.truncate(10);
+        }
+        ranked.sort_unstable_by(by_wasted);
 
-        groups.sort_unstable_by(|a, b| b.wasted.cmp(&a.wasted));
-        groups.truncate(10);
-        self.top_dups = groups;
+        self.top_dups = ranked
+            .into_iter()
+            .map(|(wasted, k)| {
+                let (size, paths) = &self.checksum_map[k];
+                DupGroup { size: *size, paths: paths.clone(), wasted }
+            })
+            .collect();
     }
 
     fn apply(&mut self, msg: WorkerMsg) {
@@ -224,6 +248,7 @@ impl AppState {
             }
             WorkerMsg::Done => {
                 self.done = true;
+                self.refresh_top_dups();
                 self.push_log(format!(
                     "done — {} written, {} errors, {} duplicate groups",
                     self.files_written,
@@ -853,6 +878,7 @@ fn run_ui(
                 Err(_) => break,
             }
         }
+        state.refresh_top_dups();
 
         // Non-blocking keyboard poll — timeout drives the redraw rate
         if event::poll(TICK)? {

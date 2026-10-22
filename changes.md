@@ -23,6 +23,19 @@ row. New files and files whose size or modified time differ are hashed and upser
 The skipped count is reported as `N unchanged`. Modified times are stored to the second, so an
 edit that keeps the same size within the same second as the stored time is not detected.
 
+### Duplicate tracking no longer slows down as the run grows
+
+**Previous behaviour:** Every time a hashed file matched an earlier checksum, the top-10
+duplicate list was rebuilt by scanning every file hashed so far and cloning the path lists of
+every duplicate group. Run time grew roughly with the square of the file count: 50,000 small,
+duplicate-heavy files took 15.5 s and 150,000 took 230 s. Empty files made this worse, since
+they all share one checksum.
+
+**Fix:** The top-10 list is recomputed at most once per UI tick (100 ms) and once at the end,
+only over checksums that actually have duplicates, and only the 10 groups displayed have their
+paths cloned. Empty files are no longer tracked as duplicates (they waste no space). The same
+test now takes 1.6 s and 4.6 s respectively.
+
 ---
 
 ## v3.0 — `diskUnder3.rust`
