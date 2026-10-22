@@ -27,7 +27,7 @@ diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 
 
 Two modes are supported:
 
-- **`index`** — full traversal of the target path
+- **`index`** — full traversal of the target path. Files already in the database are skipped without being re-hashed, so an interrupted run can simply be restarted
 - **`update`** — only files modified in the last 24 hours
 
 ### Database Schema
@@ -107,7 +107,7 @@ index /Volumes/NAS
   1000/772087 processed — 998 written, 2 errors/skipped
   2000/772087 processed — 1991 written, 9 errors/skipped
   ...
-complete: 772087 files — 511597 written, 22683 errors/skipped, 10 duplicate groups
+complete: 772087 files — 0 already indexed, 511597 written, 22683 errors/skipped, 10 duplicate groups
 wasted (top 10): 3.2 GB
 ```
 

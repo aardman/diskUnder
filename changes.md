@@ -1,5 +1,19 @@
 # diskUnder — Change Log
 
+## Unreleased
+
+### Resume skips already-indexed files
+
+**Previous behaviour:** On restart, `index` mode re-hashed every file and relied on
+`INSERT OR IGNORE` to avoid duplicate rows. Only the database writes were skipped, so resuming
+an interrupted run on a large network share cost almost as much as starting again.
+
+**Fix:** Before traversal, `index` mode loads the paths already in the table and skips those
+files entirely. The TUI shows a "Skipped" count, and the plain-text summary reports
+`N already indexed`. `update` mode is unchanged.
+
+---
+
 ## v3.0 — `diskUnder3.rust`
 
 Added a full-screen TUI (terminal UI) built with [ratatui](https://ratatui.rs) + crossterm.

@@ -24,7 +24,7 @@ use ratatui::{
 use rayon::prelude::*;
 use rusqlite::{params, Connection, Result as DbResult};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufReader, IsTerminal, Read, Stdout},
     path::{Path, PathBuf},
@@ -83,8 +83,8 @@ enum WorkerMsg {
     FileError { path: String, error: String },
     /// A batch of N rows committed to SQLite
     BatchWritten(usize),
-    /// Directory traversal finished — total file count now known
-    TraversalComplete(usize),
+    /// Directory traversal finished — `to_hash` files queued, `skipped` already in the DB
+    TraversalComplete { to_hash: usize, skipped: usize },
     /// All work done
     Done,
 }
@@ -105,6 +105,7 @@ struct AppState {
     db_path: String,
 
     files_found: usize,
+    files_skipped: usize, // already in the DB from a previous run
     files_hashed: usize,
     files_written: usize,
     files_errored: usize,
@@ -128,6 +129,7 @@ impl AppState {
             target_path: target_path.to_owned(),
             db_path: db_path.to_owned(),
             files_found: 0,
+            files_skipped: 0,
             files_hashed: 0,
             files_written: 0,
             files_errored: 0,
@@ -203,9 +205,17 @@ impl AppState {
                 self.push_log(format!("warn: {} — {}", path, error));
             }
             WorkerMsg::BatchWritten(n) => self.files_written += n,
-            WorkerMsg::TraversalComplete(n) => {
-                self.total_files = Some(n);
-                self.push_log(format!("traversal complete — {} files found", n));
+            WorkerMsg::TraversalComplete { to_hash, skipped } => {
+                self.total_files = Some(to_hash);
+                self.files_skipped = skipped;
+                if skipped > 0 {
+                    self.push_log(format!(
+                        "traversal complete — {} files found, {} already indexed, {} to hash",
+                        self.files_found, skipped, to_hash
+                    ));
+                } else {
+                    self.push_log(format!("traversal complete — {} files found", to_hash));
+                }
             }
             WorkerMsg::Done => {
                 self.done = true;
@@ -326,6 +336,12 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
     Ok(table_name)
 }
 
+fn load_indexed_paths(conn: &Connection, t: &str) -> DbResult<HashSet<String>> {
+    let mut stmt = conn.prepare(&format!("SELECT path FROM {t}", t = t))?;
+    let paths = stmt.query_map([], |row| row.get(0))?.collect();
+    paths
+}
+
 fn create_indexes(conn: &Connection, t: &str) -> DbResult<()> {
     for col in &["size", "filename", "checksum", "extension", "directory", "access_date", "modified_date"] {
         conn.execute(
@@ -400,9 +416,24 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
         }
     };
 
+    // In index mode, paths already in the table are skipped so an interrupted run
+    // resumes without re-hashing everything it has already written.
+    let indexed: HashSet<String> = if upsert {
+        HashSet::new()
+    } else {
+        load_indexed_paths(&conn, &table_name).unwrap_or_else(|e| {
+            let _ = tx.send(WorkerMsg::FileError {
+                path: "db".to_string(),
+                error: format!("could not read existing paths, re-hashing all: {}", e),
+            });
+            HashSet::new()
+        })
+    };
+
     // ── Traversal ──
     let cutoff = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut skipped = 0usize;
 
     for entry in WalkDir::new(&path) {
         match entry {
@@ -418,7 +449,11 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
                     }
                 } else {
                     let _ = tx.send(WorkerMsg::FileFound);
-                    files.push(e.path().to_owned());
+                    if indexed.contains(e.path().to_string_lossy().as_ref()) {
+                        skipped += 1;
+                    } else {
+                        files.push(e.path().to_owned());
+                    }
                 }
             }
             Ok(_) => {}
@@ -431,8 +466,8 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
         }
     }
 
-    let total = files.len();
-    let _ = tx.send(WorkerMsg::TraversalComplete(total));
+    drop(indexed);
+    let _ = tx.send(WorkerMsg::TraversalComplete { to_hash: files.len(), skipped });
 
     // ── Hashing + DB writes in batches ──
     for chunk in files.chunks(BATCH_SIZE) {
@@ -516,7 +551,7 @@ fn draw(f: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // header
-            Constraint::Min(10),    // body
+            Constraint::Min(11),    // body
             Constraint::Length(7),  // activity log
         ])
         .split(area);
@@ -573,16 +608,24 @@ fn draw_progress(f: &mut Frame, state: &AppState, area: Rect) {
                 format!("{:>9}", state.files_found),
                 Style::default().fg(Color::White),
             ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Skipped "),
             Span::styled(
-                format!(" / {}", total_str),
+                format!("{:>9}", state.files_skipped),
                 Style::default().fg(Color::DarkGray),
             ),
+            Span::styled("  already indexed", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::raw("  Hashed  "),
             Span::styled(
                 format!("{:>9}", state.files_hashed),
                 Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!(" / {}", total_str),
+                Style::default().fg(Color::DarkGray),
             ),
         ]),
         Line::from(vec![
@@ -759,8 +802,9 @@ fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>) {
     }
 
     eprintln!(
-        "complete: {} files — {} written, {} errors/skipped, {} duplicate groups",
-        state.total_files.unwrap_or(0),
+        "complete: {} files — {} already indexed, {} written, {} errors/skipped, {} duplicate groups",
+        state.files_found,
+        state.files_skipped,
         state.files_written,
         state.files_errored,
         state.top_dups.len(),
@@ -861,6 +905,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Print plain-text summary after TUI exits
         println!("\ndiskUnder — complete");
         println!("  files found   : {}", state.files_found);
+        println!("  skipped       : {} (already indexed)", state.files_skipped);
         println!("  files written : {}", state.files_written);
         println!("  errors        : {}", state.files_errored);
         println!("  dup groups    : {}", state.top_dups.len());
