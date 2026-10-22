@@ -1,7 +1,7 @@
 # diskUnder v5 — plan
 
-Search, report (with duplicate filtering), export, and include/exclude filters for file types
-and paths — in four small releases.
+Search, report (with duplicate filtering), export, a run log, and include/exclude filters for
+file types and paths — in four small releases.
 
 **Out of scope for v5:** acting on duplicates. Quarantine comes first, then `dedupe` and its
 dry run — both v6 (outline under [Deferred to v6](#deferred-to-v6--quarantine-then-dedupe)).
@@ -31,8 +31,8 @@ Also not in v5: Jobs, `watch`, metadata enrichment. Cost/savings-in-money report
 - **Refactor first.** `src/main.rs` is 1,764 lines in one file; v5 adds four commands that
   share filtering and output code. Splitting it into modules is behaviour-neutral and the 29
   existing tests guard it.
-- **Releases:** 5.0 groundwork + search + export → 5.1 report → 5.2 file-type filters and
-  `--dry-run` preview → 5.3 path patterns.
+- **Releases:** 5.0 groundwork + run log + search + export → 5.1 report → 5.2 file-type
+  filters and `--dry-run` preview → 5.3 path patterns.
 
 ---
 
@@ -96,7 +96,68 @@ Run `update` first for current answers.
 
 ---
 
-## 5.0 — `search` and `export`
+## 5.0 — run log, `search` and `export`
+
+### Run log
+
+A record of every command that changes a database — what was called, how it ended, a summary
+of the results, and any errors with running it. **Not** a per-file log: per-file read errors
+stay as counts, as they are in the summary today.
+
+```text
+2026-10-23T02:00:01+01:00 run=7f3a2c start  index /Volumes/NAS --db /data/index.db --threads 4  (user=svc-diskunder host=nas-util01 version=5.0)
+2026-10-23T02:00:09+01:00 run=7f3a2c error  traversal: /Volumes/NAS/Finance — Permission denied (os error 13)
+2026-10-23T02:14:34+01:00 run=7f3a2c end    completed in 14m33s — 772,087 found, 0 already indexed, 749,404 written, 0 removed, 22,684 errors (22,683 unreadable, 1 traversal/db), 1,408 duplicate groups, 3.2 GB wasted
+2026-10-23T09:12:40+01:00 run=91be04 start  db drop /Volumes/OldShare --yes --db /data/index.db  (user=nathan.taylor host=DPTMac2607 version=5.0)
+2026-10-23T09:12:40+01:00 run=91be04 end    completed in 0s — removed the index of /Volumes/OldShare (41,200 files)
+```
+
+**What's recorded:**
+
+- **`start`:** timestamp, the full command line, user, host and tool version.
+- **`error`:** problems with running the command — traversal and database errors, failed
+  batches, migrations that stopped a run, fatal errors such as a missing path. These are the
+  warnings plain mode already prints. Capped at 50 per run, then `… and N more`, so a share
+  with a broken permission tree can't flood the log.
+- **`end`:** outcome (`completed`, `failed`, `stopped by user` when `q` is pressed in the
+  TUI), duration, exit code when non-zero, and a one-line summary: the same counts as the
+  plain-text summary for `index`/`update`, what was done for `db drop`/`db vacuum`.
+- **A `start` with no `end`** means the process was killed (Ctrl-C, crash, reboot). The run
+  id ties the lines of one run together when two runs share a log.
+
+**Where it goes:** next to the database, as `<database>.log` (`/data/index.db.log`,
+`fileindex.db.log` by default). The log stays with the data it describes, cron and
+interactive runs land in the same place, and a shared service-account setup needs no
+per-user configuration. `--log FILE` writes elsewhere; `--no-log` turns it off.
+
+**Which commands:** only those that change the database — `index`, `update`, `db drop` and
+`db vacuum` (which rewrites the file). Read-only commands — `search`, `export`, `report`,
+`db info`, `db check`, and the 5.2 `--dry-run` previews — aren't logged. Neither are commands
+that fail before a database is involved (bad arguments, `--help`). A schema migration is
+logged as part of the run that performs it.
+
+**Details:**
+
+- **Format:** plain text, one event per line, timestamps in ISO 8601 with the UTC offset so
+  logs from different servers compare cleanly. Easy to read, and to `grep`/`tail`.
+- **Safe with concurrent runs:** each line is a single append, so lines from two runs never
+  interleave mid-line.
+- **Rotation:** at 10 MB the log is renamed to `<database>.log.1` (replacing any older one)
+  and a new log started. At typical use (a few runs a day) that's years of history.
+- **Privacy:** the log contains paths, user and host names, like the database itself. Logs
+  next to a repository-local database are covered by `.gitignore` (`*.db.log*` added in 5.0).
+- **Logging never breaks a run:** if the log can't be written (read-only folder, disk full),
+  the command carries on and prints one warning to stderr.
+- **Viewing:** `tail`/`grep` the file. A `diskunder log` command (recent runs per database,
+  filter by outcome) can follow if wanted; Jobs, when built, will keep structured run
+  history per job and can link to these run ids.
+
+**Assessment:** small. The summary counts and error messages already exist (they feed the
+plain-text output), so the work is a logger that writes `start`, `error` and `end` lines,
+hooks at each exit path (completed, fatal error, `q` in the TUI), rotation, the two flags,
+and about 6 tests (start/end written, summary matches, errors capped, `--no-log`, rotation,
+unwritable log doesn't fail the run, read-only commands write nothing). Roughly 150–200
+lines. It's easier after the Phase 0 module split, so it comes straight after that in 5.0.
 
 ### `search`
 
@@ -326,7 +387,7 @@ Before the new commands:
 
 | Release | Contents | Size |
 |---|---|---|
-| 5.0 | Phase 0, `search`, `export` | M |
+| 5.0 | Phase 0, run log, `search`, `export` | M |
 | 5.1 | `report`, including duplicate filtering and the summary | M |
 | 5.2 | Include / exclude file types; `index` / `update --dry-run` | M |
 | 5.3 | Path patterns (Ignore) | S–M |
@@ -346,6 +407,7 @@ and push routine as v4.1.
 - **Path patterns are in v5**, as 5.3.
 - **`dedupe` keeps the oldest modified copy by default** (recorded for v6).
 
+- **The run log records only commands that change the database** (see [Run log](#run-log)).
 - **Piped output keeps the readable table**; machine formats are explicit, and notes go to
   stderr (see [Output](#output)).
 

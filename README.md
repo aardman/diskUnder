@@ -373,6 +373,7 @@ database with SQLite's online backup while nothing is writing to it:
 | Auto plain-text fallback | — | — | — | Yes | Yes | Yes |
 | `--db` flag | No | No | Yes | Yes | Yes | Yes |
 | `--threads` flag | No | No | Yes | Yes | Yes | Yes |
+| Run log — each command that changes the database, its outcome, a summary and any errors (`<database>.log`) | No | No | No | No | No | Planned (5.0) |
 | `search` — query the index by name, size, age, type | No | No | No | No | No | Planned (5.0) |
 | `report` — top files/dirs, by type, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Planned (5.1) |
 | Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--ext` | No | No | No | No | No | Planned (5.1) |

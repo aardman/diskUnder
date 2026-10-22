@@ -3,7 +3,7 @@
 Inspired by feature parity with [Diskover](https://diskoverdata.com/). Items are grouped by effort and value. None of these are commitments — just ideas worth revisiting.
 
 **Planned for v5** (small releases — see [v5-plan.md](v5-plan.md) for design, schema changes
-and sizing): 5.0 `search` and `export` · 5.1 `report` with duplicate filtering · 5.2
+and sizing): 5.0 run log, `search` and `export` · 5.1 `report` with duplicate filtering · 5.2
 include/exclude file types and `--dry-run` preview · 5.3 path patterns (Ignore).
 **Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
 original ideas.
@@ -118,7 +118,8 @@ scratch       index   /tmp/scratch   never              —          —        
 columns. Arrow keys to choose, Enter to run, `q` to quit. In plain mode (no terminal), a
 missing name is an error that lists the available jobs instead.
 
-**Run history:** each run records start and end time, how it ended (completed, failed, or
+**Run history:** (the 5.0 run log already records every run per database; job history adds
+the per-job view.) Each run records start and end time, how it ended (completed, failed, or
 interrupted), and the summary counts the tool already prints: found, skipped, written,
 removed, errors, duplicate groups and wasted bytes. `jobs show` lists recent runs, and
 `jobs list` shows the latest.
