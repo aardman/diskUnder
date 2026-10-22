@@ -127,7 +127,9 @@ wasted: 3.2 GB
 | Resumable after crash | No | No | Yes | Yes | Yes | Yes |
 | Resume skips already-indexed files | — | — | No | No | Yes | Yes |
 | `update` skips unchanged files | — | — | No | No | Yes | Yes |
-| Duplicate tracking scales to large runs | — | — | — | No | Yes | Yes |
+| Duplicate tracking scales to large runs | — | — | — | No | Yes (empty files excluded) | Yes |
+| Duplicate totals cover all groups (not just the top 10) | — | — | — | No | Yes | Yes |
+| Error breakdown (unreadable / not written / traversal) | No | No | No | No | Yes | Yes |
 | Network share resilience | Partial | Poor | Yes | Yes | Yes | Yes |
 | TUI progress | No | No | No | Yes | Yes | Yes |
 | Auto plain-text fallback | — | — | — | Yes | Yes | Yes |

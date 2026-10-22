@@ -64,7 +64,7 @@ struct Cli {
 enum Command {
     /// Full index of PATH
     Index { path: String },
-    /// Re-index files modified in the last 24 hours under PATH
+    /// Re-index new and changed files under PATH, and drop rows for deleted files
     Update { path: String },
 }
 
@@ -85,6 +85,8 @@ enum WorkerMsg {
     Error { context: String, error: String },
     /// A batch of N rows committed to SQLite
     BatchWritten(usize),
+    /// N rows removed for files no longer on disk (update mode)
+    Removed(usize),
     /// A batch of `files` hashed files could not be committed
     BatchFailed { files: usize, error: String },
     /// Directory traversal finished — `to_hash` files queued, `skipped` already in the DB
@@ -113,6 +115,7 @@ struct AppState {
     files_skipped: usize, // already indexed (index mode) or unchanged (update mode)
     files_hashed: usize,
     files_written: usize,
+    files_removed: usize, // rows dropped for deleted files (update mode)
     files_errored: usize,  // queued files that could not be read or hashed
     files_unwritten: usize, // hashed files lost to a failed batch commit
     other_errors: usize,   // traversal and database errors
@@ -142,6 +145,7 @@ impl AppState {
             files_skipped: 0,
             files_hashed: 0,
             files_written: 0,
+            files_removed: 0,
             files_errored: 0,
             files_unwritten: 0,
             other_errors: 0,
@@ -272,6 +276,10 @@ impl AppState {
                 self.push_log(format!("warn: {} — {}", context, error));
             }
             WorkerMsg::BatchWritten(n) => self.files_written += n,
+            WorkerMsg::Removed(n) => {
+                self.files_removed = n;
+                self.push_log(format!("removed {} rows for files no longer on disk", n));
+            }
             WorkerMsg::BatchFailed { files, error } => {
                 self.files_unwritten += files;
                 self.push_log(format!("error: batch of {} files not written — {}", files, error));
@@ -420,6 +428,19 @@ fn load_indexed(conn: &Connection, t: &str) -> DbResult<HashMap<String, (u64, St
     rows
 }
 
+fn delete_paths(conn: &mut Connection, t: &str, paths: &[String]) -> DbResult<usize> {
+    let tx = conn.transaction()?;
+    let mut count = 0usize;
+    {
+        let mut stmt = tx.prepare(&format!("DELETE FROM {t} WHERE path = ?1", t = t))?;
+        for p in paths {
+            count += stmt.execute([p])?;
+        }
+    }
+    tx.commit()?;
+    Ok(count)
+}
+
 fn create_indexes(conn: &Connection, t: &str) -> DbResult<()> {
     for col in &["size", "filename", "checksum", "extension", "directory", "access_date", "modified_date"] {
         conn.execute(
@@ -497,7 +518,7 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
     // Files already in the table are not re-hashed: in index mode any existing path is
     // skipped (so an interrupted run resumes cheaply); in update mode a path is skipped
     // only if its size and modified time still match what was stored.
-    let indexed = load_indexed(&conn, &table_name).unwrap_or_else(|e| {
+    let mut indexed = load_indexed(&conn, &table_name).unwrap_or_else(|e| {
         let _ = tx.send(WorkerMsg::Error {
             context: "db".to_string(),
             error: format!("could not read existing paths, re-hashing all: {}", e),
@@ -506,30 +527,26 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
     });
 
     // ── Traversal ──
-    let cutoff = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
     let mut files: Vec<PathBuf> = Vec::new();
     let mut skipped = 0usize;
+    // Paths that could not be traversed; rows beneath them are not treated as deleted.
+    // None means an error had no path, so no deletions are safe.
+    let mut unreadable: Option<Vec<PathBuf>> = Some(Vec::new());
 
     for entry in WalkDir::new(&path) {
         match entry {
             Ok(e) if e.file_type().is_file() => {
                 if upsert {
-                    // update mode: only files modified in last 24h
-                    let meta = e.metadata().ok();
-                    match meta.as_ref().and_then(|m| m.modified().ok()) {
-                        Some(t) if t > cutoff => {
-                            let _ = tx.send(WorkerMsg::FileFound);
-                            let size = meta.as_ref().map_or(0, |m| m.len());
-                            let unchanged = indexed
-                                .get(e.path().to_string_lossy().as_ref())
-                                .map_or(false, |(s, m)| *s == size && *m == fmt_time(t));
-                            if unchanged {
-                                skipped += 1;
-                            } else {
-                                files.push(e.path().to_owned());
-                            }
-                        }
-                        _ => {}
+                    // update mode: re-hash unless size and modified time match the stored row.
+                    // Seen paths are removed from `indexed`; whatever remains has been deleted.
+                    let _ = tx.send(WorkerMsg::FileFound);
+                    let stored = indexed.remove(e.path().to_string_lossy().as_ref());
+                    let current = e.metadata().ok().map(|m| {
+                        (m.len(), m.modified().ok().map(fmt_time).unwrap_or_default())
+                    });
+                    match (stored, current) {
+                        (Some(s), Some(c)) if s == c => skipped += 1,
+                        _ => files.push(e.path().to_owned()),
                     }
                 } else {
                     let _ = tx.send(WorkerMsg::FileFound);
@@ -542,6 +559,10 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
             }
             Ok(_) => {}
             Err(e) => {
+                match (e.path(), unreadable.as_mut()) {
+                    (Some(p), Some(list)) => list.push(p.to_owned()),
+                    _ => unreadable = None,
+                }
                 let _ = tx.send(WorkerMsg::Error {
                     context: e.path().map(|p| p.display().to_string()).unwrap_or_default(),
                     error: e.to_string(),
@@ -550,8 +571,50 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
         }
     }
 
-    drop(indexed);
+    let found_any = !files.is_empty() || skipped > 0;
     let _ = tx.send(WorkerMsg::TraversalComplete { to_hash: files.len(), skipped });
+
+    // ── Drop rows for deleted files (update mode) ──
+    if upsert && !indexed.is_empty() {
+        match unreadable {
+            // An empty walk usually means an unmounted share, not a deleted tree
+            _ if !found_any => {
+                let _ = tx.send(WorkerMsg::Error {
+                    context: path.clone(),
+                    error: format!(
+                        "no files found — not removing {} existing rows (is the share mounted?)",
+                        indexed.len()
+                    ),
+                });
+            }
+            None => {
+                let _ = tx.send(WorkerMsg::Error {
+                    context: "db".to_string(),
+                    error: "traversal errors without a path — not removing deleted files this run"
+                        .to_string(),
+                });
+            }
+            Some(skip_under) => {
+                let gone: Vec<String> = indexed
+                    .into_keys()
+                    .filter(|p| !skip_under.iter().any(|d| Path::new(p).starts_with(d)))
+                    .collect();
+                match delete_paths(&mut conn, &table_name, &gone) {
+                    Ok(n) => {
+                        let _ = tx.send(WorkerMsg::Removed(n));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WorkerMsg::Error {
+                            context: "db".to_string(),
+                            error: format!("could not remove deleted files: {}", e),
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        drop(indexed);
+    }
 
     // ── Hashing + DB writes in batches ──
     for chunk in files.chunks(BATCH_SIZE) {
@@ -592,13 +655,13 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
         }
     }
 
-    if !upsert {
-        if let Err(e) = create_indexes(&conn, &table_name) {
-            let _ = tx.send(WorkerMsg::Error {
-                context: "db".to_string(),
-                error: format!("could not create indexes: {}", e),
-            });
-        }
+    // IF NOT EXISTS makes this cheap when they're already there; also covers a table
+    // whose first run was `update`
+    if let Err(e) = create_indexes(&conn, &table_name) {
+        let _ = tx.send(WorkerMsg::Error {
+            context: "db".to_string(),
+            error: format!("could not create indexes: {}", e),
+        });
     }
 
     let _ = tx.send(WorkerMsg::Done);
@@ -894,11 +957,12 @@ fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>) {
     }
 
     eprintln!(
-        "complete: {} files — {} {}, {} written, {}, {} duplicate groups",
+        "complete: {} files — {} {}, {} written, {} removed, {}, {} duplicate groups",
         state.files_found,
         state.files_skipped,
         state.skipped_label(),
         state.files_written,
+        state.files_removed,
         state.errors_summary(),
         state.dup_keys.len(),
     );
@@ -1000,6 +1064,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  files found   : {}", state.files_found);
         println!("  skipped       : {} ({})", state.files_skipped, state.skipped_label());
         println!("  files written : {}", state.files_written);
+        println!("  rows removed  : {}", state.files_removed);
         println!("  errors        : {}", state.errors_summary());
         println!("  dup groups    : {}", state.dup_keys.len());
         if !state.dup_keys.is_empty() {
