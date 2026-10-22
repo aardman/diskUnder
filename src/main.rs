@@ -3,6 +3,7 @@
 
 mod cli;
 mod db;
+mod dryrun;
 mod fmt;
 mod maintenance;
 mod output;
@@ -29,6 +30,7 @@ use std::{
 use clap::Parser;
 
 use crate::cli::{Cli, Command};
+use crate::dryrun::run_dry_run;
 use crate::fmt::fmt_bytes;
 use crate::maintenance::run_db_command;
 use crate::plain::run_plain;
@@ -46,9 +48,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut runlog = RunLog::new(&args.db, args.log.as_deref(), args.no_log);
 
-    let (mode, typed) = match &args.cmd {
-        Command::Index { path } => ("index", path.clone()),
-        Command::Update { path } => ("update", path.clone()),
+    let (mode, typed, dry_run) = match &args.cmd {
+        Command::Index { path, dry_run } => ("index", path.clone(), *dry_run),
+        Command::Update { path, dry_run } => ("update", path.clone(), *dry_run),
         Command::Db { action } => {
             let code = run_db_command(&args.db, action, &mut runlog);
             report_log_failure(&runlog);
@@ -106,6 +108,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let upsert = matches!(args.cmd, Command::Update { .. });
+
+    // Changes nothing, so it isn't logged
+    if dry_run {
+        std::process::exit(run_dry_run(&args.db, &typed, &path, upsert));
+    }
+
     let db_path = args.db.clone();
     let threads = args.threads;
 

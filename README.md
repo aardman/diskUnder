@@ -107,6 +107,30 @@ Update mode — pick up new, changed and deleted files:
 diskunder update /Volumes/NAS --db /data/index.db
 ```
 
+Preview a run with `--dry-run`: it walks the tree and reports what `index` or `update` would
+do, using the same rules and safeguards, but hashes and writes nothing — no database is
+created, nothing is migrated, and it isn't logged. Useful before a long first index, or to
+see how much has changed since the last `update`:
+
+```bash
+diskunder update /Volumes/NAS --db /data/index.db --dry-run
+```
+
+```text
+Dry run — update /Volumes/NAS (nothing hashed or written)
+
+  Found            772,087 files · 4.1 TB
+  Unchanged        771,950 files
+  Would hash       137 files · 1.2 GB  (90 new, 47 changed)
+  Would remove     12 rows (no longer on disk)
+  Couldn't read    1 folder — rows under it are kept
+
+Would hash, by type
+  TYPE  FILES     SIZE  SHARE
+  mov      12   1.1 GB  91.0%
+  …
+```
+
 **Plain text output format:**
 ```
 index /Volumes/NAS
@@ -408,9 +432,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | `update` catches all changes (not just the last 24 hours) | No | No | No | No | Yes | Yes |
 | `update` removes rows for deleted files | No | No | No | No | Yes | Yes |
 | One table per directory however it's typed (`/nas`, `/nas/`, `./nas`) | No | No | No | No | Yes | Yes |
-| Duplicate tracking scales to large runs | — | — | — | No | Yes (empty files excluded) | Yes |
-| Duplicate totals cover all groups (not just the top 10) | — | — | — | No | Yes | Yes |
-| Duplicates found across the whole table (not just files hashed this run) | — | — | — | No | Yes | Yes |
+| Duplicate detection — scales to large runs, totals cover every group (not just the top 10), includes files from earlier runs; empty files excluded | — | — | — | No | Yes | Yes |
 | Hard links not counted as wasted space | — | — | — | No | Yes | Yes |
 | Automated test suite (`cargo test`) | No | No | No | No | Yes | Yes |
 | Records each indexed path and its last run (`roots` table) | No | No | No | No | Yes (4.1) | Yes |
@@ -426,13 +448,13 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | `report` — overview, top files, by type, by folder, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Yes (5.1) |
 | Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--ext`, `--under` | No | No | No | No | No | Yes (5.1) |
 | `export` — CSV / TSV / JSON for BI tools | No | No | No | No | No | Yes (5.0) |
-| Dry run — preview indexing (5.2) and dedupe actions (v6) without touching files | No | No | No | No | No | Planned (5.2 / v6) |
+| Dry run — preview `index` / `update` without hashing or writing (dedupe previews come with v6) | No | No | No | No | No | Yes (5.2) |
 | Include / exclude file types — `--include-ext`, `--exclude-ext` | No | No | No | No | No | Planned (5.2) |
 | Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned (5.3) |
-| Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
-| Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 | Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned (5.4) |
 | Interactive app — main window plus Jobs / Results / Database / Settings menus | No | No | No | No | No | Planned (5.5) |
+| Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
+| Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
 ### Background
 

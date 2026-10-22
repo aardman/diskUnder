@@ -41,11 +41,17 @@ pub(crate) enum Command {
     Index {
         /// Directory to index
         path: String,
+        /// Show what would be indexed, without hashing or writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Re-index new and changed files under PATH, and drop rows for deleted files
     Update {
         /// Directory to update
         path: String,
+        /// Show what would be hashed and removed, without hashing or writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Find indexed files by name, type, size, age or duplication
     Search {

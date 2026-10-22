@@ -1463,3 +1463,142 @@ fn report_options_and_formats() {
     let missing = report(&tmp, &db, &["/nowhere"]);
     assert_eq!(missing.code, 1);
 }
+
+// ─── index / update --dry-run (5.2) ──────────────────────────────────────────
+
+/// The first number on the dry-run summary line starting with `label`
+fn dry_value(stdout: &str, label: &str) -> i64 {
+    let line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with(label))
+        .unwrap_or_else(|| panic!("no '{}' line in:\n{}", label, stdout));
+    let rest = line.trim_start()[label.len()..].trim_start();
+    rest.split(' ').next().unwrap().replace(',', "").parse().unwrap()
+}
+
+fn dry(tmp: &TempDir, args: &[&str]) -> Query {
+    let mut a = args.to_vec();
+    a.push("--dry-run");
+    let q = query(tmp.path(), &a);
+    assert_eq!(q.code, 0, "{}", q.stderr);
+    q
+}
+
+#[test]
+fn dry_run_index_creates_and_logs_nothing() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    distinct_files(&data, 5);
+    write(&data.join("clip.MOV"), &"m".repeat(2000));
+    let q = dry(&tmp, &["index", "data", "--db", "t.db"]);
+    assert!(q.stdout.starts_with("Dry run — index "), "{}", q.stdout);
+    assert!(q.stdout.contains("no database at t.db yet"), "{}", q.stdout);
+    assert_eq!(dry_value(&q.stdout, "Found"), 6);
+    assert_eq!(dry_value(&q.stdout, "Would hash"), 6);
+    assert!(q.stdout.contains("Would hash, by type") && q.stdout.contains("  mov "), "{}", q.stdout);
+    assert!(!tmp.path().join("t.db").exists(), "no database created");
+    assert!(!tmp.path().join("t.db.log").exists(), "not logged");
+}
+
+#[test]
+fn dry_run_index_predicts_a_resume() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    distinct_files(&data, 30);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s]);
+    Connection::open(&db).unwrap().execute(&format!("DELETE FROM {} WHERE id % 3 = 0", table_for(&data)), []).unwrap();
+
+    let q = dry(&tmp, &["index", "data", "--db", db_s]);
+    let real = run_in(tmp.path(), &["index", "data", "--db", db_s]).summary;
+    assert_eq!(dry_value(&q.stdout, "Already indexed") as usize, real.skipped);
+    assert_eq!(dry_value(&q.stdout, "Would hash") as usize, real.written);
+}
+
+#[test]
+fn dry_run_update_predicts_the_real_update_and_changes_nothing() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    distinct_files(&data, 20);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s]);
+
+    write(&data.join("f0"), "a longer replacement\n");
+    write(&data.join("f1"), "file X\n");
+    set_mtime(&data.join("f1"), days_ago(3));
+    write(&data.join("new.txt"), "new\n");
+    fs::remove_file(data.join("f2")).unwrap();
+    fs::rename(data.join("f3"), data.join("f3-renamed")).unwrap();
+
+    let t = table_for(&data);
+    let snapshot = |db: &Path| {
+        let conn = Connection::open(db).unwrap();
+        let rows: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get(0)).unwrap();
+        let started: String = conn.query_row("SELECT last_started FROM roots", [], |r| r.get(0)).unwrap();
+        (rows, started, user_version(db))
+    };
+    let before = snapshot(&db);
+    let log_before = log_lines(&db).len();
+
+    let q = dry(&tmp, &["update", "data", "--db", db_s]);
+    assert_eq!(snapshot(&db), before, "dry run leaves the database untouched");
+    assert_eq!(log_lines(&db).len(), log_before, "and isn't logged");
+    assert!(q.stdout.contains("(2 new, 2 changed)"), "new.txt + f3-renamed; f0 + f1:\n{}", q.stdout);
+
+    let real = run_in(tmp.path(), &["update", "data", "--db", db_s]).summary;
+    assert_eq!(dry_value(&q.stdout, "Unchanged") as usize, real.skipped);
+    assert_eq!(dry_value(&q.stdout, "Would hash") as usize, real.written);
+    assert_eq!(dry_value(&q.stdout, "Would remove") as usize, real.removed);
+    assert_eq!(dry_value(&q.stdout, "Found") as usize, real.found);
+}
+
+#[test]
+fn dry_run_update_keeps_the_deletion_safeguards() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    distinct_files(&data.join("open"), 3);
+    distinct_files(&data.join("locked"), 2);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s]);
+
+    chmod(&data.join("locked"), "000");
+    if permissions_ignored(&data.join("locked")) {
+        eprintln!("skipping: permissions not enforced (running as root?)");
+        return;
+    }
+    let q = dry(&tmp, &["update", "data", "--db", db_s]);
+    assert_eq!(dry_value(&q.stdout, "Would remove"), 0, "rows under an unreadable folder are kept");
+    assert!(q.stdout.contains("Couldn't read    1 folder — rows under it are kept"), "{}", q.stdout);
+    chmod(&data.join("locked"), "755");
+
+    fs::rename(&data, tmp.path().join("moved")).unwrap();
+    fs::create_dir(&data).unwrap();
+    let empty = dry(&tmp, &["update", "data", "--db", db_s]);
+    assert_eq!(dry_value(&empty.stdout, "Would remove"), 0);
+    assert!(empty.stdout.contains("nothing would be removed: no files found"), "{}", empty.stdout);
+}
+
+#[test]
+fn dry_run_reports_what_the_run_would_do_first() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    write(&data.join("a"), "aaa\n");
+    write(&data.join("b"), "bbb\n");
+    let db = tmp.path().join("t.db");
+    create_v3_table(&db, "data/", &[("data/a", "sum-a")]);
+
+    let q = dry(&tmp, &["index", "data/", "--db", db.to_str().unwrap()]);
+    assert!(q.stdout.contains("would first update the database schema to version 1"), "{}", q.stdout);
+    assert!(q.stdout.contains("would first migrate 1 rows from the table for \"data/\""), "{}", q.stdout);
+    assert_eq!(dry_value(&q.stdout, "Already indexed"), 1, "migrated rows aren't re-hashed");
+    assert_eq!(dry_value(&q.stdout, "Would hash"), 1);
+    assert_eq!(user_version(&db), 0, "nothing migrated by the dry run");
+
+    Connection::open(&db).unwrap().pragma_update(None, "user_version", 99).unwrap();
+    let newer = query(tmp.path(), &["index", "data", "--dry-run", "--db", db.to_str().unwrap()]);
+    assert_eq!(newer.code, 1);
+    assert!(newer.stderr.contains("newer than this diskunder supports"), "{}", newer.stderr);
+}

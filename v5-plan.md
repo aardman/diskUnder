@@ -276,7 +276,10 @@ log files.
 **Schema:** two TEXT columns on `roots` (`include_ext`, `exclude_ext` — normalised lowercase,
 sorted, comma-separated), added with `ALTER TABLE ADD COLUMN`.
 
-### `index --dry-run` / `update --dry-run`
+### `index --dry-run` / `update --dry-run` ✅
+
+**Done (5.2 part 1).** As described below; the by-type preview of excluded files comes with
+the filters in part 2.
 
 Walk the tree without hashing or writing, and print how many files and bytes would be
 indexed, by type — and, for `update`, how many rows would be removed as deleted or as newly

@@ -1,5 +1,25 @@
 # diskUnder — Change Log
 
+## v5.2 (part 1) — dry run
+
+### `index --dry-run` / `update --dry-run`
+
+Walks the tree and reports what the run would do, without hashing or writing anything: files
+found, already indexed (or unchanged), would hash — with sizes, split into new and changed for
+`update` — and, for `update`, rows that would be removed. The same rules and safeguards as a
+real run apply: rows under folders that can't be read are kept, and nothing is removed when
+the walk finds no files. A breakdown by type shows what would be hashed.
+
+Nothing changes: no database is created, no migrations run (pending ones — a v3 table to
+convert, a schema update — are noted, and converted rows count as already indexed), and dry
+runs aren't logged. A database from a newer diskunder is refused, as in a real run.
+
+Tests check that the dry run's prediction matches the real run that follows — resume after
+losing rows, and an update with new, changed, deleted and renamed files — and that the
+database and log are untouched. 61 tests in total (was 56).
+
+---
+
 ## v5.1 — report
 
 ### `report`
