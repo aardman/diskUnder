@@ -30,7 +30,7 @@ diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 
 Two modes are supported:
 
 - **`index`** — full traversal of the target path. Files already in the database are skipped without being re-hashed, so an interrupted run can simply be restarted
-- **`update`** — only files modified in the last 24 hours. Of those, files whose size and modified time still match the database are skipped without being re-hashed, so frequent runs (e.g. hourly cron) stay cheap
+- **`update`** — full traversal that brings the table in line with disk: new files and files whose size or modified time differ from the database are hashed, unchanged files are skipped without being re-hashed, and rows for files no longer on disk are removed. Rows under a directory that could not be read are kept, and nothing is removed if the walk finds no files at all (e.g. an unmounted share)
 
 ### Database Schema
 
@@ -99,7 +99,7 @@ plain mode explicitly in an interactive terminal.
 # Explicit plain text in an interactive terminal
 ./diskunder --no-tui index /Volumes/NAS --db /data/index.db
 
-# Update mode — re-index files changed in last 24 hours
+# Update mode — pick up new, changed and deleted files
 ./diskunder update /Volumes/NAS --db /data/index.db
 ```
 
@@ -109,7 +109,7 @@ index /Volumes/NAS
   1000/772087 processed — 998 written, 2 errors
   2000/772087 processed — 1991 written, 9 errors
   ...
-complete: 772087 files — 0 already indexed, 749404 written, 22683 errors (22683 unreadable), 1408 duplicate groups
+complete: 772087 files — 0 already indexed, 749404 written, 0 removed, 22683 errors (22683 unreadable), 1408 duplicate groups
 wasted: 3.2 GB
 ```
 
@@ -127,6 +127,8 @@ wasted: 3.2 GB
 | Resumable after crash | No | No | Yes | Yes | Yes | Yes |
 | Resume skips already-indexed files | — | — | No | No | Yes | Yes |
 | `update` skips unchanged files | — | — | No | No | Yes | Yes |
+| `update` catches all changes (not just the last 24 hours) | No | No | No | No | Yes | Yes |
+| `update` removes rows for deleted files | No | No | No | No | Yes | Yes |
 | Duplicate tracking scales to large runs | — | — | — | No | Yes (empty files excluded) | Yes |
 | Duplicate totals cover all groups (not just the top 10) | — | — | — | No | Yes | Yes |
 | Error breakdown (unreadable / not written / traversal) | No | No | No | No | Yes | Yes |

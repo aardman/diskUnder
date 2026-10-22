@@ -54,6 +54,22 @@ summary reports the total with a breakdown, e.g. `504 errors (1 unreadable, 502 
 footer reads `top 10 of N groups — X wasted across all groups`. Failure to create the
 secondary indexes at the end of a run is now reported instead of silently ignored.
 
+### Update mode catches every change and removes deleted files
+
+**Previous behaviour:** `update` only looked at files modified in the last 24 hours. It
+missed changes if it wasn't run daily, missed files copied with their original modified
+time preserved (`rsync -a`, `cp -p`), never removed rows for deleted or renamed files, and
+never created the secondary indexes if it was the first run against a table.
+
+**Fix:** `update` now walks the whole tree and compares every file with the database. Files
+that are new or whose size or modified time differ are hashed and upserted; the rest are
+skipped as unchanged. Rows for paths not seen on disk are removed, with two safeguards:
+- rows under a directory that could not be read are kept (a network blip doesn't wipe them)
+- if the walk finds no files at all, nothing is removed — this is usually an unmounted share
+
+Secondary indexes are now created at the end of every run (`IF NOT EXISTS`). The summary
+reports `N removed`. `index` mode never removes rows.
+
 ---
 
 ## v3.0 — `diskUnder3.rust`

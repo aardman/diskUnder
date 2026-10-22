@@ -66,7 +66,7 @@ diskunder export /nas --format json > report.json
 ## Medium value, moderate effort
 
 ### `watch` mode — continuous incremental updates
-Replace the current 24-hour cutoff heuristic in `update` with OS-native filesystem events.
+Replace scheduled `update` runs (which walk the whole tree) with OS-native filesystem events.
 Uses the `notify` crate (wraps FSEvents on macOS, inotify on Linux) to respond to actual
 file changes rather than polling on a schedule.
 
