@@ -1,11 +1,11 @@
 # diskUnder v5 — plan
 
-Search, report (with duplicate filtering), export, a run log, and include/exclude filters for
-file types and paths — in four small releases.
+Search, report (with duplicate filtering), export, a run log, include/exclude filters for
+file types and paths, saved jobs, and an interactive app — in six small releases.
 
 **Out of scope for v5:** acting on duplicates. Quarantine comes first, then `dedupe` and its
 dry run — both v6 (outline under [Deferred to v6](#deferred-to-v6--quarantine-then-dedupe)).
-Also not in v5: Jobs, `watch`, metadata enrichment. Cost/savings-in-money reporting is dropped.
+Also not in v5: `watch`, metadata enrichment. Cost/savings-in-money reporting is dropped.
 
 ---
 
@@ -32,7 +32,9 @@ Also not in v5: Jobs, `watch`, metadata enrichment. Cost/savings-in-money report
   share filtering and output code. Splitting it into modules is behaviour-neutral and the 29
   existing tests guard it.
 - **Releases:** 5.0 groundwork + run log + search + export → 5.1 report → 5.2 file-type
-  filters and `--dry-run` preview → 5.3 path patterns.
+  filters and `--dry-run` preview → 5.3 path patterns → 5.4 jobs → 5.5 interactive app.
+  Each builds on the ones before: jobs carry the 5.2/5.3 filters and use `--dry-run` for
+  "test"; the app is a front end to everything in 5.0–5.4.
 
 ---
 
@@ -345,6 +347,143 @@ Built on 5.2's machinery — stored per path, reused by `update`, "excluded" kep
 
 ---
 
+## 5.4 — Jobs
+
+Named, saved runs — the design in [future.md](future.md#jobs--named-saved-runs), scheduled
+here and extended for the app.
+
+```text
+diskunder jobs add nas-nightly update /Volumes/NAS --db /data/index.db --threads 4 --exclude-ext tmp,log
+diskunder jobs list
+diskunder jobs show nas-nightly
+diskunder jobs edit nas-nightly --exclude-path .snapshot
+diskunder jobs remove nas-nightly            # asks whether to also drop its index
+diskunder run nas-nightly                    # cron-friendly
+diskunder run nas-nightly --dry-run          # "test": what would be indexed / removed
+```
+
+- **A job is a saved command line:** mode, path, database, threads, file types and path
+  patterns. Running it is exactly `index`/`update` with those settings, so the filters still
+  end up stored in `roots`, the run log still records it, and everything from 5.0–5.3
+  applies unchanged.
+- **Test** is `run NAME --dry-run` — the 5.2 preview, using the job's settings.
+- **`diskunder run` with no name** lists the jobs and their last result, and says to give a
+  name. The interactive picker comes with the app in 5.5, so it isn't built twice.
+- **Never two runs of one job at once:** a lock file per job, held with the standard
+  library's file locking (no new dependency). A second run exits with "already running".
+- **Overrides:** flags given to `run` (e.g. `--no-tui`) apply to that run only.
+- **Names:** letters, digits, `-` and `_`, so they're safe in cron lines.
+
+### Where jobs live
+
+Jobs name their own index database, so they can't live inside one. They go in a **per-user
+store**, `~/.config/diskunder/diskunder.db` (overridable with `--config-db` or the
+`DISKUNDER_CONFIG_DB` environment variable, for service accounts and shared setups). The
+same store holds the 5.5 settings.
+
+| Table | Holds |
+|---|---|
+| `jobs` | name, mode, path, index database, threads, include/exclude types, path patterns, created, updated |
+| `job_runs` | one row per run: run id (matching the run log), started, finished, outcome, exit code, and the summary counts — found, skipped, written, removed, errors by kind, duplicate groups, wasted bytes |
+| `job_run_errors` | up to 50 error messages per run (same cap as the run log), so the app's **History** and **Errors** can show them for any past run |
+
+**Size: M** — the CLI, the store, locking, and about 10 tests.
+
+---
+
+## 5.5 — Interactive app (TUI)
+
+`diskunder` with no subcommand, in a terminal, opens a full-screen app. With a subcommand,
+piped or from cron, nothing changes. It's a front end to 5.0–5.4: every screen runs the same
+code as a CLI command, and shows that command so it can be copied into a script, cron line
+or job.
+
+### Main window
+
+Always visible beneath the menus: things to select on the left, information about the
+selection on the right, and any run in progress along the bottom. Menus act on the
+selection.
+
+```text
+┌ diskUnder v5 ─ /data/index.db ─────────────────────────────────────────────────────────┐
+│ Jobs  Results  Database  Settings  Help                                                │
+├─ Jobs ─────────────────────────────────┬─ nas-nightly ─────────────────────────────────┤
+│ ▸ nas-nightly    ✓ 02:14 today         │ update /Volumes/NAS  ·  threads 4             │
+│   projects       ✗ failed 19 Oct       │ types: all except tmp, log                    │
+│   scratch        ● running 42%         │ last run  02:00 → 02:14 today, completed      │
+│   photos         – never run           │   772,087 files · 749,404 written · 0 removed │
+│                                        │   22,684 errors (22,683 unreadable, 1 other)  │
+│ Indexed paths with no job              │ duplicates  1,408 groups · 3.2 GB wasted      │
+│   /Volumes/Archive   index 3 Oct       │ previous    ✓ 02:13 yesterday · ✓ 02:15 Mon   │
+├────────────────────────────────────────┴───────────────────────────────────────────────┤
+│ scratch  ████████████░░░░░░░░░░░░░░  42%  4,120 / 9,844  data/renders/shot_041.exr     │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ ⏎ run  t test  r results  n new job  ? help  q quit                                    │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Indexed paths without a job are listed too, so nothing in the database is hidden. Runs
+started from the app carry on in the bottom strip while you use the menus (the indexing
+worker already runs on its own thread).
+
+### Menus
+
+```text
+Jobs
+├── Create…          name, path, mode, file types, path patterns, threads
+├── Run ⏎            runs the selected job (progress in the bottom strip)
+├── Test             dry run of the selected job: what would be indexed / removed, no hashing
+├── Edit…
+├── Status           all jobs: running now, last result, last run time
+└── Remove…          job definition only — asks whether to also drop its index
+
+Results              (for the selected job or path)
+├── Latest           summary of the last run: counts, errors, duplicates, top files/types
+├── Search…          filter form + live results
+├── Duplicates       groups → paths, with filters (min size, copies, …)
+├── Reports          top files · by type · by folder · stale
+├── Browse           folder tree by size, drill in/out
+├── History          every run of this job/path: when, outcome, counts
+├── Errors           errors from the last run (or any run, from History)
+└── Logs             run log viewer, filterable by job, outcome, date
+
+Database
+├── Info             every indexed path: files, size, duplicates, last run  (= db info)
+├── Check            integrity check, tables with no recorded path         (= db check)
+├── Vacuum…          compact the file                                      (= db vacuum)
+├── Drop path…       remove an index                                       (= db drop)
+├── Open…            switch to another database
+└── Backup…          online copy of the database file
+
+Settings
+├── Start            database to open, what the main window lists first, auto-select last job
+├── Defaults         threads, mode, file types and path patterns for new jobs
+├── File types       named type groups (images, video, documents…) for filters
+├── Deletion         dry run on by default · confirm before quarantine · grace period before purge   (v6)
+└── Logging          log location, rotation size
+```
+
+**Keys everywhere:** `↑↓` `⏎` `Esc` to move, open and go back; `/` search; `f` filters for
+the current list; `s` sort; `e` export the current list; `c` copy the equivalent CLI command;
+`?` help; `q` quit (asks if a run is in progress).
+
+### Notes
+
+- **Browse** is new: a folder tree sorted by size, with file counts and wasted space per
+  folder — "where did the space go?". It uses the `--by-directory` rollup from 5.1.
+- **Settings** live in the per-user store from 5.4 (a `settings` table). Per-path filters
+  stay in `roots`; a job's filters stay in the job.
+- **Deletion settings** appear from the start but only take effect in v6. "Dry run on by
+  default" can't be turned off without a confirmation.
+- **Testing:** ratatui's test backend renders screens to text, so screens get snapshot tests
+  alongside the CLI tests.
+
+**Size: L** — the largest v5 release. It can ship in steps as 5.5.x: main window, Jobs and
+Results (Latest, History, Errors, Logs) first; then Search, Duplicates, Reports and Browse;
+then Database and Settings.
+
+---
+
 ## Schema changes
 
 | # | Change | Release | Why | Migration | Cost on an existing table |
@@ -353,6 +492,8 @@ Built on 5.2's machinery — stored per path, reused by `update`, "excluded" kep
 | 2 | Store `extension` lowercase | 5.0 | `--ext`, `--by-type` and the file-type filters treat `JPG`/`jpg` as one type and can use the extension index | `UPDATE … SET extension = lower(extension)` once per table; new rows written lowercase | 0.7 s per million rows |
 | 3 | `roots.include_ext`, `roots.exclude_ext` | 5.2 | Remember file-type filters per path | `ALTER TABLE roots ADD COLUMN` | Instant |
 | 4 | `roots.exclude_paths` | 5.3 | Remember path patterns per path | `ALTER TABLE roots ADD COLUMN` | Instant |
+| 5 | Per-user store `~/.config/diskunder/diskunder.db`: `jobs`, `job_runs`, `job_run_errors` | 5.4 | Saved jobs and their run history — outside any index database | New file, created on first use | — |
+| 6 | `settings` table in the per-user store | 5.5 | App settings (start-up, defaults, type groups, deletion, logging) | Created on first use | — |
 
 **Deliberately not added in v5:**
 
@@ -391,8 +532,10 @@ Before the new commands:
 | 5.1 | `report`, including duplicate filtering and the summary | M |
 | 5.2 | Include / exclude file types; `index` / `update --dry-run` | M |
 | 5.3 | Path patterns (Ignore) | S–M |
+| 5.4 | Jobs: saved runs, `run NAME`, test (`--dry-run`), run history | M |
+| 5.5 | Interactive app: main window, Jobs / Results / Database / Settings menus — can ship as 5.5.x steps | L |
 
-S is under a day of focused work, M is one to three. These are rough. Each release ships
+S is under a day of focused work, M is one to three, L is a week or more. These are rough. Each release ships
 with integration tests in the style of `tests/cli.rs`, header checks for the CSV and JSON
 formats, and its own changelog, README and comparison-table updates — the same tag, rebuild
 and push routine as v4.1.
@@ -406,7 +549,7 @@ and push routine as v4.1.
 - **`--stale` uses the modified date**; access-based is opt-in.
 - **Path patterns are in v5**, as 5.3.
 - **`dedupe` keeps the oldest modified copy by default** (recorded for v6).
-
+- **Jobs are 5.4; the interactive app is 5.5**, with the menu structure above.
 - **The run log records only commands that change the database** (see [Run log](#run-log)).
 - **Piped output keeps the readable table**; machine formats are explicit, and notes go to
   stderr (see [Output](#output)).

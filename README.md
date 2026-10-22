@@ -200,11 +200,11 @@ touched. Run it from the repository root. Steps 2–4 use `--no-tui` so your out
 what's shown here; leave it off to watch the live TUI instead (press `q` when it finishes).
 
 **1. Make some fake data** — three 200 KB "photos", a backup folder holding two real copies
-and one hard link, and a small text file. On Linux, change the first line to
-`BIN=$PWD/diskunder-linux`; if you've installed it, `BIN=diskunder` works on either.
+and one hard link, and a small text file. On MacOS, change the first line to
+`BIN=$PWD/diskunder-macos`; if you've installed it, `BIN=diskunder` works on either.
 
 ```bash
-BIN=$PWD/diskunder-macos
+BIN=$PWD/diskunder-linux
 DEMO=/tmp/diskunder-demo
 rm -rf "$DEMO" && mkdir -p "$DEMO/data/photos" "$DEMO/data/backup"
 
@@ -241,78 +241,7 @@ complete: 7 files — 7 already indexed, 0 written, 0 removed, 0 errors, 2 dupli
 wasted: 390.6 KB
 ```
 
-**4. Change things and update** — delete a duplicate, edit a file, add a file:
-
-```bash
-rm "$DEMO/data/backup/img1.jpg"
-echo "milk, eggs" >> "$DEMO/data/notes.txt"
-echo "new file" > "$DEMO/data/todo.txt"
-$BIN update "$DEMO/data" --db "$DEMO/demo.db" --no-tui
-```
-```
-update /private/tmp/diskunder-demo/data
-  2/2 processed — 2 written, 0 errors
-complete: 7 files — 5 unchanged, 2 written, 1 removed, 0 errors, 1 duplicate groups
-wasted: 195.3 KB
-```
-
-Only the edited and new files were hashed, the deleted copy's row was removed, and one
-duplicate group remains.
-
-**5. Query the database** (needs the `sqlite3` command — preinstalled on macOS; `apt install sqlite3` on Debian/Ubuntu):
-
-First find the table name, then list the largest files:
-
-```bash
-T=$(sqlite3 "$DEMO/demo.db" "SELECT name FROM sqlite_master WHERE name LIKE 'files_%' AND type='table'")
-sqlite3 -header -column "$DEMO/demo.db" \
-  "SELECT filename, size, directory FROM $T ORDER BY size DESC LIMIT 3"
-```
-
-Then checksums seen more than once — paths versus distinct copies on disk:
-
-```bash
-sqlite3 -header -column "$DEMO/demo.db" \
-  "SELECT substr(checksum,1,12) AS checksum, COUNT(*) AS paths, COUNT(DISTINCT inode) AS copies, size
-   FROM $T GROUP BY checksum HAVING COUNT(*) > 1"
-```
-
-Output from both:
-```
-filename  size    directory
---------  ------  ---------------------------------------
-img1.jpg  200000  /private/tmp/diskunder-demo/data/photos
-img2.jpg  200000  /private/tmp/diskunder-demo/data/photos
-img3.jpg  200000  /private/tmp/diskunder-demo/data/photos
-
-checksum      paths  copies  size
-------------  -----  ------  ------
-7b828503f882  2      2       200000
-e22348758b55  2      1       200000
-```
-
-The first group is the real duplicate (`img2.jpg` and its backup — 2 copies). The second is
-`img3.jpg` and its hard link — 2 paths but only 1 copy, which is why it isn't reported as
-wasted space. Your checksums — and so the order of these two rows — will differ, since the files are random.
-
-**6. See what's in the database** — `db info` summarises every indexed path, so you don't need
-SQL for the basics:
-
-```bash
-$BIN db info --db "$DEMO/demo.db"
-```
-```
-database: /tmp/diskunder-demo/demo.db — 56.0 KB on disk
-
-/private/tmp/diskunder-demo/data
-  files       7 (976.6 KB)
-  duplicates  1 group, 195.3 KB wasted
-  last run    update at 2026-10-22 15:53, finished 2026-10-22 15:53
-  first run   2026-10-22 15:53
-  table       files_774ac007bc3fea44b72a1c083588ff71 (40.0 KB with indexes)
-```
-
-**7. Clean up:**
+**4. Clean up:**
 
 ```bash
 rm -rf /tmp/diskunder-demo
@@ -383,7 +312,8 @@ database with SQLite's online backup while nothing is writing to it:
 | Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned (5.3) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
-| Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned |
+| Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned (5.4) |
+| Interactive app — main window plus Jobs / Results / Database / Settings menus | No | No | No | No | No | Planned (5.5) |
 
 ---
 
@@ -401,7 +331,7 @@ diskunder/
 ├── Cargo.lock         # Locked dependency versions — ensures reproducible builds
 ├── changes.md         # Full change log (v1 → v4)
 ├── future.md          # Feature ideas
-└── v5-plan.md         # v5 plan: search, report, export, file-type and path filters
+└── v5-plan.md         # v5 plan: search, report, export, filters, jobs, interactive app
 ```
 
 > **Note:** `*.db` files are excluded from version control (`.gitignore`) as they contain

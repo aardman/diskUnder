@@ -4,8 +4,8 @@ Inspired by feature parity with [Diskover](https://diskoverdata.com/). Items are
 
 **Planned for v5** (small releases — see [v5-plan.md](v5-plan.md) for design, schema changes
 and sizing): 5.0 run log, `search` and `export` · 5.1 `report` with duplicate filtering · 5.2
-include/exclude file types and `--dry-run` preview · 5.3 path patterns (Ignore).
-**Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
+include/exclude file types and `--dry-run` preview · 5.3 path patterns (Ignore) · 5.4 Jobs ·
+5.5 interactive app (TUI). **Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
 original ideas.
 
 ---
@@ -92,6 +92,9 @@ same mechanism: `.gitignore`-style patterns such as `.snapshot`, `@eaDir` or
 `projects/*/render-cache`, with excluded folders never walked.
 
 ### Jobs — named, saved runs
+**Planned for 5.4** — the scheduled design, extended for the 5.5 app, is in
+[v5-plan.md](v5-plan.md). This section is the original idea.
+
 Save a run's settings under a name so it can be repeated without retyping paths and flags,
 and keep a history of every run so it's easy to see when each job last ran and how it went.
 
@@ -128,9 +131,10 @@ removed, errors, duplicate groups and wasted bytes. `jobs show` lists recent run
 whether the last run finished — job history extends that with per-run rows and counts.
 
 **Where jobs live:** a job names its own index database (`--db`), so job definitions and
-history can't sit inside an index database. They belong in a small per-user database
-(e.g. `~/.config/diskunder/jobs.db`), overridable with `--jobs-db` or an environment
-variable for shared or service-account setups.
+history can't sit inside an index database. They belong in a small per-user database —
+planned as `~/.config/diskunder/diskunder.db`, shared with the 5.5 app's settings, and
+overridable with `--config-db` or an environment variable for shared or service-account
+setups.
 
 **Details worth deciding up front:**
 - Running a job twice at once should be refused (a lock per job), since two runs against
@@ -166,14 +170,14 @@ diskunder rules run
 Possible actions: `flag` (mark in DB), `report` (print to stdout), `delete` (with
 explicit confirmation prompt — never silent).
 
-### Results browser TUI
-A second TUI mode for exploring the index after indexing is complete — separate from
-the indexing progress TUI in v3.0. Would allow keyboard navigation through duplicate
-groups, directory trees, and search results without dropping to a SQL prompt.
-
-```
-diskunder browse /nas
-```
+### Interactive app (TUI)
+**Planned for 5.5** — design in [v5-plan.md](v5-plan.md). Replaces the earlier "results
+browser TUI" idea with a full app: `diskunder` with no subcommand opens a main window listing
+jobs and indexed paths (with status and last-run details), and menus for **Jobs** (create,
+run, test, edit, status, remove), **Results** (latest, search, duplicates, reports, browse,
+history, errors, logs), **Database** (info, check, vacuum, drop, open, backup) and
+**Settings** (start-up, defaults, file types, deletion, logging). Every screen shows the
+equivalent CLI command. It also absorbs the dedupe "TUI selection" idea below for v6.
 
 ---
 
@@ -429,5 +433,6 @@ Some features above would benefit from schema changes. Notes for when that work 
 - `status` column — `active` / `quarantined` / `deleted`; updated by dedupe actions so
   reports can exclude already-handled files
 - Separate `manifests` table — records every dedupe action for audit and restore support
-- `jobs` and `job_runs` tables (in a per-user jobs database, not the index database) — saved
-  job definitions, and one row per run with timings, outcome and summary counts
+- `jobs`, `job_runs`, `job_run_errors` and `settings` tables (in the per-user store, not the
+  index database) — saved jobs, one row per run with timings, outcome, summary counts and up
+  to 50 errors, and app settings (5.4 / 5.5, see v5-plan.md)
