@@ -1,12 +1,13 @@
 //! SQLite schema, migrations and queries for index tables and the roots table
 
-use rusqlite::{params, Connection, Result as DbResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as DbResult};
 use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
 
+use crate::filters::TypeFilter;
 use crate::scan::{FileEntry, FileId};
 
 pub(crate) fn table_name_for(root: &str) -> String {
@@ -92,7 +93,8 @@ pub(crate) fn migrate_legacy_table(conn: &mut Connection, typed: &str, root: &st
 /// once, in order, over the whole database.
 ///   0 — v4.1 and earlier
 ///   1 — v5.0: file extensions stored lowercase
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+///   2 — v5.2: file-type filter columns on `roots`
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 pub(crate) fn schema_version(conn: &Connection) -> DbResult<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -129,7 +131,34 @@ pub(crate) fn migrate_schema(conn: &mut Connection) -> Result<Vec<String>, Strin
         }
     }
 
+    if version < 2 {
+        let tx = conn.transaction().map_err(db)?;
+        let mut added = false;
+        // A database with no runs recorded yet gets these columns when `roots` is created
+        if table_exists(&tx, "roots").map_err(db)? {
+            for col in ["include_ext", "exclude_ext"] {
+                if !has_column(&tx, "roots", col).map_err(db)? {
+                    tx.execute(&format!("ALTER TABLE roots ADD COLUMN {col} TEXT"), []).map_err(db)?;
+                    added = true;
+                }
+            }
+        }
+        tx.pragma_update(None, "user_version", 2).map_err(db)?;
+        tx.commit().map_err(db)?;
+        if added {
+            applied.push("schema 2: added file-type filter columns to the roots table".to_string());
+        }
+    }
+
     Ok(applied)
+}
+
+pub(crate) fn has_column(conn: &Connection, t: &str, col: &str) -> DbResult<bool> {
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = '{col}')"),
+        [],
+        |row| row.get(0),
+    )
 }
 
 pub(crate) fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
@@ -197,20 +226,44 @@ const ROOTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS roots (
     first_run     TEXT NOT NULL,   -- UTC, like the file dates
     last_started  TEXT NOT NULL,
     last_finished TEXT,            -- NULL while a run is in progress or if it was interrupted
-    last_mode     TEXT NOT NULL    -- index | update
+    last_mode     TEXT NOT NULL,   -- index | update
+    include_ext   TEXT,            -- file-type filters: comma-separated, \"none\" = no extension
+    exclude_ext   TEXT
 )";
 
-pub(crate) fn roots_run_started(conn: &Connection, table: &str, root: &str, mode: &str) -> DbResult<()> {
+/// Records the run's start, and the file-type filters it uses (so `update` can reuse them)
+pub(crate) fn roots_run_started(
+    conn: &Connection,
+    table: &str,
+    root: &str,
+    mode: &str,
+    filter: &TypeFilter,
+) -> DbResult<()> {
     conn.execute(ROOTS_SCHEMA, [])?;
+    let (include, exclude) = filter.to_db();
     conn.execute(
-        "INSERT INTO roots (table_name, root, first_run, last_started, last_finished, last_mode)
-         VALUES (?1, ?2, datetime('now'), datetime('now'), NULL, ?3)
+        "INSERT INTO roots (table_name, root, first_run, last_started, last_finished, last_mode, include_ext, exclude_ext)
+         VALUES (?1, ?2, datetime('now'), datetime('now'), NULL, ?3, ?4, ?5)
          ON CONFLICT(table_name) DO UPDATE SET
            root = excluded.root, last_started = excluded.last_started,
-           last_finished = NULL, last_mode = excluded.last_mode",
-        params![table, root, mode],
+           last_finished = NULL, last_mode = excluded.last_mode,
+           include_ext = excluded.include_ext, exclude_ext = excluded.exclude_ext",
+        params![table, root, mode, include, exclude],
     )?;
     Ok(())
+}
+
+/// The file-type filters stored for a table, if it has a roots row (and the columns exist)
+pub(crate) fn stored_filter(conn: &Connection, table: &str) -> DbResult<Option<TypeFilter>> {
+    if !table_exists(conn, "roots")? || !has_column(conn, "roots", "include_ext")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT include_ext, exclude_ext FROM roots WHERE table_name = ?1",
+        [table],
+        |r| Ok(TypeFilter::from_db(r.get(0)?, r.get(1)?)),
+    )
+    .optional()
 }
 
 pub(crate) fn roots_run_finished(conn: &Connection, table: &str) -> DbResult<()> {
@@ -347,6 +400,7 @@ pub(crate) struct RootRow {
     pub(crate) last_started: String,
     pub(crate) last_finished: Option<String>,
     pub(crate) last_mode: String,
+    pub(crate) filter: TypeFilter,
 }
 
 /// table name → its roots row (empty if the roots table doesn't exist yet)
@@ -354,9 +408,11 @@ pub(crate) fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>
     if !table_exists(conn, "roots")? {
         return Ok(HashMap::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT table_name, root, first_run, last_started, last_finished, last_mode FROM roots",
-    )?;
+    // Before schema 2 there are no filter columns; read-only commands don't migrate, so cope
+    let filters = if has_column(conn, "roots", "include_ext")? { "include_ext, exclude_ext" } else { "NULL, NULL" };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT table_name, root, first_run, last_started, last_finished, last_mode, {filters} FROM roots"
+    ))?;
     let rows = stmt
         .query_map([], |row| {
             Ok((
@@ -367,6 +423,7 @@ pub(crate) fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>
                     last_started: row.get(3)?,
                     last_finished: row.get(4)?,
                     last_mode: row.get(5)?,
+                    filter: TypeFilter::from_db(row.get(6)?, row.get(7)?),
                 },
             ))
         })?

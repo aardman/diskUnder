@@ -4,6 +4,7 @@
 mod cli;
 mod db;
 mod dryrun;
+mod filters;
 mod fmt;
 mod maintenance;
 mod output;
@@ -48,9 +49,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut runlog = RunLog::new(&args.db, args.log.as_deref(), args.no_log);
 
-    let (mode, typed, dry_run) = match &args.cmd {
-        Command::Index { path, dry_run } => ("index", path.clone(), *dry_run),
-        Command::Update { path, dry_run } => ("update", path.clone(), *dry_run),
+    let (mode, typed, dry_run, filter) = match &args.cmd {
+        Command::Index { path, dry_run, types } => ("index", path.clone(), *dry_run, types.filter()),
+        Command::Update { path, dry_run, types } => ("update", path.clone(), *dry_run, types.filter()),
         Command::Db { action } => {
             let code = run_db_command(&args.db, action, &mut runlog);
             report_log_failure(&runlog);
@@ -111,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Changes nothing, so it isn't logged
     if dry_run {
-        std::process::exit(run_dry_run(&args.db, &typed, &path, upsert));
+        std::process::exit(run_dry_run(&args.db, &typed, &path, upsert, filter.as_ref()));
     }
 
     let db_path = args.db.clone();
@@ -127,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<WorkerMsg>();
     let path_w = path.clone();
     let db_w = db_path.clone();
-    std::thread::spawn(move || run_worker(path_w, typed, db_w, threads, upsert, tx));
+    std::thread::spawn(move || run_worker(path_w, typed, db_w, threads, upsert, filter, tx));
 
     let mut state = AppState::new(mode, &path, &db_path);
 
@@ -164,6 +165,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  skipped       : {} ({})", state.files_skipped, state.skipped_label());
         println!("  files written : {}", state.files_written);
         println!("  rows removed  : {}", state.files_removed);
+        if let Some(excluded) = state.excluded_line() {
+            println!("  excluded      : {}", excluded);
+        }
         println!("  errors        : {}", state.errors_summary());
         println!("  dup groups    : {}", state.dup_keys.len());
         if !state.dup_keys.is_empty() {

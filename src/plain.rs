@@ -55,4 +55,8 @@ pub(crate) fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>, runlog: &
     if !state.dup_keys.is_empty() {
         eprintln!("wasted: {}", fmt_bytes(state.dup_wasted));
     }
+    // A line of its own, so the format of the `complete:` line above never changes
+    if let Some(excluded) = state.excluded_line() {
+        eprintln!("{}", excluded);
+    }
 }

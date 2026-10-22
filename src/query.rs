@@ -6,7 +6,7 @@ use clap::Args;
 use rusqlite::{types::Value, Connection};
 use std::{collections::HashMap, fs};
 
-use crate::db::{file_tables, load_roots, schema_version, table_exists, table_name_for, RootRow};
+use crate::db::{file_tables, has_column, load_roots, schema_version, table_exists, table_name_for, RootRow};
 use crate::fmt::fmt_local;
 
 #[derive(Args, Clone, Default)]
@@ -189,13 +189,23 @@ impl Scope {
         let mut finished: Vec<&str> = Vec::new();
         for t in &self.tables {
             match self.roots.get(t) {
-                Some(r) => match &r.last_finished {
-                    Some(end) => finished.push(end),
-                    None => notes.push(format!(
-                        "warning: the last run of {} did not finish — results may be incomplete",
-                        r.root
-                    )),
-                },
+                Some(r) => {
+                    match &r.last_finished {
+                        Some(end) => finished.push(end),
+                        None => notes.push(format!(
+                            "warning: the last run of {} did not finish — results may be incomplete",
+                            r.root
+                        )),
+                    }
+                    // So "no duplicates" isn't mistaken for "no duplicates among types not indexed"
+                    if !r.filter.is_empty() {
+                        notes.push(format!(
+                            "note: {} is indexed with file-type filters ({}) — other types aren't in the index",
+                            r.root,
+                            r.filter.describe()
+                        ));
+                    }
+                }
                 None => notes.push(format!("note: {} has no recorded runs (see `diskunder db info`)", t)),
             }
         }
@@ -230,14 +240,6 @@ pub(crate) struct Query {
     pub(crate) sql: String,
     pub(crate) count_sql: String,
     pub(crate) params: Vec<Value>,
-}
-
-fn has_column(conn: &Connection, t: &str, col: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = '{col}')"),
-        [],
-        |row| row.get(0),
-    )
 }
 
 fn sql_literal(s: &str) -> String {

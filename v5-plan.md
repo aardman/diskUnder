@@ -242,7 +242,10 @@ Largest group          : render.mov — 1.6 GB × 4 copies (4.8 GB wasted)
 
 ---
 
-## 5.2 — Include / exclude file types, and `--dry-run` preview
+## 5.2 — Include / exclude file types, and `--dry-run` preview ✅
+
+**Done**, in two parts: the dry run, then the filters. As designed below, plus `--all-types`
+to clear stored filters. See [changes.md](changes.md).
 
 ```text
 diskunder index /nas --include-ext jpg,jpeg,png,heic,mov,mp4
@@ -278,8 +281,7 @@ sorted, comma-separated), added with `ALTER TABLE ADD COLUMN`.
 
 ### `index --dry-run` / `update --dry-run` ✅
 
-**Done (5.2 part 1).** As described below; the by-type preview of excluded files comes with
-the filters in part 2.
+**Done.**
 
 Walk the tree without hashing or writing, and print how many files and bytes would be
 indexed, by type — and, for `update`, how many rows would be removed as deleted or as newly
@@ -539,7 +541,7 @@ Before the new commands:
 |---|---|---|
 | 5.0 ✅ | Phase 0, run log, `search`, `export` | M |
 | 5.1 ✅ | `report`, including duplicate filtering and the summary | M |
-| 5.2 | Include / exclude file types; `index` / `update --dry-run` | M |
+| 5.2 ✅ | Include / exclude file types; `index` / `update --dry-run` | M |
 | 5.3 | Path patterns (Ignore) | S–M |
 | 5.4 | Jobs: saved runs, `run NAME`, test (`--dry-run`), run history | M |
 | 5.5 | Interactive app: main window, Jobs / Results / Database / Settings menus — can ship as 5.5.x steps | L |

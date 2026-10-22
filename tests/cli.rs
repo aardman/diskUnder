@@ -861,7 +861,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     let db = tmp.path().join("t.db");
     let db_s = db.to_str().unwrap();
     run_in(tmp.path(), &["index", "data", "--db", db_s]);
-    assert_eq!(user_version(&db), 1);
+    assert_eq!(user_version(&db), 2);
     let t = table_for(&data);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension IN ('jpg', 'mov')", t)), 2);
 
@@ -874,7 +874,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     write(&data.join("c.PNG"), "c\n");
     let run = run_in(tmp.path(), &["update", "data", "--db", db_s]);
     assert!(run.stderr.contains("schema 1: stored 1 file extensions in lowercase"), "{}", run.stderr);
-    assert_eq!(user_version(&db), 1);
+    assert_eq!(user_version(&db), 2);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension != lower(extension)", t)), 0);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension = 'png'", t)), 1);
 
@@ -1591,7 +1591,7 @@ fn dry_run_reports_what_the_run_would_do_first() {
     create_v3_table(&db, "data/", &[("data/a", "sum-a")]);
 
     let q = dry(&tmp, &["index", "data/", "--db", db.to_str().unwrap()]);
-    assert!(q.stdout.contains("would first update the database schema to version 1"), "{}", q.stdout);
+    assert!(q.stdout.contains("would first update the database schema to version 2"), "{}", q.stdout);
     assert!(q.stdout.contains("would first migrate 1 rows from the table for \"data/\""), "{}", q.stdout);
     assert_eq!(dry_value(&q.stdout, "Already indexed"), 1, "migrated rows aren't re-hashed");
     assert_eq!(dry_value(&q.stdout, "Would hash"), 1);
@@ -1601,4 +1601,185 @@ fn dry_run_reports_what_the_run_would_do_first() {
     let newer = query(tmp.path(), &["index", "data", "--dry-run", "--db", db.to_str().unwrap()]);
     assert_eq!(newer.code, 1);
     assert!(newer.stderr.contains("newer than this diskunder supports"), "{}", newer.stderr);
+}
+
+// ─── File-type filters (5.2) ─────────────────────────────────────────────────
+
+/// photos (jpg, one JPG), a clip, temp files, a log and a README
+fn typed_share(tmp: &TempDir) -> PathBuf {
+    let d = tmp.path().join("share");
+    for i in 0..3 {
+        write(&d.join(format!("p{}.jpg", i)), &format!("photo {}\n", i));
+    }
+    write(&d.join("SHOUTY.JPG"), "loud\n");
+    write(&d.join("clip.mov"), &"m".repeat(500));
+    for i in 0..4 {
+        write(&d.join(format!("cache/t{}.tmp", i)), &format!("tmp {}\n", i));
+    }
+    write(&d.join("run.log"), "log\n");
+    write(&d.join("README"), "readme\n");
+    d
+}
+
+fn stored_filters(db: &Path) -> (Option<String>, Option<String>) {
+    Connection::open(db)
+        .unwrap()
+        .query_row("SELECT include_ext, exclude_ext FROM roots", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+}
+
+fn indexed_names(db: &Path, table: &str) -> Vec<String> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn.prepare(&format!("SELECT filename FROM {} ORDER BY filename", table)).unwrap();
+    let names = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    names
+}
+
+#[test]
+fn excluded_types_are_never_read_and_the_filters_are_stored() {
+    let tmp = TempDir::new();
+    let d = typed_share(&tmp);
+    chmod(&d.join("cache/t0.tmp"), "000"); // would be an "unreadable" error if it were read
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+
+    let run = run_in(tmp.path(), &["index", "share", "--exclude-ext", "TMP,.log", "--db", db_s]);
+    assert_eq!((run.summary.found, run.summary.written), (6, 6));
+    assert_eq!(run.summary.errors, "0 errors", "the unreadable .tmp file was never opened");
+    assert!(run.stderr.contains("file-type filters: exclude log,tmp"), "{}", run.stderr);
+    assert!(run.stderr.contains("\n5 excluded by filters\n"), "own line, after the summary:\n{}", run.stderr);
+    assert_eq!(stored_filters(&db), (None, Some("log,tmp".to_string())));
+    assert!(!indexed_names(&db, &table_for(&d)).iter().any(|n| n.ends_with(".tmp") || n.ends_with(".log")));
+
+    let again = run_in(tmp.path(), &["update", "share", "--db", db_s]);
+    assert!(again.stderr.contains("file-type filters: exclude log,tmp"), "stored filters reused:\n{}", again.stderr);
+    assert_eq!((again.summary.skipped, again.summary.written, again.summary.removed), (6, 0, 0));
+    assert!(log_lines(&db).last().unwrap().2.ends_with(", 5 excluded by filters"), "{:?}", log_lines(&db).last());
+    chmod(&d.join("cache/t0.tmp"), "644");
+}
+
+#[test]
+fn include_is_an_allowlist_with_a_none_token() {
+    let tmp = TempDir::new();
+    let d = typed_share(&tmp);
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "share", "--include-ext", "jpg,none", "--db", db.to_str().unwrap()]);
+    assert_eq!(
+        indexed_names(&db, &table_for(&d)),
+        ["README", "SHOUTY.JPG", "p0.jpg", "p1.jpg", "p2.jpg"],
+        "case-insensitive, and none = no extension"
+    );
+    assert_eq!(stored_filters(&db), (Some("none,jpg".to_string()), None));
+}
+
+#[test]
+fn changing_filters_removes_now_excluded_rows_separately_from_deleted_ones() {
+    let tmp = TempDir::new();
+    let d = typed_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--db", db_s]);
+    fs::remove_file(d.join("p0.jpg")).unwrap();
+
+    // index never removes rows — it says what update would do
+    let idx = run_in(tmp.path(), &["index", "share", "--exclude-ext", "tmp", "--db", db_s]);
+    assert!(idx.stderr.contains("file-type filters changed: all file types → exclude tmp"), "{}", idx.stderr);
+    assert!(idx.stderr.contains("4 indexed files are now excluded by the file-type filters — `update` removes their rows"), "{}", idx.stderr);
+    assert_eq!(indexed_names(&db, &table_for(&d)).len(), 11);
+
+    let upd = run_in(tmp.path(), &["update", "share", "--db", db_s]);
+    assert_eq!(upd.summary.removed, 1, "only the deleted p0.jpg counts as removed");
+    assert!(upd.stderr.contains("\n4 excluded by filters, 4 rows removed as excluded\n"), "{}", upd.stderr);
+    assert_eq!(indexed_names(&db, &table_for(&d)).len(), 6);
+}
+
+#[test]
+fn all_types_clears_the_filters() {
+    let tmp = TempDir::new();
+    let d = typed_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--include-ext", "mov", "--db", db_s]);
+    let all = run_in(tmp.path(), &["update", "share", "--all-types", "--db", db_s]);
+    assert!(all.stderr.contains("file-type filters changed: include mov → all file types"), "{}", all.stderr);
+    assert_eq!(all.summary.written, 10);
+    assert_eq!(stored_filters(&db), (None, None));
+    assert_eq!(indexed_names(&db, &table_for(&d)).len(), 11);
+
+    let both = query(tmp.path(), &["index", "share", "--all-types", "--exclude-ext", "tmp", "--db", db_s]);
+    assert_eq!(both.code, 2, "--all-types can't be combined with other filters");
+}
+
+#[test]
+fn an_all_excluded_walk_still_removes_deleted_files() {
+    let tmp = TempDir::new();
+    let d = typed_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--db", db_s]);
+    fs::remove_file(d.join("README")).unwrap();
+
+    // Nothing is included, but excluded files prove the share is mounted
+    let run = run_in(tmp.path(), &["update", "share", "--include-ext", "xyz", "--db", db_s]);
+    assert!(!run.stderr.contains("is the share mounted"), "{}", run.stderr);
+    assert_eq!(run.summary.removed, 1);
+    assert!(run.stderr.contains("10 rows removed as excluded"), "{}", run.stderr);
+}
+
+#[test]
+fn dry_run_predicts_filter_changes() {
+    let tmp = TempDir::new();
+    let d = typed_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--db", db_s]);
+    fs::remove_file(d.join("p1.jpg")).unwrap();
+
+    let q = dry(&tmp, &["update", "share", "--include-ext", "jpg", "--db", db_s]);
+    assert!(q.stdout.contains("file-type filters would change: all file types → include jpg"), "{}", q.stdout);
+    assert!(q.stdout.contains("Excluded by filters, by type"), "{}", q.stdout);
+    assert_eq!(stored_filters(&db), (None, None), "dry run stores nothing");
+
+    let real = run_in(tmp.path(), &["update", "share", "--include-ext", "jpg", "--db", db_s]);
+    assert_eq!(dry_value(&q.stdout, "Found") as usize, real.summary.found);
+    assert_eq!(dry_value(&q.stdout, "Excluded"), 7, "clip, 4 tmp, log, README");
+    assert_eq!(dry_value(&q.stdout, "Would remove") as usize, real.summary.removed);
+    assert_eq!(dry_value(&q.stdout, "Now excluded"), 7);
+    assert!(real.stderr.contains("7 rows removed as excluded"), "{}", real.stderr);
+}
+
+#[test]
+fn filters_show_in_db_info_and_query_notes() {
+    let tmp = TempDir::new();
+    typed_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--exclude-ext", "tmp", "--db", db_s]);
+
+    let info = db_cmd(tmp.path(), &["info", "--db", db_s]);
+    assert!(info.stdout.contains("  filters     exclude tmp\n"), "{}", info.stdout);
+    let note = "is indexed with file-type filters (exclude tmp) — other types aren't in the index";
+    assert!(query(tmp.path(), &["search", "share", "--db", db_s]).stderr.contains(note));
+    assert!(query(tmp.path(), &["report", "share", "--db", db_s]).stderr.contains(note));
+}
+
+#[test]
+fn schema_1_databases_are_read_and_upgraded() {
+    let tmp = TempDir::new();
+    typed_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--db", db_s]);
+    // Back to a v5.1 database: no filter columns on roots, schema version 1
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("ALTER TABLE roots DROP COLUMN include_ext; ALTER TABLE roots DROP COLUMN exclude_ext;").unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    drop(conn);
+
+    assert_eq!(db_cmd(tmp.path(), &["info", "--db", db_s]).code, 0, "read-only commands cope");
+    assert_eq!(query(tmp.path(), &["search", "share", "--db", db_s]).code, 0);
+    let upd = run_in(tmp.path(), &["update", "share", "--exclude-ext", "tmp", "--db", db_s]);
+    assert!(upd.stderr.contains("schema 2: added file-type filter columns to the roots table"), "{}", upd.stderr);
+    assert_eq!(user_version(&db), 2);
+    assert_eq!(stored_filters(&db), (None, Some("tmp".to_string())));
 }

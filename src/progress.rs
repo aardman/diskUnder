@@ -39,6 +39,8 @@ pub(crate) struct AppState {
     pub(crate) files_hashed: usize,
     pub(crate) files_written: usize,
     pub(crate) files_removed: usize, // rows dropped for deleted files (update mode)
+    pub(crate) files_excluded: usize, // files skipped by the file-type filters
+    pub(crate) rows_excluded_removed: usize, // rows dropped because their type is now excluded
     pub(crate) files_errored: usize,  // queued files that could not be read or hashed
     pub(crate) files_unwritten: usize, // hashed files lost to a failed batch commit
     pub(crate) other_errors: usize,   // traversal and database errors
@@ -70,6 +72,8 @@ impl AppState {
             files_hashed: 0,
             files_written: 0,
             files_removed: 0,
+            files_excluded: 0,
+            rows_excluded_removed: 0,
             files_errored: 0,
             files_unwritten: 0,
             other_errors: 0,
@@ -99,7 +103,7 @@ impl AppState {
         if let Some(fatal) = &self.fatal {
             return fatal.clone();
         }
-        format!(
+        let mut summary = format!(
             "{} found, {} {}, {} written, {} removed, {}, {} duplicate groups, {} wasted",
             fmt_count(self.files_found as i64),
             fmt_count(self.files_skipped as i64),
@@ -109,7 +113,23 @@ impl AppState {
             self.errors_summary(),
             fmt_count(self.dup_keys.len() as i64),
             fmt_bytes(self.dup_wasted)
-        )
+        );
+        if let Some(excluded) = self.excluded_line() {
+            summary.push_str(&format!(", {}", excluded));
+        }
+        summary
+    }
+
+    /// "120 excluded by filters, 3 rows removed as excluded" — None when filters changed nothing
+    pub(crate) fn excluded_line(&self) -> Option<String> {
+        if self.files_excluded == 0 && self.rows_excluded_removed == 0 {
+            return None;
+        }
+        let mut line = format!("{} excluded by filters", fmt_count(self.files_excluded as i64));
+        if self.rows_excluded_removed > 0 {
+            line.push_str(&format!(", {} rows removed as excluded", fmt_count(self.rows_excluded_removed as i64)));
+        }
+        Some(line)
     }
 
     /// e.g. "3 errors (2 unreadable, 1 not written)"; just "0 errors" when clean
@@ -251,6 +271,14 @@ impl AppState {
                 }
             }
             WorkerMsg::BatchWritten(n) => self.files_written += n,
+            WorkerMsg::Excluded(n) => {
+                self.files_excluded = n;
+                self.push_log(format!("{} files excluded by the file-type filters", n));
+            }
+            WorkerMsg::RemovedExcluded(n) => {
+                self.rows_excluded_removed = n;
+                self.push_log(format!("removed {} rows whose type is now excluded", n));
+            }
             WorkerMsg::Removed(n) => {
                 self.files_removed = n;
                 self.push_log(format!("removed {} rows for files no longer on disk", n));

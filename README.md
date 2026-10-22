@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 0.5.1`:
+**Check it worked** — this should print `diskunder 0.5.2`:
 
 ```bash
 diskunder --version
@@ -106,6 +106,21 @@ Update mode — pick up new, changed and deleted files:
 ```bash
 diskunder update /Volumes/NAS --db /data/index.db
 ```
+
+**File types.** Index only the types you care about, or skip ones you don't — excluded files
+are never read, so runs get faster too. Extensions are matched case-insensitively on the text
+after the last dot (`archive.tar.gz` → `gz`); `none` means files without one:
+
+```bash
+diskunder index /Volumes/Photos --include-ext jpg,jpeg,png,heic,mov,mp4 --db /data/index.db
+diskunder index /Volumes/NAS --exclude-ext tmp,log,ds_store --db /data/index.db
+```
+
+The filters are stored with the path, so a later `update` with no filters uses them again (and
+says so). Passing `--include-ext` or `--exclude-ext` replaces them; `--all-types` clears them.
+When a type becomes excluded, `update` removes its rows and reports them separately from
+deleted files (`index` never removes rows — it notes how many `update` would remove).
+`db info` shows each path's filters, and `search` and `report` note when an index is filtered.
 
 Preview a run with `--dry-run`: it walks the tree and reports what `index` or `update` would
 do, using the same rules and safeguards, but hashes and writes nothing — no database is
@@ -377,11 +392,13 @@ CREATE TABLE roots (
     first_run     TEXT NOT NULL,      -- UTC
     last_started  TEXT NOT NULL,
     last_finished TEXT,               -- NULL if the last run was interrupted (or is still running)
-    last_mode     TEXT NOT NULL       -- index | update
+    last_mode     TEXT NOT NULL,      -- index | update
+    include_ext   TEXT,               -- file-type filters: comma-separated, "none" = no extension
+    exclude_ext   TEXT
 );
 ```
 
-The layout version is kept in SQLite's `PRAGMA user_version` (v5.0+: `1`). `index` and
+The layout version is kept in SQLite's `PRAGMA user_version` (v5.2+: `2`). `index` and
 `update` bring an older database up to date; a database written by a newer diskunder is
 refused rather than modified.
 
@@ -449,7 +466,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--ext`, `--under` | No | No | No | No | No | Yes (5.1) |
 | `export` — CSV / TSV / JSON for BI tools | No | No | No | No | No | Yes (5.0) |
 | Dry run — preview `index` / `update` without hashing or writing (dedupe previews come with v6) | No | No | No | No | No | Yes (5.2) |
-| Include / exclude file types — `--include-ext`, `--exclude-ext` | No | No | No | No | No | Planned (5.2) |
+| Include / exclude file types — `--include-ext`, `--exclude-ext`, stored per path | No | No | No | No | No | Yes (5.2) |
 | Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned (5.3) |
 | Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned (5.4) |
 | Interactive app — main window plus Jobs / Results / Database / Settings menus | No | No | No | No | No | Planned (5.5) |
@@ -467,7 +484,7 @@ The project was developed in multiple languages, each addressing the limitations
 - **Rust v2:** All known bugs fixed, plain-text output only
 - **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
 - **Rust v4:** Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
-- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`; the rest is planned in [v5-plan.md](v5-plan.md)
+- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters; the rest is planned in [v5-plan.md](v5-plan.md)
 
 Only the current Rust version is kept in this repository; the earlier versions were not committed.
 
@@ -492,6 +509,8 @@ diskunder/
 │   ├── output.rs      #   table, CSV, TSV, JSON, paths
 │   ├── search.rs      #   search and export commands
 │   ├── report.rs      #   report command
+│   ├── dryrun.rs      #   index / update --dry-run
+│   ├── filters.rs     #   file-type filters
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
@@ -538,5 +557,7 @@ cargo test
 checks both its summary output and the database it writes: resume, change detection, deletions,
 path normalisation and v3 migration, error counting, duplicate totals, hard links, argument
 parsing, the `db` maintenance commands, schema migrations, the run log, `search`/`export`
-filters, scopes and formats, and every `report` section and duplicate filter. Unit tests in `src/query.rs` cover size, age and extension parsing.
+filters, scopes and formats, every `report` section and duplicate filter, `--dry-run` (checked against the real run that
+follows), and file-type filters. Unit tests in `src/query.rs` and `src/filters.rs` cover size,
+age and extension parsing and filter matching.
 Tests that rely on file permissions skip themselves when run as root.

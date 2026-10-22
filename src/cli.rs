@@ -3,7 +3,8 @@
 use clap::{Parser, Subcommand};
 
 use crate::output::Format;
-use crate::query::{parse_size, FilterArgs, SortKey};
+use crate::filters::TypeFilter;
+use crate::query::{parse_ext_list, parse_size, ExtList, FilterArgs, SortKey};
 use crate::report::{parse_age_arg, Age, StaleBy};
 
 #[derive(Parser)]
@@ -44,6 +45,8 @@ pub(crate) enum Command {
         /// Show what would be indexed, without hashing or writing anything
         #[arg(long)]
         dry_run: bool,
+        #[command(flatten)]
+        types: TypeArgs,
     },
     /// Re-index new and changed files under PATH, and drop rows for deleted files
     Update {
@@ -52,6 +55,8 @@ pub(crate) enum Command {
         /// Show what would be hashed and removed, without hashing or writing anything
         #[arg(long)]
         dry_run: bool,
+        #[command(flatten)]
+        types: TypeArgs,
     },
     /// Find indexed files by name, type, size, age or duplication
     Search {
@@ -164,6 +169,39 @@ pub(crate) enum DbAction {
     Vacuum,
     /// Run SQLite's integrity check and report tables with no recorded path
     Check,
+}
+
+/// File-type filters for `index` and `update`. Any of these replaces the filters stored for
+/// the path; with none, the stored filters are reused.
+#[derive(clap::Args)]
+pub(crate) struct TypeArgs {
+    /// Only index these extensions, comma-separated, e.g. jpg,png,mov ("none" = no extension)
+    #[arg(long, value_name = "LIST", value_parser = parse_ext_list)]
+    pub(crate) include_ext: Option<ExtList>,
+
+    /// Don't index these extensions, e.g. tmp,log
+    #[arg(long, value_name = "LIST", value_parser = parse_ext_list)]
+    pub(crate) exclude_ext: Option<ExtList>,
+
+    /// Clear any stored file-type filters and index every type
+    #[arg(long, conflicts_with_all = ["include_ext", "exclude_ext"])]
+    pub(crate) all_types: bool,
+}
+
+impl TypeArgs {
+    /// The filters to use from the command line, or None to reuse the stored ones
+    pub(crate) fn filter(&self) -> Option<TypeFilter> {
+        if self.all_types {
+            return Some(TypeFilter::default());
+        }
+        if self.include_ext.is_none() && self.exclude_ext.is_none() {
+            return None;
+        }
+        Some(TypeFilter {
+            include: self.include_ext.as_ref().map(|l| l.0.clone()),
+            exclude: self.exclude_ext.as_ref().map(|l| l.0.clone()).unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

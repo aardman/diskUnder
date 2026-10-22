@@ -1,6 +1,6 @@
 # diskUnder — Change Log
 
-## v5.2 (part 1) — dry run
+## v5.2 — dry run and file-type filters
 
 ### `index --dry-run` / `update --dry-run`
 
@@ -16,7 +16,38 @@ runs aren't logged. A database from a newer diskunder is refused, as in a real r
 
 Tests check that the dry run's prediction matches the real run that follows — resume after
 losing rows, and an update with new, changed, deleted and renamed files — and that the
-database and log are untouched. 61 tests in total (was 56).
+database and log are untouched.
+
+### File-type filters: `--include-ext`, `--exclude-ext`, `--all-types`
+
+`index` and `update` can include only some extensions, or exclude some. Matching is
+case-insensitive on the last extension (`archive.tar.gz` → `gz`), with `none` for files that
+have no extension; include is an allowlist, and exclude applies after it. Excluded files are
+skipped during the walk — never stat'ed or hashed.
+
+- **Stored per path** (new `roots.include_ext` / `exclude_ext`), so `update` with no filter
+  options reuses them and says so. Any filter option replaces the stored filters; `--all-types`
+  clears them.
+- **"Now excluded" isn't "deleted".** When a type becomes excluded, `update` removes its rows
+  and reports them separately (`N rows removed as excluded`); `index` never removes rows and
+  notes how many `update` would. A walk where every file is excluded still counts as finding
+  the share, so the unmounted-share safeguard doesn't misfire.
+- **Visible:** excluded counts get their own line after the plain-text `complete:` line (whose
+  format is unchanged) and are appended to the run log's end line; `db info` shows each path's
+  filters; `search` and `report` note on stderr when an index is filtered.
+- **Dry run:** shows what would be excluded (with a by-type breakdown), and for `update` how
+  many rows would be removed as now excluded.
+
+### Schema 2
+
+`roots` gains `include_ext` and `exclude_ext`; existing databases get them on their next
+`index` or `update`. Read-only commands work on schema-1 databases without changing them.
+
+### Tests
+
+71 in total (was 56): 5 unit tests and 66 end-to-end, including dry-run predictions, filters
+applied/stored/reused/changed/cleared, an unreadable excluded file causing no error (proof
+it's never read), now-excluded rows kept apart from deleted ones, and schema-1 upgrades.
 
 ---
 
