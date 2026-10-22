@@ -24,7 +24,7 @@ use ratatui::{
 use rayon::prelude::*;
 use rusqlite::{params, Connection, Result as DbResult};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::{self, File},
     io::{BufReader, IsTerminal, Read, Stdout},
     path::{Path, PathBuf},
@@ -84,6 +84,7 @@ enum WorkerMsg {
     /// A batch of N rows committed to SQLite
     BatchWritten(usize),
     /// Directory traversal finished — `to_hash` files queued, `skipped` already in the DB
+    /// (index mode) or unchanged since last indexed (update mode)
     TraversalComplete { to_hash: usize, skipped: usize },
     /// All work done
     Done,
@@ -105,7 +106,7 @@ struct AppState {
     db_path: String,
 
     files_found: usize,
-    files_skipped: usize, // already in the DB from a previous run
+    files_skipped: usize, // already indexed (index mode) or unchanged (update mode)
     files_hashed: usize,
     files_written: usize,
     files_errored: usize,
@@ -140,6 +141,10 @@ impl AppState {
             log: Vec::new(),
             done: false,
         }
+    }
+
+    fn skipped_label(&self) -> &'static str {
+        if self.mode == "update" { "unchanged" } else { "already indexed" }
     }
 
     fn progress(&self) -> f64 {
@@ -210,8 +215,8 @@ impl AppState {
                 self.files_skipped = skipped;
                 if skipped > 0 {
                     self.push_log(format!(
-                        "traversal complete — {} files found, {} already indexed, {} to hash",
-                        self.files_found, skipped, to_hash
+                        "traversal complete — {} files found, {} {}, {} to hash",
+                        self.files_found, skipped, self.skipped_label(), to_hash
                     ));
                 } else {
                     self.push_log(format!("traversal complete — {} files found", to_hash));
@@ -336,10 +341,16 @@ fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
     Ok(table_name)
 }
 
-fn load_indexed_paths(conn: &Connection, t: &str) -> DbResult<HashSet<String>> {
-    let mut stmt = conn.prepare(&format!("SELECT path FROM {t}", t = t))?;
-    let paths = stmt.query_map([], |row| row.get(0))?.collect();
-    paths
+/// path → (size, modified_date) for every row already in the table
+fn load_indexed(conn: &Connection, t: &str) -> DbResult<HashMap<String, (u64, String)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT path, size, COALESCE(modified_date, '') FROM {t}",
+        t = t
+    ))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+        .collect();
+    rows
 }
 
 fn create_indexes(conn: &Connection, t: &str) -> DbResult<()> {
@@ -416,19 +427,16 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
         }
     };
 
-    // In index mode, paths already in the table are skipped so an interrupted run
-    // resumes without re-hashing everything it has already written.
-    let indexed: HashSet<String> = if upsert {
-        HashSet::new()
-    } else {
-        load_indexed_paths(&conn, &table_name).unwrap_or_else(|e| {
-            let _ = tx.send(WorkerMsg::FileError {
-                path: "db".to_string(),
-                error: format!("could not read existing paths, re-hashing all: {}", e),
-            });
-            HashSet::new()
-        })
-    };
+    // Files already in the table are not re-hashed: in index mode any existing path is
+    // skipped (so an interrupted run resumes cheaply); in update mode a path is skipped
+    // only if its size and modified time still match what was stored.
+    let indexed = load_indexed(&conn, &table_name).unwrap_or_else(|e| {
+        let _ = tx.send(WorkerMsg::FileError {
+            path: "db".to_string(),
+            error: format!("could not read existing paths, re-hashing all: {}", e),
+        });
+        HashMap::new()
+    });
 
     // ── Traversal ──
     let cutoff = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
@@ -440,16 +448,25 @@ fn run_worker(path: String, db_path: String, threads: usize, upsert: bool, tx: S
             Ok(e) if e.file_type().is_file() => {
                 if upsert {
                     // update mode: only files modified in last 24h
-                    match e.metadata().ok().and_then(|m| m.modified().ok()) {
+                    let meta = e.metadata().ok();
+                    match meta.as_ref().and_then(|m| m.modified().ok()) {
                         Some(t) if t > cutoff => {
                             let _ = tx.send(WorkerMsg::FileFound);
-                            files.push(e.path().to_owned());
+                            let size = meta.as_ref().map_or(0, |m| m.len());
+                            let unchanged = indexed
+                                .get(e.path().to_string_lossy().as_ref())
+                                .map_or(false, |(s, m)| *s == size && *m == fmt_time(t));
+                            if unchanged {
+                                skipped += 1;
+                            } else {
+                                files.push(e.path().to_owned());
+                            }
                         }
                         _ => {}
                     }
                 } else {
                     let _ = tx.send(WorkerMsg::FileFound);
-                    if indexed.contains(e.path().to_string_lossy().as_ref()) {
+                    if indexed.contains_key(e.path().to_string_lossy().as_ref()) {
                         skipped += 1;
                     } else {
                         files.push(e.path().to_owned());
@@ -615,7 +632,10 @@ fn draw_progress(f: &mut Frame, state: &AppState, area: Rect) {
                 format!("{:>9}", state.files_skipped),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled("  already indexed", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {}", state.skipped_label()),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(vec![
             Span::raw("  Hashed  "),
@@ -802,9 +822,10 @@ fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>) {
     }
 
     eprintln!(
-        "complete: {} files — {} already indexed, {} written, {} errors/skipped, {} duplicate groups",
+        "complete: {} files — {} {}, {} written, {} errors/skipped, {} duplicate groups",
         state.files_found,
         state.files_skipped,
+        state.skipped_label(),
         state.files_written,
         state.files_errored,
         state.top_dups.len(),
@@ -905,7 +926,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Print plain-text summary after TUI exits
         println!("\ndiskUnder — complete");
         println!("  files found   : {}", state.files_found);
-        println!("  skipped       : {} (already indexed)", state.files_skipped);
+        println!("  skipped       : {} ({})", state.files_skipped, state.skipped_label());
         println!("  files written : {}", state.files_written);
         println!("  errors        : {}", state.files_errored);
         println!("  dup groups    : {}", state.top_dups.len());

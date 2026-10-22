@@ -28,7 +28,7 @@ diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 
 Two modes are supported:
 
 - **`index`** — full traversal of the target path. Files already in the database are skipped without being re-hashed, so an interrupted run can simply be restarted
-- **`update`** — only files modified in the last 24 hours
+- **`update`** — only files modified in the last 24 hours. Of those, files whose size and modified time still match the database are skipped without being re-hashed, so frequent runs (e.g. hourly cron) stay cheap
 
 ### Database Schema
 

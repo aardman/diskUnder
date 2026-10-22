@@ -10,7 +10,18 @@ an interrupted run on a large network share cost almost as much as starting agai
 
 **Fix:** Before traversal, `index` mode loads the paths already in the table and skips those
 files entirely. The TUI shows a "Skipped" count, and the plain-text summary reports
-`N already indexed`. `update` mode is unchanged.
+`N already indexed`.
+
+### Update mode skips unchanged files
+
+**Previous behaviour:** `update` mode re-hashed every file modified in the last 24 hours, even
+if it had not changed since an earlier `update` run. Running it more often than daily (e.g.
+hourly from cron) re-hashed the same files repeatedly.
+
+**Fix:** A file in the 24-hour window is skipped if its size and modified time match the stored
+row. New files and files whose size or modified time differ are hashed and upserted as before.
+The skipped count is reported as `N unchanged`. Modified times are stored to the second, so an
+edit that keeps the same size within the same second as the stored time is not detected.
 
 ---
 
