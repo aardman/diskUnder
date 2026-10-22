@@ -149,6 +149,7 @@ wasted: 3.2 GB
 | Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned |
+| Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned |
 
 ---
 

@@ -61,6 +61,51 @@ diskunder export /nas --format csv  > report.csv
 diskunder export /nas --format json > report.json
 ```
 
+### Jobs — named, saved runs
+Save a run's settings under a name so it can be repeated without retyping paths and flags,
+and keep a history of every run so it's easy to see when each job last ran and how it went.
+
+```
+diskunder jobs add nas-nightly update /Volumes/NAS --db /data/index.db --threads 4
+diskunder jobs list                     # every job with its last run, status and duration
+diskunder jobs show nas-nightly         # settings plus recent run history
+diskunder jobs remove nas-nightly
+
+diskunder run nas-nightly               # run a saved job by name (cron-friendly)
+diskunder run                           # no name: pick a job from a menu
+```
+
+`jobs list` output:
+
+```
+NAME          MODE    PATH           LAST RUN           STATUS     DURATION  FILES    ERRORS
+nas-nightly   update  /Volumes/NAS   2026-10-22 02:00   completed  14m 32s   772,087  22,683
+projects      index   /Volumes/Proj  2026-10-19 18:45   failed     3m 10s    41,200   1
+scratch       index   /tmp/scratch   never              —          —         —        —
+```
+
+**Menu:** `diskunder run` with no name opens a TUI list of saved jobs showing the same
+columns. Arrow keys to choose, Enter to run, `q` to quit. In plain mode (no terminal), a
+missing name is an error that lists the available jobs instead.
+
+**Run history:** each run records start and end time, how it ended (completed, failed, or
+interrupted), and the summary counts the tool already prints: found, skipped, written,
+removed, errors, duplicate groups and wasted bytes. `jobs show` lists recent runs, and
+`jobs list` shows the latest.
+
+**Where jobs live:** a job names its own index database (`--db`), so job definitions and
+history can't sit inside an index database. They belong in a small per-user database
+(e.g. `~/.config/diskunder/jobs.db`), overridable with `--jobs-db` or an environment
+variable for shared or service-account setups.
+
+**Details worth deciding up front:**
+- Running a job twice at once should be refused (a lock per job), since two runs against
+  the same table would fight.
+- Run-time flags such as `--no-tui` should still work on `run`; any setting given on the
+  command line overrides the saved one for that run only.
+- Job names are case-sensitive and limited to letters, digits, `-` and `_`, so they're safe
+  in cron lines and shell scripts.
+
 ---
 
 ## Medium value, moderate effort
@@ -341,3 +386,5 @@ Some features above would benefit from schema changes. Notes for when that work 
 - `status` column — `active` / `quarantined` / `deleted`; updated by dedupe actions so
   reports can exclude already-handled files
 - Separate `manifests` table — records every dedupe action for audit and restore support
+- `jobs` and `job_runs` tables (in a per-user jobs database, not the index database) — saved
+  job definitions, and one row per run with timings, outcome and summary counts
