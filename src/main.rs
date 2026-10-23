@@ -6,56 +6,70 @@ mod db;
 mod dryrun;
 mod filters;
 mod fmt;
+mod jobs;
 mod maintenance;
 mod output;
 mod plain;
 mod progress;
 mod query;
 mod report;
+mod run;
 mod runlog;
 mod scan;
 mod search;
 mod tui;
 
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{
-    fs,
-    io::IsTerminal,
-    sync::mpsc,
-};
 use clap::Parser;
+use std::fs;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, JobsAction, Mode};
 use crate::dryrun::run_dry_run;
-use crate::fmt::fmt_bytes;
+use crate::jobs::{run_jobs_command, store_path, JobSettings, JobsCommand, LogArgs};
 use crate::maintenance::run_db_command;
-use crate::plain::run_plain;
-use crate::progress::AppState;
 use crate::report::{run_report, ReportOptions};
+use crate::run::{report_log_failure, run_indexing, IndexRun};
 use crate::runlog::RunLog;
-use crate::scan::{WorkerMsg, run_worker};
 use crate::search::{run_export, run_search, SearchOptions};
-use crate::tui::run_ui;
 
-// ─── Entry point ─────────────────────────────────────────────────────────────
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let args = Cli::parse();
+    let db = args.db();
+    let log_args = LogArgs { log: args.log.clone(), no_log: args.no_log, no_tui: args.no_tui };
+    let store = store_path(args.config_db.as_deref());
 
-    let mut runlog = RunLog::new(&args.db, args.log.as_deref(), args.no_log);
-
-    let (mode, typed, dry_run, filter) = match &args.cmd {
-        Command::Index { path, dry_run, types } => ("index", path.clone(), *dry_run, types.overrides()),
-        Command::Update { path, dry_run, types } => ("update", path.clone(), *dry_run, types.overrides()),
+    let code = match &args.cmd {
+        Command::Index { path, dry_run, types } => index(&args, &db, false, path, *dry_run, types.overrides()),
+        Command::Update { path, dry_run, types } => index(&args, &db, true, path, *dry_run, types.overrides()),
+        Command::Jobs { action } => {
+            let cmd = match action {
+                JobsAction::Add { name, mode, path, types } => {
+                    JobsCommand::Add { name, settings: job_settings(&args, Some(*mode), Some(path), types) }
+                }
+                JobsAction::Edit { name, mode, path, types } => {
+                    JobsCommand::Edit { name, settings: job_settings(&args, *mode, path.as_deref(), types) }
+                }
+                JobsAction::List => JobsCommand::List,
+                JobsAction::Show { name } => JobsCommand::Show { name },
+                JobsAction::Remove { name, yes, drop_index } => {
+                    JobsCommand::Remove { name, yes: *yes, drop_index: *drop_index }
+                }
+            };
+            run_jobs_command(&store, cmd, &log_args)
+        }
+        Command::Run { name, dry_run } => {
+            if args.db.is_some() {
+                eprintln!("error: a job always uses its own database — change it with `diskunder jobs edit NAME --db FILE`");
+                2
+            } else {
+                let cmd = JobsCommand::Run { name: name.as_deref(), dry_run: *dry_run, threads: args.threads };
+                run_jobs_command(&store, cmd, &log_args)
+            }
+        }
         Command::Db { action } => {
-            let code = run_db_command(&args.db, action, &mut runlog);
+            let mut runlog = RunLog::new(&db, args.log.as_deref(), args.no_log);
+            let code = run_db_command(&db, action, &mut runlog);
             report_log_failure(&runlog);
-            std::process::exit(code);
+            code
         }
         // Read-only: never logged
         Command::Search { path, filters, sort, limit, format, paths, null, long } => {
@@ -69,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 null: *null,
                 long: *long,
             };
-            std::process::exit(run_search(&args.db, &options));
+            run_search(&db, &options)
         }
         Command::Report {
             path, filters, top_files, by_type, by_directory, depth, stale, stale_by, duplicates,
@@ -92,105 +106,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 limit: *limit,
                 format: *format,
             };
-            std::process::exit(run_report(&args.db, &options));
+            run_report(&db, &options)
         }
         Command::Export { path, filters, sort, format } => {
-            std::process::exit(run_export(&args.db, path.as_deref(), filters, *sort, (*format).into()));
+            run_export(&db, path.as_deref(), filters, *sort, (*format).into())
         }
     };
-
-    // Absolute, symlink-free root, so every spelling of the same directory shares a table
-    let path = match fs::canonicalize(&typed) {
-        Ok(p) => p.to_string_lossy().into_owned(),
-        Err(e) => {
-            eprintln!("error: path not found: {} ({})", typed, e);
-            std::process::exit(1);
-        }
-    };
-
-    let upsert = matches!(args.cmd, Command::Update { .. });
-
-    // Changes nothing, so it isn't logged
-    if dry_run {
-        std::process::exit(run_dry_run(&args.db, &typed, &path, upsert, &filter));
-    }
-
-    let db_path = args.db.clone();
-    let threads = args.threads;
-
-    // Use plain-text mode if --no-tui is set OR stdout is not an interactive terminal
-    // (e.g. cron job, SSH without TTY, piped output)
-    let plain = args.no_tui || !std::io::stdout().is_terminal();
-
-    runlog.start();
-
-    // Start worker on a background thread
-    let (tx, rx) = mpsc::channel::<WorkerMsg>();
-    let path_w = path.clone();
-    let db_w = db_path.clone();
-    std::thread::spawn(move || run_worker(path_w, typed, db_w, threads, upsert, filter, tx));
-
-    let mut state = AppState::new(mode, &path, &db_path);
-
-    if plain {
-        run_plain(&mut state, rx, &mut runlog);
-    } else {
-        // Initialise TUI terminal
-        enable_raw_mode()?;
-        let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-
-        let result = run_ui(&mut terminal, &mut state, rx, &mut runlog);
-
-        // Always restore terminal, even on error
-        disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
-        terminal.show_cursor()?;
-
-        if let Err(e) = result {
-            eprintln!("UI error: {}", e);
-            runlog.end("failed", &format!("UI error: {}", e), 1);
-            report_log_failure(&runlog);
-            std::process::exit(1);
-        }
-
-        // Print plain-text summary after TUI exits
-        println!("\ndiskUnder — complete");
-        println!("  files found   : {}", state.files_found);
-        println!("  skipped       : {} ({})", state.files_skipped, state.skipped_label());
-        println!("  files written : {}", state.files_written);
-        println!("  rows removed  : {}", state.files_removed);
-        if let Some(excluded) = state.excluded_line() {
-            println!("  excluded      : {}", excluded);
-        }
-        println!("  errors        : {}", state.errors_summary());
-        println!("  dup groups    : {}", state.dup_keys.len());
-        if !state.dup_keys.is_empty() {
-            println!("  wasted        : {}", fmt_bytes(state.dup_wasted));
-        }
-    }
-
-    // A run that stopped on a fatal error exits non-zero, so cron and scripts can tell
-    let (outcome, code) = match (&state.fatal, state.done) {
-        (Some(_), _) => ("failed", 1),
-        (None, true) => ("completed", 0),
-        (None, false) => ("stopped by user", 0),
-    };
-    runlog.end(outcome, &state.log_summary(), code);
-    report_log_failure(&runlog);
-    if code != 0 {
-        std::process::exit(code);
-    }
-    Ok(())
+    std::process::exit(code);
 }
 
-fn report_log_failure(runlog: &RunLog) {
-    if let Some(reason) = runlog.failure() {
-        eprintln!("warning: {} — the run itself was not affected", reason);
+/// Job settings from the command line: only what was given (the global --db and --threads
+/// count only when passed)
+fn job_settings<'a>(args: &'a Cli, mode: Option<Mode>, path: Option<&'a str>, types: &cli::TypeArgs) -> JobSettings<'a> {
+    JobSettings {
+        upsert: mode.map(|m| matches!(m, Mode::Update)),
+        path,
+        db: args.db.as_deref(),
+        threads: args.threads,
+        overrides: types.overrides(),
     }
+}
+
+/// `index` / `update`, or their dry runs
+fn index(args: &Cli, db: &str, upsert: bool, typed: &str, dry_run: bool, overrides: filters::Overrides) -> i32 {
+    if dry_run {
+        // Changes nothing, so it isn't logged
+        return match fs::canonicalize(typed) {
+            Ok(root) => run_dry_run(db, typed, &root.to_string_lossy(), upsert, &overrides),
+            Err(e) => {
+                eprintln!("error: path not found: {} ({})", typed, e);
+                1
+            }
+        };
+    }
+    let mut runlog = RunLog::new(db, args.log.as_deref(), args.no_log);
+    let run = IndexRun {
+        upsert,
+        typed: typed.to_string(),
+        db: db.to_string(),
+        threads: args.threads(),
+        overrides,
+        no_tui: args.no_tui,
+    };
+    let outcome = run_indexing(run, &mut runlog);
+    report_log_failure(&runlog);
+    outcome.code
 }

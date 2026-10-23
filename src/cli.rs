@@ -13,13 +13,17 @@ pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) cmd: Command,
 
-    /// SQLite database file (created if absent)
-    #[arg(long, default_value = "fileindex.db", global = true)]
-    pub(crate) db: String,
+    /// SQLite database file, created if absent [default: fileindex.db]
+    #[arg(long, global = true, value_name = "FILE")]
+    pub(crate) db: Option<String>,
 
-    /// Parallel hashing threads — keep low for network shares (e.g. --threads 4)
-    #[arg(long, default_value_t = 4, global = true)]
-    pub(crate) threads: usize,
+    /// Parallel hashing threads — keep low for network shares [default: 4]
+    #[arg(long, global = true, value_name = "N")]
+    pub(crate) threads: Option<usize>,
+
+    /// Per-user store for jobs [default: $DISKUNDER_CONFIG_DB, else ~/.config/diskunder/diskunder.db]
+    #[arg(long, global = true, value_name = "FILE")]
+    pub(crate) config_db: Option<String>,
 
     /// Disable the TUI and print plain progress lines instead.
     /// Enabled automatically when stdout is not a terminal (cron, SSH, pipes).
@@ -142,10 +146,71 @@ pub(crate) enum Command {
         #[arg(long, value_enum, default_value_t = ExportFormat::Csv)]
         format: ExportFormat,
     },
+    /// Saved index / update runs: add, list, show, edit, remove
+    Jobs {
+        #[command(subcommand)]
+        action: JobsAction,
+    },
+    /// Run a saved job by name (cron-friendly); with no name, list the jobs
+    Run {
+        /// Job to run
+        name: Option<String>,
+        /// Show what the job would do, without hashing or writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Inspect and maintain the index database
     Db {
         #[command(subcommand)]
         action: DbAction,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum Mode {
+    /// Index every file; files already indexed are skipped
+    Index,
+    /// Re-index new and changed files, and drop rows for deleted ones
+    Update,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum JobsAction {
+    /// Save a job: diskunder jobs add NAME index|update PATH [--db FILE] [--threads N] [filters]
+    Add {
+        /// Letters, digits, - and _
+        name: String,
+        mode: Mode,
+        /// Directory the job indexes
+        path: String,
+        #[command(flatten)]
+        types: TypeArgs,
+    },
+    /// List jobs with their last run
+    List,
+    /// A job's settings, recent runs and the last run's errors
+    Show { name: String },
+    /// Change a job — only the settings given (--db, --threads, filters, --mode, --path)
+    Edit {
+        name: String,
+        /// index or update
+        #[arg(long, value_enum)]
+        mode: Option<Mode>,
+        /// Directory the job indexes
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        #[command(flatten)]
+        types: TypeArgs,
+    },
+    /// Remove a job and its run history (asks first)
+    Remove {
+        name: String,
+        /// Don't ask (required when not run from a terminal)
+        #[arg(long)]
+        yes: bool,
+        /// Also remove the job's index from its database
+        #[arg(long)]
+        drop_index: bool,
     },
 }
 
@@ -243,6 +308,16 @@ impl From<ExportFormat> for Format {
             ExportFormat::Tsv => Format::Tsv,
             ExportFormat::Json => Format::Json,
         }
+    }
+}
+
+impl Cli {
+    pub(crate) fn db(&self) -> String {
+        self.db.clone().unwrap_or_else(|| "fileindex.db".to_string())
+    }
+
+    pub(crate) fn threads(&self) -> usize {
+        self.threads.unwrap_or(4)
     }
 }
 

@@ -22,6 +22,7 @@ pub(crate) struct RunLog {
     finished: Option<Instant>, // when the work ended, which can be before `end` is called
     errors_logged: usize,
     errors_dropped: usize,
+    errors: Vec<String>, // the errors logged (up to MAX_ERRORS), kept for job history
     failure: Option<String>,
 }
 
@@ -39,6 +40,7 @@ impl RunLog {
             finished: None,
             errors_logged: 0,
             errors_dropped: 0,
+            errors: Vec::new(),
             failure: None,
         }
     }
@@ -64,6 +66,7 @@ impl RunLog {
     pub(crate) fn error(&mut self, text: &str) {
         if self.errors_logged < MAX_ERRORS {
             self.errors_logged += 1;
+            self.errors.push(text.replace('\n', " "));
             self.write("error", text);
         } else {
             self.errors_dropped += 1;
@@ -96,6 +99,21 @@ impl RunLog {
         let took = self.finished.unwrap_or_else(Instant::now) - self.started;
         let line = format!("{} in {}{} — {}", outcome, fmt_duration(took), code, summary);
         self.write("end", &line);
+    }
+
+    /// Ties log lines and job history together
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The errors this run logged (at most 50), and how many more there were
+    pub(crate) fn errors(&self) -> (&[String], usize) {
+        (&self.errors, self.errors_dropped)
+    }
+
+    /// How long the work took, in whole seconds
+    pub(crate) fn duration_secs(&self) -> u64 {
+        (self.finished.unwrap_or_else(Instant::now) - self.started).as_secs()
     }
 
     /// Why the log couldn't be written, if it couldn't. Logging never stops a run; the

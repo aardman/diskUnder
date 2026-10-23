@@ -364,7 +364,11 @@ Built on 5.2's machinery — stored per path, reused by `update`, "excluded" kep
 
 ---
 
-## 5.4 — Jobs
+## 5.4 — Jobs ✅
+
+**Done.** As designed below, plus: the store also honours `$XDG_CONFIG_HOME`; `jobs edit`
+accepts `--mode` and `--path`; a run that fails before indexing is recorded with the reason;
+and the database's folder is created on first run. See [changes.md](changes.md).
 
 Named, saved runs — the design in [future.md](future.md#jobs--named-saved-runs), scheduled
 here and extended for the app.
@@ -549,7 +553,7 @@ Before the new commands:
 | 5.1 ✅ | `report`, including duplicate filtering and the summary | M |
 | 5.2 ✅ | Include / exclude file types; `index` / `update --dry-run` | M |
 | 5.3 ✅ | Path patterns (Ignore) | S–M |
-| 5.4 | Jobs: saved runs, `run NAME`, test (`--dry-run`), run history | M |
+| 5.4 ✅ | Jobs: saved runs, `run NAME`, test (`--dry-run`), run history | M |
 | 5.5 | Interactive app: main window, Jobs / Results / Database / Settings menus — can ship as 5.5.x steps | L |
 
 S is under a day of focused work, M is one to three, L is a week or more. These are rough. Each release ships

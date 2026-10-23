@@ -1,5 +1,55 @@
 # diskUnder — Change Log
 
+## v5.4 — jobs
+
+### `jobs` and `run`
+
+Named, saved `index` / `update` runs:
+
+- `jobs add NAME index|update PATH` with `--db`, `--threads` and any file-type and path filters
+  — paths stored absolute, so cron's working directory doesn't matter
+- `jobs list` — each job's last run: when, status, duration, files, errors (`never` if not run)
+- `jobs show NAME` — settings, the last 10 runs, and the last run's errors
+- `jobs edit NAME` — only what's given changes (`--mode`, `--path`, `--db`, `--threads`,
+  filters; type and path filters replaced independently)
+- `jobs remove NAME` — asks (or `--yes`); `--drop-index` also removes the job's index (logged
+  like `db drop`)
+- `run NAME` — runs the job as `index` / `update` with its settings; its filters always apply.
+  `--threads`, `--no-tui`, `--log` / `--no-log` apply to that run only; `--db` is refused.
+  `run NAME --dry-run` tests it. `run` with no name lists the jobs.
+
+**History:** a `job_runs` row is written when a run starts (so a killed run shows as `did not
+finish`) and completed at the end with the outcome, exit code, duration, every summary count,
+the run id shared with the run log, and up to 50 error messages (`job_run_errors`). A run that
+fails before indexing — e.g. the share isn't mounted — is recorded with the reason.
+
+**One run per job at a time:** a lock file per job (standard-library file locking); a second
+run is refused with "already running", and `jobs list` shows `running` while a run holds it.
+
+**Where jobs live:** a per-user store, `~/.config/diskunder/diskunder.db` (or under
+`$XDG_CONFIG_HOME`), overridable with `--config-db` or `DISKUNDER_CONFIG_DB`. Listing jobs
+never creates it.
+
+### The database's folder is created if missing
+
+`--db new/folder/index.db` used to fail with "unable to open database file" when the folder
+didn't exist; `index`, `update` and job runs now create it.
+
+### Internals
+
+The indexing flow (worker, TUI or plain output, run log) moved from `main.rs` into `run.rs` so
+`index`, `update` and `run NAME` share it. `--db` and `--threads` keep their defaults
+(`fileindex.db`, 4) but can now tell when they were given, which `jobs` and `run` need.
+
+### Tests
+
+90 in total (was 81): 9 new end-to-end tests for jobs — add/list/show, runs from another
+working directory using the job's settings and filters, history matching the run log, errors
+and failures recorded, dry run recording nothing, the lock refusing a second run, edits, name
+and argument checks, removal with and without the index — all against a temporary store.
+
+---
+
 ## v5.3 — path filters
 
 ### `--exclude-path`, `--include-path`, `--no-path-filters`

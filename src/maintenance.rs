@@ -179,6 +179,17 @@ fn logged(runlog: &mut RunLog, action: impl FnOnce() -> Result<String, String>) 
     result
 }
 
+/// Remove the index of `root` from `db_path` without asking (the caller has confirmed);
+/// logged like `db drop`. Used by `jobs remove --drop-index`.
+pub(crate) fn drop_index(db_path: &str, root: &str, runlog: &mut RunLog) -> Result<String, String> {
+    if !Path::new(db_path).exists() {
+        return Err(format!("no database at {}", db_path));
+    }
+    let conn = Connection::open(db_path).map_err(|e| format!("{}: {}", db_path, e))?;
+    let target = resolve_drop(&conn, Some(root), None)?;
+    logged(runlog, || perform_drop(&conn, &target))
+}
+
 /// Returns the summary line, which is both printed and logged
 fn perform_vacuum(conn: &Connection, db_path: &str) -> DbResult<String> {
     let before = db_file_bytes(db_path);

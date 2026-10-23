@@ -1968,3 +1968,232 @@ fn path_filters_show_in_db_info_and_queries_and_schema_2_upgrades() {
     assert!(upd.stderr.contains("schema 3: added path filter columns to the roots table"), "{}", upd.stderr);
     assert_eq!(user_version(&db), 3);
 }
+
+// ─── Jobs (5.4) ──────────────────────────────────────────────────────────────
+
+/// Runs diskunder against a temporary jobs store (never the real ~/.config), stdin closed
+fn jobs_cmd(tmp: &TempDir, args: &[&str]) -> Query {
+    let store = tmp.path().join("store/diskunder.db");
+    let out = Command::new(BIN)
+        .args(args)
+        .args(["--config-db", store.to_str().unwrap(), "--no-tui"])
+        .current_dir(tmp.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    Query {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+fn ok(q: Query) -> Query {
+    assert_eq!(q.code, 0, "stdout:\n{}\nstderr:\n{}", q.stdout, q.stderr);
+    q
+}
+
+fn store(tmp: &TempDir) -> Connection {
+    Connection::open(tmp.path().join("store/diskunder.db")).unwrap()
+}
+
+/// A share with photos, a temp file and a snapshot folder, and a job over it
+fn job_share(tmp: &TempDir) -> PathBuf {
+    let d = tmp.path().join("share");
+    for i in 0..3 {
+        write(&d.join(format!("p{}.jpg", i)), &format!("photo {}\n", i));
+    }
+    write(&d.join("x.tmp"), "tmp\n");
+    write(&d.join(".snapshot/old.jpg"), "old\n");
+    ok(jobs_cmd(tmp, &[
+        "jobs", "add", "nightly", "update", "share", "--db", "idx/index.db", "--threads", "2",
+        "--exclude-ext", "tmp", "--exclude-path", ".snapshot",
+    ]));
+    d
+}
+
+#[test]
+fn jobs_add_list_show() {
+    let tmp = TempDir::new();
+    let empty = ok(jobs_cmd(&tmp, &["jobs", "list"]));
+    assert!(empty.stdout.starts_with("no jobs yet"), "{}", empty.stdout);
+    assert!(!tmp.path().join("store").exists(), "listing doesn't create the store");
+
+    let d = job_share(&tmp);
+    let list = ok(jobs_cmd(&tmp, &["jobs", "list"]));
+    assert!(list.stdout.contains("NAME") && list.stdout.contains("nightly") && list.stdout.contains("never"), "{}", list.stdout);
+
+    let show = ok(jobs_cmd(&tmp, &["jobs", "show", "nightly"]));
+    assert!(show.stdout.contains(&format!("  path       {}\n", d.display())), "stored absolute:\n{}", show.stdout);
+    assert!(show.stdout.contains(&format!("  database   {}  (not created yet)\n", tmp.path().join("idx/index.db").display())), "{}", show.stdout);
+    assert!(show.stdout.contains("  threads    2\n") && show.stdout.contains("  filters    exclude tmp · exclude .snapshot\n"), "{}", show.stdout);
+    assert!(show.stdout.contains("never run — `diskunder run nightly`"), "{}", show.stdout);
+}
+
+#[test]
+fn run_uses_the_job_and_records_history() {
+    let tmp = TempDir::new();
+    let d = job_share(&tmp);
+    fs::create_dir_all(tmp.path().join("idx")).unwrap();
+    let db = tmp.path().join("idx/index.db");
+
+    // Run from a different working directory: the job's paths are absolute
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let store_path = tmp.path().join("store/diskunder.db");
+    let out = Command::new(BIN)
+        .args(["run", "nightly", "--no-tui", "--config-db", store_path.to_str().unwrap()])
+        .current_dir(&elsewhere)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", stderr);
+    let s = parse_summary(&stderr);
+    assert_eq!((s.found, s.written), (3, 3), "the job's filters applied:\n{}", stderr);
+    assert!(stderr.contains("1 excluded by filters, 1 folder skipped"), "{}", stderr);
+    assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {}", table_for(&d))), 3);
+
+    let lines = log_lines(&db);
+    assert!(lines[0].2.starts_with("run nightly --no-tui"), "run log beside the job's database: {:?}", lines);
+    let (run_id, outcome, found, written): (String, String, i64, i64) = store(&tmp)
+        .query_row("SELECT run_id, outcome, found, written FROM job_runs", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap();
+    assert_eq!((outcome.as_str(), found, written), ("completed", 3, 3));
+    assert_eq!(run_id, lines[0].0, "history and run log share the run id");
+
+    write(&d.join("new.jpg"), "new\n");
+    ok(jobs_cmd(&tmp, &["run", "nightly"]));
+    let list = ok(jobs_cmd(&tmp, &["jobs", "list"]));
+    assert!(list.stdout.contains("completed") && list.stdout.contains("  4  "), "{}", list.stdout);
+    let show = ok(jobs_cmd(&tmp, &["jobs", "show", "nightly"]));
+    assert_eq!(show.stdout.matches("completed").count(), 2, "two runs in history:\n{}", show.stdout);
+    assert!(show.stdout.contains("Last run: 4 found, 3 unchanged, 1 written"), "{}", show.stdout);
+}
+
+#[test]
+fn run_records_errors_and_failures() {
+    let tmp = TempDir::new();
+    let d = job_share(&tmp);
+    distinct_files(&d.join("locked"), 1);
+    chmod(&d.join("locked"), "000");
+    if permissions_ignored(&d.join("locked")) {
+        eprintln!("skipping: permissions not enforced (running as root?)");
+        return;
+    }
+    ok(jobs_cmd(&tmp, &["run", "nightly"]));
+    chmod(&d.join("locked"), "755");
+    let show = ok(jobs_cmd(&tmp, &["jobs", "show", "nightly"]));
+    assert!(show.stdout.contains("Errors in the last run\n") && show.stdout.contains("/locked — "), "{}", show.stdout);
+
+    // A run that fails before indexing anything still lands in the history, with why
+    fs::rename(&d, tmp.path().join("gone")).unwrap();
+    let failed = jobs_cmd(&tmp, &["run", "nightly"]);
+    assert_eq!(failed.code, 1);
+    let show = ok(jobs_cmd(&tmp, &["jobs", "show", "nightly"]));
+    assert!(show.stdout.contains("failed (exit 1)"), "{}", show.stdout);
+    assert!(show.stdout.contains("path not found"), "{}", show.stdout);
+}
+
+#[test]
+fn run_dry_run_changes_nothing() {
+    let tmp = TempDir::new();
+    job_share(&tmp);
+    let q = ok(jobs_cmd(&tmp, &["run", "nightly", "--dry-run"]));
+    assert!(q.stdout.starts_with("Dry run — update "), "{}", q.stdout);
+    assert_eq!(dry_value(&q.stdout, "Would hash"), 3, "the job's filters apply to the test");
+    assert!(!tmp.path().join("idx/index.db").exists());
+    let runs: i64 = store(&tmp).query_row("SELECT COUNT(*) FROM job_runs", [], |r| r.get(0)).unwrap();
+    assert_eq!(runs, 0, "a dry run isn't a run");
+}
+
+#[test]
+fn one_run_per_job_at_a_time() {
+    let tmp = TempDir::new();
+    job_share(&tmp);
+    fs::create_dir_all(tmp.path().join("idx")).unwrap();
+    let lock_path = tmp.path().join("store/locks/nightly.lock");
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock = File::create(&lock_path).unwrap();
+    lock.lock().unwrap();
+
+    let second = jobs_cmd(&tmp, &["run", "nightly"]);
+    assert_eq!(second.code, 1);
+    assert!(second.stderr.contains("job nightly is already running"), "{}", second.stderr);
+
+    // A run row with no finish shows as running while the lock is held, then as interrupted
+    store(&tmp)
+        .execute("INSERT INTO job_runs (job, run_id, started, outcome) VALUES ('nightly', 'abc123', datetime('now'), 'running')", [])
+        .unwrap();
+    assert!(ok(jobs_cmd(&tmp, &["jobs", "list"])).stdout.contains("running"));
+    drop(lock);
+    assert!(ok(jobs_cmd(&tmp, &["jobs", "list"])).stdout.contains("did not finish"));
+    ok(jobs_cmd(&tmp, &["run", "nightly"]));
+}
+
+#[test]
+fn jobs_edit_changes_only_what_is_given() {
+    let tmp = TempDir::new();
+    job_share(&tmp);
+    let e = ok(jobs_cmd(&tmp, &["jobs", "edit", "nightly", "--threads", "8", "--exclude-path", "cache"]));
+    assert!(e.stdout.contains("  threads   2 → 8\n"), "{}", e.stdout);
+    assert!(e.stdout.contains("  filters   exclude tmp · exclude .snapshot → exclude tmp · exclude cache\n"), "path filters replaced, type filters kept:\n{}", e.stdout);
+    assert!(!e.stdout.contains("database"), "{}", e.stdout);
+
+    let mode = ok(jobs_cmd(&tmp, &["jobs", "edit", "nightly", "--mode", "index", "--all-types"]));
+    assert!(mode.stdout.contains("  mode      update → index\n"), "{}", mode.stdout);
+    let same = ok(jobs_cmd(&tmp, &["jobs", "edit", "nightly", "--threads", "8"]));
+    assert!(same.stdout.contains("job nightly unchanged"), "{}", same.stdout);
+    assert_eq!(jobs_cmd(&tmp, &["jobs", "edit", "nope", "--threads", "1"]).code, 1);
+}
+
+#[test]
+fn jobs_names_and_arguments_are_checked() {
+    let tmp = TempDir::new();
+    job_share(&tmp);
+    let bad = jobs_cmd(&tmp, &["jobs", "add", "bad/name", "index", "share"]);
+    assert_eq!(bad.code, 1);
+    assert!(bad.stderr.contains("letters, digits, - and _"), "{}", bad.stderr);
+    let dup = jobs_cmd(&tmp, &["jobs", "add", "nightly", "index", "share"]);
+    assert!(dup.code == 1 && dup.stderr.contains("already exists"), "{}", dup.stderr);
+    let with_db = jobs_cmd(&tmp, &["run", "nightly", "--db", "other.db"]);
+    assert_eq!(with_db.code, 2, "a job always uses its own database");
+    let no_name = jobs_cmd(&tmp, &["run"]);
+    assert_eq!(no_name.code, 1);
+    assert!(no_name.stdout.contains("nightly") && no_name.stderr.contains("give a job name"), "{}", no_name.stderr);
+    let unknown = jobs_cmd(&tmp, &["run", "nope"]);
+    assert!(unknown.code == 1 && unknown.stderr.contains("no job named nope"), "{}", unknown.stderr);
+    assert_eq!(jobs_cmd(&tmp, &["jobs", "add", "x", "sometimes", "share"]).code, 2, "mode is index or update");
+}
+
+#[test]
+fn jobs_remove_asks_and_can_drop_the_index() {
+    let tmp = TempDir::new();
+    let d = job_share(&tmp);
+    fs::create_dir_all(tmp.path().join("idx")).unwrap();
+    let db = tmp.path().join("idx/index.db");
+    ok(jobs_cmd(&tmp, &["run", "nightly"]));
+
+    let refused = jobs_cmd(&tmp, &["jobs", "remove", "nightly"]);
+    assert_eq!(refused.code, 1);
+    assert!(refused.stderr.contains("pass --yes"), "{}", refused.stderr);
+
+    let removed = ok(jobs_cmd(&tmp, &["jobs", "remove", "nightly", "--yes", "--drop-index"]));
+    assert!(removed.stdout.contains("removed job nightly and its run history"), "{}", removed.stdout);
+    assert!(removed.stdout.contains("removed the index of") && removed.stdout.contains("(3 files)"), "{}", removed.stdout);
+    let s = store(&tmp);
+    let left: (i64, i64) = s
+        .query_row("SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM job_runs)", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(left, (0, 0));
+    assert!(!tables(&db).contains(&table_for(&d)), "index dropped");
+    assert!(log_lines(&db).iter().any(|(_, k, t)| k == "end" && t.contains("removed the index of")), "drop is logged");
+}
+
+#[test]
+fn the_database_folder_is_created_if_missing() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 2);
+    let run = run_in(tmp.path(), &["index", "data", "--db", "new/folder/t.db"]);
+    assert_eq!(run.summary.written, 2);
+    assert!(tmp.path().join("new/folder/t.db").exists() && tmp.path().join("new/folder/t.db.log").exists());
+}

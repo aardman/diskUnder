@@ -4,7 +4,7 @@ Inspired by feature parity with [Diskover](https://diskoverdata.com/). Items are
 
 **Planned for v5** (small releases — see [v5-plan.md](v5-plan.md) for design, schema changes
 and sizing): 5.0 run log, `search` and `export` (**done**) · 5.1 `report` with duplicate filtering (**done**) · 5.2
-include/exclude file types and `--dry-run` preview (**done**) · 5.3 path patterns (Ignore) (**done**) · 5.4 Jobs ·
+include/exclude file types and `--dry-run` preview (**done**) · 5.3 path patterns (Ignore) (**done**) · 5.4 Jobs (**done**) ·
 5.5 interactive app (TUI). **Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
 original ideas.
 
@@ -92,8 +92,8 @@ same mechanism: `.gitignore`-style patterns such as `.snapshot`, `@eaDir` or
 `projects/*/render-cache`, with excluded folders never walked.
 
 ### Jobs — named, saved runs
-**Planned for 5.4** — the scheduled design, extended for the 5.5 app, is in
-[v5-plan.md](v5-plan.md). This section is the original idea.
+**Done in 5.4** — see the README's Jobs section and [changes.md](changes.md); the menu comes
+with the 5.5 app. This section is the original idea.
 
 Save a run's settings under a name so it can be repeated without retyping paths and flags,
 and keep a history of every run so it's easy to see when each job last ran and how it went.

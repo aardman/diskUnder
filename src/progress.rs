@@ -130,7 +130,8 @@ impl AppState {
         }
         let mut line = format!("{} excluded by filters", fmt_count(self.files_excluded as i64));
         if self.folders_excluded > 0 {
-            line.push_str(&format!(", {} folders skipped", fmt_count(self.folders_excluded as i64)));
+            let folders = self.folders_excluded;
+            line.push_str(&format!(", {} {} skipped", fmt_count(folders as i64), if folders == 1 { "folder" } else { "folders" }));
         }
         if self.rows_excluded_removed > 0 {
             line.push_str(&format!(", {} rows removed as excluded", fmt_count(self.rows_excluded_removed as i64)));

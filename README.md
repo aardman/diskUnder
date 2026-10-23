@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 0.5.3`:
+**Check it worked** — this should print `diskunder 0.5.4`:
 
 ```bash
 diskunder --version
@@ -357,6 +357,59 @@ duplicate groups and wasted space count hard links as one copy.
 
 ---
 
+## Jobs
+
+Save a run's settings under a name, then run it by name — from cron, or by hand — and keep a
+history of every run.
+
+```bash
+diskunder jobs add nas-nightly update /Volumes/NAS --db /data/index.db --threads 4 --exclude-ext tmp,log --exclude-path .snapshot
+diskunder run nas-nightly
+```
+
+A job is a saved `index` or `update`: its path, database, threads, and file-type and path
+filters. Paths are stored absolute, so cron's working directory doesn't matter, and the
+database's folder is created on the first run if needed. Running a job is exactly that
+`index` or `update` — same output, same run log next to the job's database — and its filters
+always apply.
+
+| Command | What it does |
+|---|---|
+| `diskunder jobs add NAME index\|update PATH` | save a job, with `--db`, `--threads` and any filters |
+| `diskunder jobs list` | every job with its last run: when, status, duration, files, errors |
+| `diskunder jobs show NAME` | settings, the last 10 runs, and the last run's errors |
+| `diskunder jobs edit NAME` | change only what's given: `--mode`, `--path`, `--db`, `--threads`, filters |
+| `diskunder jobs remove NAME` | remove the job and its history (asks; `--yes` in scripts); `--drop-index` also removes its index |
+| `diskunder run NAME` | run it (cron-friendly); `--threads`, `--no-tui`, `--log` / `--no-log` apply to this run only |
+| `diskunder run NAME --dry-run` | test it — what it would do, without hashing or writing |
+| `diskunder run` | list the jobs |
+
+```text
+  NAME         MODE    PATH           LAST RUN          STATUS           DURATION    FILES  ERRORS
+  nas-nightly  update  /Volumes/NAS   2026-10-23 02:14  completed          14m33s  772,087  22,684
+  projects     index   /Volumes/Proj  2026-10-19 18:45  failed (exit 1)     3m10s   41,200       1
+  scratch      index   /tmp/scratch   never             —                       —        —       —
+```
+
+- **Names** use letters, digits, `-` and `_`, so they're safe in cron lines.
+- **One run per job at a time:** a second `run` of a job that's already running is refused.
+- **History** records each run when it starts, so a run that was killed shows as
+  `did not finish`; finished runs keep their outcome, counts, duration, run id (matching the
+  run log) and up to 50 errors.
+- **A job always uses its own database** — `run NAME --db …` is an error; change it with
+  `jobs edit NAME --db …`.
+- **Where jobs live:** a per-user store, `~/.config/diskunder/diskunder.db` (or under
+  `$XDG_CONFIG_HOME`). `--config-db FILE` or `DISKUNDER_CONFIG_DB` points elsewhere — e.g. a
+  shared store for a service account.
+
+A cron line:
+
+```text
+0 2 * * * /usr/local/bin/diskunder run nas-nightly
+```
+
+---
+
 ## Database maintenance
 
 `diskunder db` looks after the index database. It never creates a database — pass the same
@@ -492,7 +545,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Dry run — preview `index` / `update` without hashing or writing (dedupe previews come with v6) | No | No | No | No | No | Yes (5.2) |
 | Include / exclude file types — `--include-ext`, `--exclude-ext`, stored per path | No | No | No | No | No | Yes (5.2) |
 | Ignore — exclude paths by `.gitignore`-style pattern, with exceptions; excluded folders never entered | No | No | No | No | No | Yes (5.3) |
-| Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned (5.4) |
+| Jobs — named, saved runs: `jobs add/list/show/edit/remove`, `run NAME`, run history (menu in 5.5) | No | No | No | No | No | Yes (5.4) |
 | Interactive app — main window plus Jobs / Results / Database / Settings menus | No | No | No | No | No | Planned (5.5) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
@@ -508,7 +561,7 @@ The project was developed in multiple languages, each addressing the limitations
 - **Rust v2:** All known bugs fixed, plain-text output only
 - **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
 - **Rust v4:** Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
-- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters; the rest is planned in [v5-plan.md](v5-plan.md)
+- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters, 5.4 adds jobs; the rest is planned in [v5-plan.md](v5-plan.md)
 
 Only the current Rust version is kept in this repository; the earlier versions were not committed.
 
@@ -535,6 +588,8 @@ diskunder/
 │   ├── report.rs      #   report command
 │   ├── dryrun.rs      #   index / update --dry-run
 │   ├── filters.rs     #   file-type and path filters
+│   ├── run.rs         #   one index / update run (shared by jobs)
+│   ├── jobs.rs        #   jobs and run history
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
@@ -582,6 +637,7 @@ checks both its summary output and the database it writes: resume, change detect
 path normalisation and v3 migration, error counting, duplicate totals, hard links, argument
 parsing, the `db` maintenance commands, schema migrations, the run log, `search`/`export`
 filters, scopes and formats, every `report` section and duplicate filter, `--dry-run` (checked against the real run that
-follows), and file-type and path filters. Unit tests in `src/query.rs` and `src/filters.rs`
+follows), file-type and path filters, and jobs (history, locking, editing, removal) — always
+against a temporary jobs store. Unit tests in `src/query.rs` and `src/filters.rs`
 cover size, age and extension parsing, and type and path-pattern matching.
 Tests that rely on file permissions skip themselves when run as root.
