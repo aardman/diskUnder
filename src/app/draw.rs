@@ -568,6 +568,7 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 "",
                 "Views and menus",
                 "  Esc        back / close",
+                "  m          back to the menu you came from",
                 "  ↑↓ PgUp PgDn Home End   scroll",
                 "",
                 "Every screen shows its command line in the footer.",
@@ -684,8 +685,8 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 area,
             );
         }
-        Dialog::TestJob { selected, made, ran, clash } => {
-            let done = [*made, *ran, false, false];
+        Dialog::TestJob { selected, made, ran, seen, clash } => {
+            let done = [*made, *ran, *seen, false];
             let mut lines: Vec<Line> = vec![
                 Line::from("A job over generated sample files, to see diskunder work without real data."),
                 Line::from(""),
@@ -701,7 +702,7 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             lines.push(if *clash {
                 Line::from(Span::styled("You already have a job called test — rename or remove it first.", Style::new().fg(Color::Yellow)))
             } else {
-                Line::from(Span::styled("↑↓ step · ⏎ do it (or 1–4) · c copy command · Esc close", DIM))
+                Line::from(Span::styled("↑↓ step · ⏎ do it (or 1–4) · c copy command · Esc close · m menus", DIM))
             });
             let area = centered(96, lines.len() as u16 + 2, area);
             f.render_widget(Clear, area);

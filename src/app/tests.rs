@@ -171,18 +171,27 @@ fn test_job_is_created_run_shown_and_removed() {
 
     press(&mut app, &[KeyCode::Enter]); // Run
     assert!(app.running.is_some(), "{:?}", app.message);
+    assert!(matches!(app.dialog, Some(Dialog::TestJob { .. })), "the steps stay up during the run");
     settle(&mut app);
+    assert!(app.dialog.is_none(), "the results replace the steps");
     let s = screen(&app);
     assert!(s.contains("Test job — results") && s.contains("d duplicates"), "the results open when it ends:\n{}", s);
     assert!(s.contains("excluded    1 files, 1 folders skipped") && s.contains("duplicates  3 groups"), "the tmp file and the snapshot are left out:\n{}", s);
 
+    press(&mut app, &[KeyCode::Esc]);
+    assert!(matches!(app.dialog, Some(Dialog::TestJob { selected: 3, seen: true, .. })), "Esc goes back to the steps");
+    assert!(screen(&app).contains("3 ✓  See results"), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Char('3')]);
+    assert!(screen(&app).contains("Test job — results"), "See results again");
+    press(&mut app, &[KeyCode::Char('m')]);
+    assert!(matches!(app.dialog, Some(Dialog::TestJob { .. })), "m goes back to the steps too");
     press(&mut app, &[KeyCode::Esc, KeyCode::Char('d')]);
     settle(&mut app);
     let s = screen(&app);
     assert!(s.contains("img1.jpg") && s.contains("edit.prproj"), "copies show as duplicates:\n{}", s);
 
     press(&mut app, &[KeyCode::Esc, KeyCode::Char('t')]);
-    assert!(matches!(app.dialog, Some(Dialog::TestJob { selected: 2, ran: true, .. })), "reopens at See results");
+    assert!(matches!(app.dialog, Some(Dialog::TestJob { selected: 3, ran: true, seen: true, .. })), "reopens at Remove");
     press(&mut app, &[KeyCode::Char('4')]); // Remove
     assert!(!folder.exists() && !app.jobs.iter().any(|s| s.job.name == "test"), "{:?}", app.message);
     assert!(app.jobs.iter().any(|s| s.job.name == "nightly"), "other jobs are untouched");
@@ -219,6 +228,23 @@ fn host_menu_shows_drives_and_host_info() {
     press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Down, KeyCode::Enter]);
     let s = screen(&app);
     assert!(s.contains("Host info") && s.contains("jobs store") && s.contains("diskunder.db"), "{}", s);
+}
+
+#[test]
+fn m_goes_back_to_the_menu_you_came_from() {
+    let (_t, mut app) = setup();
+    press(&mut app, &[KeyCode::Char('m'), KeyCode::Right, KeyCode::Down, KeyCode::Enter]); // Results → History
+    assert!(matches!(app.view, View::History { .. }));
+    press(&mut app, &[KeyCode::Char('m')]);
+    assert!(matches!(app.view, View::Main) && matches!(app.menu, Some(Menu { open: 1, item: 1 })), "back at Results → History");
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('?'), KeyCode::Char('m')]);
+    assert!(app.dialog.is_none() && app.menu.is_some(), "dialogs too");
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('/')]);
+    type_text(&mut app, "m");
+    assert!(matches!(app.view, View::Search(_)) && app.menu.is_none(), "m is a letter while typing");
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('n')]);
+    type_text(&mut app, "m");
+    assert!(matches!(&app.dialog, Some(Dialog::Form(f)) if f.fields[0].value == "m"), "and in the form");
 }
 
 #[test]

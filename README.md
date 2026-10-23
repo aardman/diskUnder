@@ -368,7 +368,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.5.4 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.5.5 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -393,8 +393,9 @@ $ diskunder run nas-nightly
 - **Test job** (`t`): try diskunder without real data. It steps you through **creating** a job
   named `test` over generated sample files (photos with copies in `backup/`, a hard link, a
   film project, a temp file and a `.snapshot` folder the job's filters leave out), **running**
-  it (the results open when it finishes), **seeing the results** — then try `d`, `p`, `/` and
-  `b` on it — and **removing** the job, its index and the sample files. The files live in a
+  it (the results open when it finishes; Esc goes back to the steps), **seeing the results** —
+  then try `d`, `p`, `/` and `b` on it — and **removing** the job, its index and the sample
+  files. Each step is ticked off as you go. The files live in a
   `test` folder beside the jobs store; a job of yours that happens to be called `test` is left
   alone.
 - **Results menu** (`r`), for the selected job or indexed path:
@@ -415,6 +416,7 @@ $ diskunder run nas-nightly
   logs are. Both are `diskunder host` on the command line.
 - **Settings menu**: Start, Defaults, File types, Deletion, Logging — the settings below,
   edited in place (`⏎` edits or toggles, `x` puts one back to its default).
+- **`m`** in a view or dialog goes back to the menu you opened it from (except while typing).
 - Outside a terminal (cron, pipes), `diskunder` with no command prints the help, as before.
 
 ---

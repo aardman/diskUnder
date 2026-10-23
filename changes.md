@@ -1,5 +1,12 @@
 # diskUnder — Change Log
 
+## v5.5.5 — app fixes
+
+- **Test job:** the steps stay up while the test job runs, and Esc (or `m`) from its results
+  goes back to them, at Remove. See results is ticked once you've seen them.
+- **`m`** in any view or dialog goes back to the menu you opened it from — not while typing in
+  Search, a form or a field.
+
 ## v5.5.4 — test job, dry run, Host menu
 
 ### Jobs menu

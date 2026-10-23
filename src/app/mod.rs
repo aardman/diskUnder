@@ -108,11 +108,13 @@ pub(crate) enum Dialog {
     Vacuum,
     DropIndex { items: Vec<DropItem>, selected: usize, confirm: bool },
     Input { purpose: InputFor, value: String },
-    /// The test job's steps; `made`/`ran` tick them off, `clash` is a job of yours called test
-    TestJob { selected: usize, made: bool, ran: bool, clash: bool },
+    /// The test job's steps; `made`/`ran`/`seen` tick them off, `clash` is a job of yours called test
+    TestJob { selected: usize, made: bool, ran: bool, seen: bool, clash: bool },
 }
 
 /// The test job's steps: (label, what it does)
+const TEST_RESULTS: &str = "Test job — results";
+
 pub(crate) const TEST_STEPS: [(&str, &str); 4] = [
     ("Create", "sample files (photos, copies, a film project) and a job named test"),
     ("Run", "index the sample files — the results open when it finishes"),
@@ -231,6 +233,8 @@ pub(crate) struct App {
     pub(crate) finished: Option<String>, // the strip's last line once a run ends
     pending: Option<Pending>, // a dry run or report working in the background
     follow_test: bool,        // open the test job's results when its run ends
+    test_seen: bool,          // the test job's results have been shown since it was made
+    last_menu: Option<(usize, usize)>, // (menu, item) last chosen, for m to go back to
     pub(crate) message: Option<String>, // one-line feedback in the footer
     pub(crate) settings: Settings,
     pub(crate) quit: bool,
@@ -267,6 +271,8 @@ impl App {
             finished: None,
             pending: None,
             follow_test: false,
+            test_seen: false,
+            last_menu: None,
             message: None,
             settings: Settings::default(),
             quit: false,
@@ -501,7 +507,9 @@ impl App {
             self.message = Some(reason.to_string());
         }
         self.refresh();
-        if run.name == testjob::NAME && std::mem::take(&mut self.follow_test) && matches!(self.view, View::Main) && self.dialog.is_none() {
+        let waiting = self.menu.is_none() && (self.dialog.is_none() || matches!(self.dialog, Some(Dialog::TestJob { .. })));
+        if run.name == testjob::NAME && std::mem::take(&mut self.follow_test) && matches!(self.view, View::Main) && waiting {
+            self.dialog = None;
             self.show_test_results();
         }
     }
@@ -563,7 +571,8 @@ impl App {
     fn test_dialog(&self, selected: usize) -> Dialog {
         let job = self.jobs.iter().find(|s| s.job.name == testjob::NAME);
         let ours = job.is_some_and(|s| testjob::is_ours(&self.store, &s.job));
-        Dialog::TestJob { selected, made: ours, ran: ours && job.is_some_and(|s| s.last.is_some()), clash: job.is_some() && !ours }
+        let ran = ours && job.is_some_and(|s| s.last.is_some());
+        Dialog::TestJob { selected, made: ours, ran, seen: ran && self.test_seen, clash: job.is_some() && !ours }
     }
 
     fn select_test_job(&mut self) -> bool {
@@ -592,6 +601,7 @@ impl App {
             0 => match testjob::create(&self.store) {
                 Ok(msg) => {
                     self.message = Some(msg);
+                    self.test_seen = false;
                     self.refresh();
                     self.select_test_job();
                     self.dialog = Some(self.test_dialog(1));
@@ -602,6 +612,10 @@ impl App {
                 if made && self.select_test_job() {
                     self.run_job();
                     self.follow_test = self.running.as_ref().is_some_and(|r| r.name == testjob::NAME);
+                    if self.follow_test {
+                        // The steps stay up while it runs; the results replace them at the end
+                        self.dialog = Some(self.test_dialog(1));
+                    }
                 } else if !made {
                     self.message = Some("create the test job first".into());
                 }
@@ -618,6 +632,7 @@ impl App {
                 }
                 let job = self.jobs.iter().find(|s| s.job.name == testjob::NAME).map(|s| s.job.clone());
                 self.message = Some(testjob::remove(&self.store, job.as_ref()).unwrap_or_else(|e| e));
+                self.test_seen = false;
                 self.refresh();
             }
         }
@@ -629,15 +644,16 @@ impl App {
             return;
         }
         self.show_latest();
+        self.test_seen = true;
         if let View::Text { title, lines, .. } = &mut self.view {
-            *title = "Test job — results".into();
+            *title = TEST_RESULTS.into();
             lines.extend(
                 [
                     "",
                     "The sample has copies of photos in backup/ and an old copy of a project file, so try",
-                    "(Esc back first):  d duplicates · p reports · / search · b browse · y dry run",
+                    "(Esc twice to the main window first):  d duplicates · p reports · / search · b browse · y dry run",
                     "The job skips *.tmp files and .snapshot folders — Browse shows they're not indexed.",
-                    "t then Remove deletes the test job and its sample files.",
+                    "Esc goes back to the test job's steps — Remove deletes the job and its sample files.",
                 ]
                 .map(String::from),
             );
@@ -748,7 +764,8 @@ impl App {
                 let next = match self.test_dialog(0) {
                     Dialog::TestJob { made: false, .. } => 0,
                     Dialog::TestJob { ran: false, .. } => 1,
-                    _ => 2,
+                    Dialog::TestJob { seen: false, .. } => 2,
+                    _ => 3,
                 };
                 self.dialog = Some(self.test_dialog(next));
             }
@@ -826,6 +843,31 @@ impl App {
         }
     }
 
+    /// m from a view or dialog: back to the menu it was opened from (the test job's steps,
+    /// for its results)
+    fn back_to_menu(&mut self) {
+        let from_test = matches!(&self.view, View::Text { title, .. } if title == TEST_RESULTS);
+        self.view = View::Main;
+        self.dialog = None;
+        if from_test {
+            self.dialog = Some(self.test_dialog(3));
+        } else {
+            let (open, item) = self.last_menu.unwrap_or((0, 0));
+            self.menu = Some(Menu { open, item });
+        }
+    }
+
+    /// Whether the screen is taking typed text, so m is a letter, not "back to the menu"
+    fn typing(&self) -> bool {
+        match (&self.dialog, &self.view) {
+            (Some(Dialog::Form(_) | Dialog::Input { .. } | Dialog::DupFilters { .. }), _) => true,
+            (Some(_), _) => false,
+            (None, View::Search(x)) => !x.in_results,
+            (None, View::Settings(x)) => x.editing.is_some(),
+            _ => false,
+        }
+    }
+
     fn request_quit(&mut self) {
         if self.running.is_some() {
             self.dialog = Some(Dialog::QuitWhileRunning);
@@ -839,6 +881,10 @@ impl App {
             return;
         }
         self.message = None;
+        let elsewhere = self.dialog.is_some() || !matches!(self.view, View::Main);
+        if key.code == KeyCode::Char('m') && elsewhere && self.menu.is_none() && !self.typing() {
+            return self.back_to_menu();
+        }
         if let Some(dialog) = self.dialog.take() {
             self.dialog_key(dialog, key);
             return;
@@ -904,7 +950,10 @@ impl App {
             }
             KeyCode::Up => menu.item = (menu.item + items - 1) % items,
             KeyCode::Down => menu.item = (menu.item + 1) % items,
-            KeyCode::Enter => return self.act(MENUS[menu.open].1[menu.item].2),
+            KeyCode::Enter => {
+                self.last_menu = Some((menu.open, menu.item));
+                return self.act(MENUS[menu.open].1[menu.item].2);
+            }
             _ => {}
         }
         self.menu = Some(menu);
@@ -980,6 +1029,9 @@ impl App {
         }
         let back = matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left);
         if back {
+            if matches!(&self.view, View::Text { title, .. } if title == TEST_RESULTS) {
+                return self.back_to_menu();
+            }
             self.view = View::Main;
             return;
         }
@@ -1122,22 +1174,22 @@ impl App {
                 }
                 _ => self.dialog = Some(Dialog::Input { purpose, value }),
             },
-            Dialog::TestJob { selected, made, ran, clash } => match key.code {
+            Dialog::TestJob { selected, made, ran, seen, clash } => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.dialog = Some(Dialog::TestJob { selected: selected.saturating_sub(1), made, ran, clash })
+                    self.dialog = Some(Dialog::TestJob { selected: selected.saturating_sub(1), made, ran, seen, clash })
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     let selected = (selected + 1).min(TEST_STEPS.len() - 1);
-                    self.dialog = Some(Dialog::TestJob { selected, made, ran, clash })
+                    self.dialog = Some(Dialog::TestJob { selected, made, ran, seen, clash })
                 }
                 KeyCode::Char(c @ '1'..='4') => self.test_step(c as usize - '1' as usize, made, clash),
                 KeyCode::Enter => self.test_step(selected, made, clash),
                 KeyCode::Char('c') => {
-                    self.dialog = Some(Dialog::TestJob { selected, made, ran, clash });
+                    self.dialog = Some(Dialog::TestJob { selected, made, ran, seen, clash });
                     self.copy_command();
                 }
                 KeyCode::Esc | KeyCode::Char('q') => {}
-                _ => self.dialog = Some(Dialog::TestJob { selected, made, ran, clash }),
+                _ => self.dialog = Some(Dialog::TestJob { selected, made, ran, seen, clash }),
             },
             Dialog::Form(mut form) => match form.handle_key(key) {
                 FormKey::Continue => self.dialog = Some(Dialog::Form(form)),

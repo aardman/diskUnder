@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "diskunder"
-version = "5.5.4"
+version = "5.5.5"
 dependencies = [
  "blake3",
  "chrono",

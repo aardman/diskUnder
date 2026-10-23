@@ -420,7 +420,8 @@ same store holds the 5.5 settings.
 in every type filter, configurable run-log folder and rotation, and `db backup`. **5.5 is
 complete.**
 **5.5.4 done:** Test job (sample data from the Jobs menu), Test renamed Dry run (`y`), and a
-Host menu / `diskunder host` listing local drives and network mounts.
+Host menu / `diskunder host` listing local drives and network mounts. **5.5.5:** the test
+job's steps stay with you through its run and results; `m` goes back to the menu.
 
 `diskunder` with no subcommand, in a terminal, opens a full-screen app. With a subcommand,
 piped or from cron, nothing changes. It's a front end to 5.0–5.4: every screen runs the same
