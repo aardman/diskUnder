@@ -603,23 +603,99 @@ impl Report<'_> {
     }
 }
 
-fn report(db_path: &str, o: &ReportOptions) -> Result<(), String> {
+/// Open the database and work out what a report covers
+fn open<'a>(db_path: &str, o: &'a ReportOptions<'a>, out: Out, width: Option<usize>) -> Result<Report<'a>, String> {
     // A report shouldn't create a database
     if !Path::new(db_path).exists() {
         return Err(format!("no database at {}", db_path));
     }
     let conn = Connection::open(db_path).map_err(|e| format!("{}: {}", db_path, e))?;
     let scope = resolve_scope(&conn, o.path)?;
-    for note in scope.freshness_notes() {
-        eprintln!("{}", note);
-    }
+    Ok(Report { groups: None, conn, scope, out, format: o.format, width, o })
+}
+
+fn report(db_path: &str, o: &ReportOptions) -> Result<(), String> {
     let width = std::io::stdout()
         .is_terminal()
         .then(|| crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(120));
-    let mut r = Report { groups: None, conn, scope, out: Out::new(), format: o.format, width, o };
+    let mut r = open(db_path, o, Out::new(), width)?;
+    for note in r.scope.freshness_notes() {
+        eprintln!("{}", note);
+    }
     let result = r.run();
     r.out.flush();
     result
+}
+
+/// The report as text, plus its notes — for the interactive app. `width` fits paths to it.
+pub(crate) fn report_text(db_path: &str, o: &ReportOptions, width: Option<usize>) -> Result<(String, Vec<String>), String> {
+    let mut r = open(db_path, o, Out::buffer(), width)?;
+    let notes = r.scope.freshness_notes();
+    r.run()?;
+    Ok((r.out.into_text(), notes))
+}
+
+/// Options for a report with nothing but a path and filters set
+pub(crate) fn plain_options<'a>(path: Option<&'a str>, filters: &'a FilterArgs) -> ReportOptions<'a> {
+    ReportOptions {
+        path,
+        filters,
+        top_files: None,
+        by_type: false,
+        by_directory: false,
+        depth: 1,
+        stale: None,
+        stale_by: StaleBy::Modified,
+        duplicates: false,
+        min_size: None,
+        min_copies: 2,
+        min_wasted: None,
+        all_paths: false,
+        limit: None,
+        format: Format::Table,
+    }
+}
+
+/// A duplicate group, for the app
+pub(crate) struct GroupInfo {
+    pub(crate) checksum: String,
+    pub(crate) size: i64,
+    pub(crate) copies: i64,
+    pub(crate) wasted: i64,
+    pub(crate) name: String,
+}
+
+/// One copy in a duplicate group; `hard_link` marks a path sharing an earlier copy's data
+pub(crate) struct Member {
+    pub(crate) path: String,
+    pub(crate) modified: String,
+    pub(crate) hard_link: bool,
+}
+
+/// Every duplicate group matching the options (with their duplicate filters), most wasted
+/// space first — the same groups `report --duplicates` lists
+pub(crate) fn duplicate_groups_for(db_path: &str, o: &ReportOptions) -> Result<Vec<GroupInfo>, String> {
+    let mut r = open(db_path, o, Out::buffer(), None)?;
+    Ok(r.duplicate_groups()?
+        .into_iter()
+        .map(|(checksum, size, copies, wasted, first)| GroupInfo { name: Report::name_of(&first), checksum, size, copies, wasted })
+        .collect())
+}
+
+/// The copies in one duplicate group, by path
+pub(crate) fn group_members_for(db_path: &str, o: &ReportOptions, checksum: &str) -> Result<Vec<Member>, String> {
+    let r = open(db_path, o, Out::buffer(), None)?;
+    let mut members = r.group_members(&[checksum])?;
+    let mut seen = HashSet::new();
+    Ok(members
+        .remove(checksum)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(path, modified, device, inode)| {
+            let hard_link = matches!((device, inode), (Some(d), Some(i)) if !seen.insert((d, i)));
+            Member { path, modified, hard_link }
+        })
+        .collect())
 }
 
 pub(crate) fn run_report(db_path: &str, o: &ReportOptions) -> i32 {

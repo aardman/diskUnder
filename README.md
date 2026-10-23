@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 5.5.1`:
+**Check it worked** — this should print `diskunder 5.5.2`:
 
 ```bash
 diskunder --version
@@ -368,7 +368,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Settings  Help                       diskUnder v5.5.1 · /data/index.db
+ Jobs  Results  Database  Settings  Help                       diskUnder v5.5.2 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -389,14 +389,20 @@ $ diskunder run nas-nightly
   (`--db`) that no job covers. The right-hand pane shows the selection's details.
 - **Jobs menu** (`m`): Create… (`n`), Run (`⏎`), Test (`t` — a dry run), Edit… (`e`),
   Status (`s` — every job), Remove… (`x` — optionally with its index).
-- **Results menu** (`r`): Latest (`l`), History (`h` — `⏎` on a run shows its errors),
-  Errors (`o`), Logs (`g` — the job's lines from the run log; `a` shows every run).
+- **Results menu** (`r`), for the selected job or indexed path:
+  - Latest (`l`), History (`h` — `⏎` on a run shows its errors), Errors (`o`), Logs (`g` —
+    the job's lines from the run log; `a` shows every run)
+  - Search… (`/`) — the `search` filters as a form; results update as you type
+  - Duplicates (`d`) — groups by wasted space with the selected group's copies (hard links
+    marked); `f` sets the duplicate filters
+  - Reports… (`p`) — overview, largest files, by type, by folder, stale, duplicates
+  - Browse (`b`) — folders by size with files, share and duplicated space; `⏎` goes in, `⌫` up
 - **Runs carry on in the bottom strip** while you use the menus — one at a time. Quitting
   during a run asks first, and records it as stopped by user.
 - Outside a terminal (cron, pipes), `diskunder` with no command prints the help, as before.
 
-The Database and Settings menus, and Search, Duplicates, Reports and Browse under Results,
-arrive in the next 5.5 steps — the command line has all of them already.
+The Database and Settings menus arrive in 5.5.3 — the command line has them already
+(`diskunder db …`).
 
 ---
 
@@ -589,7 +595,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Include / exclude file types — `--include-ext`, `--exclude-ext`, stored per path | No | No | No | No | No | Yes (5.2) |
 | Ignore — exclude paths by `.gitignore`-style pattern, with exceptions; excluded folders never entered | No | No | No | No | No | Yes (5.3) |
 | Jobs — named, saved runs: `jobs add/list/show/edit/remove`, `run NAME`, run history (menu in 5.5) | No | No | No | No | No | Yes (5.4) |
-| Interactive app — main window, Jobs and Results menus (more Results, Database and Settings to follow) | No | No | No | No | No | Partly (5.5.1) |
+| Interactive app — main window, Jobs and Results menus (Database and Settings to follow) | No | No | No | No | No | Partly (5.5.2) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
@@ -633,7 +639,8 @@ diskunder/
 │   ├── filters.rs     #   file-type and path filters
 │   ├── run.rs         #   one index / update run (shared by jobs)
 │   ├── jobs.rs        #   jobs and run history
-│   ├── app/           #   the interactive app: state and keys, drawing, the job form, tests
+│   ├── app/           #   the interactive app: state and keys, drawing, the job form,
+│   │                  #   Search / Duplicates / Browse, tests
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)

@@ -9,7 +9,8 @@ use ratatui::{
     Frame,
 };
 
-use super::{App, Dialog, PathEntry, Selected, View, MENUS};
+use super::results::{Browse, Dups, Fields, Search};
+use super::{App, Dialog, PathEntry, Selected, View, MENUS, REPORTS};
 use crate::cli::display_version;
 use crate::fmt::{fmt_bytes, fmt_count, fmt_local, truncate_path};
 use crate::jobs::{fmt_secs, opt_count, status, JobSummary, RunRow};
@@ -63,6 +64,9 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
             };
             draw_text(f, &title, lines, *scroll, rows[1])
         }
+        View::Search(x) => draw_search(f, x, rows[1]),
+        View::Duplicates(x) => draw_dups(f, x, rows[1]),
+        View::Browse(x) => draw_browse(f, x, rows[1]),
     }
     if strip > 0 {
         draw_strip(f, app, rows[2]);
@@ -72,7 +76,10 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         draw_menu(f, menu.open, menu.item, rows[1]);
     }
     if let Some(dialog) = &app.dialog {
-        draw_dialog(f, dialog, f.area());
+        match (dialog, &app.view) {
+            (Dialog::DupFilters { .. }, View::Duplicates(d)) => draw_dup_filters(f, d, f.area()),
+            _ => draw_dialog(f, dialog, f.area()),
+        }
     }
 }
 
@@ -446,6 +453,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             View::Main => "⏎ run · t test · n new · e edit · x remove · r results · m menus · c copy command · ? help · q quit",
             View::History { .. } => "↑↓ select · ⏎ errors · c copy command · Esc back",
             View::Logs { .. } => "↑↓ PgUp PgDn scroll · a all runs · c copy command · Esc back",
+            View::Search(x) if x.in_results => "↑↓ results · Tab back to the filters · c copy command · Esc back",
+            View::Search(_) => "type to filter — results update as you go · Tab / ↑↓ fields · space cycles choices · ⏎ results · Esc back",
+            View::Duplicates(_) => "↑↓ groups · f filters · c copy command · Esc back",
+            View::Browse(_) => "↑↓ select · ⏎ / → into folder · ⌫ / ← up · c copy command · Esc back",
             _ => "↑↓ PgUp PgDn scroll · c copy command · Esc back",
         }
     };
@@ -513,6 +524,21 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             f.render_widget(Clear, area);
             f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Keys — any key closes ")), area);
         }
+        Dialog::Reports { selected } => {
+            let area = centered(44, REPORTS.len() as u16 + 2, area);
+            let items: Vec<ListItem> = REPORTS.iter().map(|(label, _)| ListItem::new(format!(" {}", label))).collect();
+            let mut state = ListState::default();
+            state.select(Some(*selected));
+            f.render_widget(Clear, area);
+            f.render_stateful_widget(
+                List::new(items)
+                    .block(Block::default().borders(Borders::ALL).title(" Reports — ⏎ choose "))
+                    .highlight_style(Style::new().bg(Color::Cyan).fg(Color::Black)),
+                area,
+                &mut state,
+            );
+        }
+        Dialog::DupFilters { .. } => {} // drawn with the Duplicates view, which owns the fields
         Dialog::QuitWhileRunning => {
             let area = centered(64, 5, area);
             f.render_widget(Clear, area);
@@ -564,4 +590,167 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(form.title())), area);
         }
     }
+}
+
+/// Labelled fields, the focused one highlighted with its hint
+fn field_lines(fields: &Fields, focused: bool) -> Vec<Line<'static>> {
+    fields
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let on = focused && i == fields.focus;
+            let value = if f.choices.is_empty() {
+                if on { format!("{}▏", f.value) } else { f.value.clone() }
+            } else {
+                format!("‹ {} ›", f.value)
+            };
+            let mut spans = vec![
+                Span::styled(format!("{:>13}  ", f.label), if on { BOLD } else { Style::new() }),
+                Span::styled(value, if on { Style::new().fg(Color::Cyan) } else { Style::new() }),
+            ];
+            if on {
+                spans.push(Span::styled(format!("   {}", f.hint), DIM));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn draw_search(f: &mut Frame, s: &Search, area: Rect) {
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(s.fields.items.len() as u16 + 2), Constraint::Min(3)])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(field_lines(&s.fields, !s.in_results))
+            .block(Block::default().borders(Borders::ALL).title(format!(" Search — {} ", s.target.label))),
+        parts[0],
+    );
+    let title = match &s.error {
+        Some(e) => format!(" {} ", e),
+        None if s.total > s.results.len() => format!(" {} matches — showing the first {} ", fmt_count(s.total as i64), s.results.len()),
+        None => format!(" {} matches ", fmt_count(s.total as i64)),
+    };
+    let header = Row::new(["SIZE", "MODIFIED", "PATH"]).style(BOLD);
+    let rows: Vec<Row> = s
+        .results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let style = if s.in_results && i == s.selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            let modified = if r.modified.is_empty() { "-".to_string() } else { fmt_local(&r.modified) };
+            Row::new(vec![fmt_bytes(r.size as u64), modified, truncate_path(&r.path, parts[1].width.saturating_sub(32) as usize)]).style(style)
+        })
+        .collect();
+    let skip = if s.in_results { s.selected.saturating_sub(parts[1].height.saturating_sub(4) as usize) } else { 0 };
+    let rows: Vec<Row> = rows.into_iter().skip(skip).collect();
+    let title_style = if s.error.is_some() { Style::new().fg(Color::Red) } else { Style::new() };
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(10), Constraint::Length(17), Constraint::Min(10)])
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title(Span::styled(title, title_style))),
+        parts[1],
+    );
+}
+
+fn draw_dups(f: &mut Frame, d: &Dups, area: Rect) {
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+    let active: Vec<String> = d
+        .filters
+        .items
+        .iter()
+        .filter(|f| !f.value.trim().is_empty())
+        .map(|f| format!("{} {}", f.label.to_lowercase(), f.value.trim()))
+        .collect();
+    let filters = if active.is_empty() { "no filters".to_string() } else { active.join(" · ") };
+    let title = match &d.error {
+        Some(e) => format!(" Duplicates — {} — {} ", d.target.label, e),
+        None => format!(
+            " Duplicates — {} — {} groups · {} wasted — {} (f to change) ",
+            d.target.label,
+            fmt_count(d.groups.len() as i64),
+            fmt_bytes(d.wasted() as u64),
+            filters
+        ),
+    };
+    let header = Row::new(["WASTED", "SIZE × COPIES", "NAME"]).style(BOLD);
+    let visible = parts[0].height.saturating_sub(4) as usize;
+    let skip = d.selected.saturating_sub(visible);
+    let rows: Vec<Row> = d
+        .groups
+        .iter()
+        .enumerate()
+        .skip(skip)
+        .map(|(i, g)| {
+            let style = if i == d.selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            Row::new(vec![fmt_bytes(g.wasted as u64), format!("{} × {}", fmt_bytes(g.size as u64), g.copies), g.name.clone()]).style(style)
+        })
+        .collect();
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(11), Constraint::Length(18), Constraint::Min(10)])
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        parts[0],
+    );
+    let width = parts[1].width.saturating_sub(34) as usize;
+    let lines: Vec<Line> = d
+        .members
+        .iter()
+        .map(|m| {
+            let when = if m.modified.is_empty() { "-".to_string() } else { fmt_local(&m.modified) };
+            let mut spans = vec![Span::styled(format!("{:<17} ", when), DIM), Span::raw(truncate_path(&m.path, width))];
+            if m.hard_link {
+                spans.push(Span::styled("  (hard link)", DIM));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    let name = d.groups.get(d.selected).map_or(String::new(), |g| format!(" {} — copies ", g.name));
+    f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(name)), parts[1]);
+}
+
+/// The duplicate filters, over the Duplicates view
+pub(crate) fn draw_dup_filters(f: &mut Frame, d: &Dups, area: Rect) {
+    let mut lines = field_lines(&d.filters, true);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Tab / ↑↓ move · ⏎ apply · Esc cancel · Ctrl-U clear field", DIM)));
+    let area = centered(90, lines.len() as u16 + 2, area);
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Duplicate filters ")), area);
+}
+
+fn draw_browse(f: &mut Frame, b: &Browse, area: Rect) {
+    let title = match &b.error {
+        Some(e) => format!(" Browse — {} ", e),
+        None => format!(" {} — {} files · {} ", b.folder, fmt_count(b.total.0), fmt_bytes(b.total.1 as u64)),
+    };
+    let header = Row::new(["FILES", "SIZE", "SHARE", "DUPLICATED", "FOLDER"]).style(BOLD);
+    let visible = area.height.saturating_sub(4) as usize;
+    let skip = b.selected.saturating_sub(visible);
+    let rows: Vec<Row> = b
+        .rows
+        .iter()
+        .enumerate()
+        .skip(skip)
+        .map(|(i, r)| {
+            let style = if i == b.selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            let share = if b.total.1 > 0 { r.bytes as f64 * 100.0 / b.total.1 as f64 } else { 0.0 };
+            let name = if r.folder.is_some() { format!("{}/", r.name) } else { r.name.clone() };
+            let dup = if r.duplicated > 0 { fmt_bytes(r.duplicated as u64) } else { "—".to_string() };
+            Row::new(vec![fmt_count(r.files), fmt_bytes(r.bytes as u64), format!("{:.1}%", share), dup, name]).style(style)
+        })
+        .collect();
+    f.render_widget(
+        Table::new(
+            rows,
+            [Constraint::Length(10), Constraint::Length(10), Constraint::Length(7), Constraint::Length(11), Constraint::Min(10)],
+        )
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
 }

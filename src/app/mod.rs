@@ -3,6 +3,7 @@
 
 mod draw;
 mod form;
+mod results;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
@@ -31,6 +32,7 @@ use crate::query::absolute;
 use crate::run::{finish_run, start_run, Started};
 use crate::runlog::RunLog;
 use form::{Form, FormKey};
+use results::{Browse, Dups, Outcome, Search, Target};
 
 const TICK: Duration = Duration::from_millis(100);
 const RECENT_RUNS: usize = 4; // for the details pane
@@ -58,13 +60,28 @@ pub(crate) enum View {
     Text { title: String, lines: Vec<String>, scroll: usize, command: String },
     History { job: String, runs: Vec<RunRow>, selected: usize },
     Logs { job: Option<String>, db: String, all: bool, lines: Vec<String>, scroll: usize },
+    Search(Box<Search>),
+    Duplicates(Box<Dups>),
+    Browse(Box<Browse>),
 }
+
+/// The report sections the Reports menu offers: (label, `report` options)
+pub(crate) const REPORTS: [(&str, &str); 6] = [
+    ("Overview", ""),
+    ("Largest files", "--top-files"),
+    ("Space by type", "--by-type"),
+    ("Space by folder", "--by-directory"),
+    ("Not modified in 1 year", "--stale 1y"),
+    ("Duplicates with summary", "--duplicates"),
+];
 
 pub(crate) enum Dialog {
     Form(Form),
     RemoveJob { name: String, drop_index: bool },
     QuitWhileRunning,
     Help,
+    Reports { selected: usize },
+    DupFilters { saved: Vec<String> }, // values to restore if the edit is cancelled
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -79,6 +96,10 @@ pub(crate) enum Action {
     History,
     Errors,
     Logs,
+    Search,
+    Duplicates,
+    Reports,
+    Browse,
     Later, // Database and Settings menus: 5.5.3
     Help,
     Quit,
@@ -104,6 +125,10 @@ pub(crate) const MENUS: [(&str, &[(&str, &str, Action)]); 5] = [
             ("History", "h", Action::History),
             ("Errors", "o", Action::Errors),
             ("Logs", "g", Action::Logs),
+            ("Search…", "/", Action::Search),
+            ("Duplicates", "d", Action::Duplicates),
+            ("Reports…", "p", Action::Reports),
+            ("Browse", "b", Action::Browse),
         ],
     ),
     ("Database", &[("Coming in 5.5.3 — use `diskunder db` for now", "", Action::Later)]),
@@ -138,9 +163,16 @@ pub(crate) struct App {
     pub(crate) menu: Option<Menu>,
     pub(crate) running: Option<RunningJob>,
     pub(crate) finished: Option<String>, // the strip's last line once a run ends
-    testing: Option<(String, Receiver<Result<(String, Vec<String>), String>>)>,
+    pending: Option<Pending>, // a test or report working in the background
     pub(crate) message: Option<String>, // one-line feedback in the footer
     pub(crate) quit: bool,
+}
+
+/// Background work whose result becomes a text view
+pub(crate) struct Pending {
+    title: String,
+    command: String,
+    rx: Receiver<Result<(String, Vec<String>), String>>,
 }
 
 pub(crate) enum Selected<'a> {
@@ -165,7 +197,7 @@ impl App {
             menu: None,
             running: None,
             finished: None,
-            testing: None,
+            pending: None,
             message: None,
             quit: false,
         };
@@ -261,6 +293,9 @@ impl App {
             View::Text { command, .. } => command.clone(),
             View::History { job, .. } => format!("diskunder jobs show {}", job),
             View::Logs { db, .. } => format!("less {}.log", db),
+            View::Search(x) => x.command(),
+            View::Duplicates(x) => x.command(),
+            View::Browse(x) => x.command(),
             View::Main => match self.selected() {
                 Selected::Job(s) => format!("diskunder run {}", s.job.name),
                 Selected::Path(p) => match &p.root {
@@ -297,33 +332,58 @@ impl App {
                 self.finish_running();
             }
         }
-        if let Some((name, rx)) = &self.testing {
-            if let Ok(result) = rx.try_recv() {
-                let name = name.clone();
-                self.testing = None;
-                self.message = None; // "testing…" is done
-                self.view = match result {
-                    Ok((report, warnings)) => {
-                        let mut lines: Vec<String> = report.lines().map(str::to_string).collect();
-                        if !warnings.is_empty() {
+        if let Some(p) = &self.pending {
+            if let Ok(result) = p.rx.try_recv() {
+                let p = self.pending.take().unwrap();
+                self.message = None; // "working…" is done
+                match result {
+                    Ok((text, notes)) => {
+                        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+                        if !notes.is_empty() {
                             lines.push(String::new());
-                            lines.push("Warnings".into());
-                            lines.extend(warnings.iter().map(|w| format!("  {}", w)));
+                            lines.extend(notes.iter().map(|n| n.to_string()));
                         }
-                        View::Text {
-                            title: format!("Test — {} (dry run)", name),
-                            lines,
-                            scroll: 0,
-                            command: format!("diskunder run {} --dry-run", name),
-                        }
+                        self.view = View::Text { title: p.title, lines, scroll: 0, command: p.command };
                     }
-                    Err(e) => {
-                        self.message = Some(format!("test of {} failed: {}", name, e));
-                        View::Main
-                    }
-                };
+                    Err(e) => self.message = Some(format!("{}: {}", p.title, e)),
+                }
             }
         }
+        if let View::Search(s) = &mut self.view {
+            s.tick();
+        }
+    }
+
+    /// Run `work` in the background; its text becomes a view titled `title`
+    fn spawn_text(
+        &mut self,
+        title: String,
+        command: String,
+        work: impl FnOnce() -> Result<(String, Vec<String>), String> + Send + 'static,
+    ) {
+        if self.pending.is_some() {
+            self.message = Some("still working on the last request".into());
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        self.message = Some(format!("{} — working…", title));
+        self.pending = Some(Pending { title, command, rx });
+    }
+
+    /// The index the selection points at, for the Results views
+    fn target(&mut self) -> Option<Target> {
+        let t = match self.selected() {
+            Selected::Job(s) => Some(Target { label: s.job.name.clone(), db: s.job.db.clone(), path: s.job.path.clone() }),
+            Selected::Path(p) => p.root.as_ref().map(|r| Target { label: r.root.clone(), db: self.db.clone(), path: r.root.clone() }),
+            Selected::Nothing => None,
+        };
+        if t.is_none() {
+            self.message = Some("select a job or an indexed path first".into());
+        }
+        t
     }
 
     /// Record the run that just ended (or is being stopped) in the job's history
@@ -378,10 +438,6 @@ impl App {
             self.message = Some("select a job to test".into());
             return;
         };
-        if self.testing.is_some() {
-            self.message = Some("a test is already in progress".into());
-            return;
-        }
         let root = match fs::canonicalize(&job.path) {
             Ok(r) => r.to_string_lossy().into_owned(),
             Err(e) => {
@@ -389,13 +445,12 @@ impl App {
                 return;
             }
         };
-        let (tx, rx) = mpsc::channel();
-        let name = job.name.clone();
-        self.message = Some(format!("testing {} — walking {} …", name, root));
-        std::thread::spawn(move || {
-            let _ = tx.send(dry_run_report(&job.db, &job.path, &root, job.upsert, &job.overrides()));
+        let title = format!("Test — {} (dry run)", job.name);
+        let command = format!("diskunder run {} --dry-run", job.name);
+        self.spawn_text(title, command, move || {
+            let (report, warnings) = dry_run_report(&job.db, &job.path, &root, job.upsert, &job.overrides())?;
+            Ok((report, warnings.iter().map(|w| format!("warn: {}", w)).collect()))
         });
-        self.testing = Some((name, rx));
     }
 
     // ─── Views ───────────────────────────────────────────────────────────────
@@ -519,6 +574,26 @@ impl App {
                 }
             }
             Action::Logs => self.show_logs(),
+            Action::Search => {
+                if let Some(t) = self.target() {
+                    self.view = View::Search(Box::new(Search::new(t)));
+                }
+            }
+            Action::Duplicates => {
+                if let Some(t) = self.target() {
+                    self.view = View::Duplicates(Box::new(Dups::new(t)));
+                }
+            }
+            Action::Browse => {
+                if let Some(t) = self.target() {
+                    self.view = View::Browse(Box::new(Browse::new(t)));
+                }
+            }
+            Action::Reports => {
+                if self.target().is_some() {
+                    self.dialog = Some(Dialog::Reports { selected: 0 });
+                }
+            }
             Action::Later => self.message = Some("the Database and Settings menus come in 5.5.3".into()),
             Action::Help => self.dialog = Some(Dialog::Help),
             Action::Quit => self.request_quit(),
@@ -572,6 +647,10 @@ impl App {
             KeyCode::Char('h') => self.act(Action::History),
             KeyCode::Char('o') => self.act(Action::Errors),
             KeyCode::Char('g') => self.act(Action::Logs),
+            KeyCode::Char('/') => self.act(Action::Search),
+            KeyCode::Char('d') => self.act(Action::Duplicates),
+            KeyCode::Char('p') => self.act(Action::Reports),
+            KeyCode::Char('b') => self.act(Action::Browse),
             KeyCode::Char('r') => self.menu = Some(Menu { open: 1, item: 0 }),
             KeyCode::Char('m') | KeyCode::F(10) => self.menu = Some(Menu { open: 0, item: 0 }),
             KeyCode::Char('?') => self.act(Action::Help),
@@ -605,6 +684,41 @@ impl App {
     }
 
     fn view_key(&mut self, key: KeyEvent) {
+        // Views with their own keys (Search types into fields; Browse uses ← to go up)
+        let outcome = match &mut self.view {
+            View::Search(x) => {
+                if x.in_results && key.code == KeyCode::Char('c') {
+                    return self.copy_command();
+                }
+                Some(x.key(key))
+            }
+            View::Duplicates(x) => {
+                if key.code == KeyCode::Char('f') {
+                    let saved = x.filters.items.iter().map(|f| f.value.clone()).collect();
+                    self.dialog = Some(Dialog::DupFilters { saved });
+                    return;
+                }
+                if key.code == KeyCode::Char('c') {
+                    return self.copy_command();
+                }
+                Some(x.key(key))
+            }
+            View::Browse(x) => {
+                if key.code == KeyCode::Char('c') {
+                    return self.copy_command();
+                }
+                Some(x.key(key))
+            }
+            _ => None,
+        };
+        match outcome {
+            Some(Outcome::Back) => {
+                self.view = View::Main;
+                return;
+            }
+            Some(Outcome::Stay) => return,
+            None => {}
+        }
         let back = matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left);
         if back {
             self.view = View::Main;
@@ -631,7 +745,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(runs.len().saturating_sub(1)),
                 _ => {}
             },
-            View::Status | View::Main => {}
+            View::Status | View::Main | View::Search(_) | View::Duplicates(_) | View::Browse(_) => {}
         }
         // Keys that open another view
         match (&self.view, key.code) {
@@ -667,12 +781,68 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::RemoveJob { name, drop_index: drop }),
             },
+            Dialog::Reports { selected } => match key.code {
+                KeyCode::Up => self.dialog = Some(Dialog::Reports { selected: selected.saturating_sub(1) }),
+                KeyCode::Down => self.dialog = Some(Dialog::Reports { selected: (selected + 1).min(REPORTS.len() - 1) }),
+                KeyCode::Enter => self.run_report(selected),
+                KeyCode::Esc => {}
+                _ => self.dialog = Some(Dialog::Reports { selected }),
+            },
+            Dialog::DupFilters { saved } => {
+                let View::Duplicates(d) = &mut self.view else { return };
+                match key.code {
+                    KeyCode::Esc => {
+                        for (f, v) in d.filters.items.iter_mut().zip(saved) {
+                            f.value = v;
+                        }
+                    }
+                    KeyCode::Enter => d.reload(),
+                    KeyCode::Tab | KeyCode::Down => {
+                        d.filters.next();
+                        self.dialog = Some(Dialog::DupFilters { saved });
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        d.filters.prev();
+                        self.dialog = Some(Dialog::DupFilters { saved });
+                    }
+                    _ => {
+                        d.filters.edit(key);
+                        self.dialog = Some(Dialog::DupFilters { saved });
+                    }
+                }
+            }
             Dialog::Form(mut form) => match form.handle_key(key) {
                 FormKey::Continue => self.dialog = Some(Dialog::Form(form)),
                 FormKey::Cancel => {}
                 FormKey::Submit => self.save_form(form),
             },
         }
+    }
+
+    fn run_report(&mut self, section: usize) {
+        let Some(t) = self.target() else { return };
+        let (label, flag) = REPORTS[section];
+        let title = format!("{} — {}", label, t.label);
+        let flag = if flag.is_empty() { String::new() } else { format!("{} ", flag) };
+        let command = format!("diskunder report {} {}--db {}", t.path, flag, t.db);
+        let width = crossterm::terminal::size().ok().map(|(w, _)| w.saturating_sub(2) as usize);
+        self.spawn_text(title, command, move || {
+            if !Path::new(&t.db).exists() {
+                return Err(format!("nothing indexed yet in {} — run the job first", t.db));
+            }
+            let filters = crate::query::FilterArgs::default();
+            let stale = crate::report::parse_age_arg("1y")?;
+            let mut o = crate::report::plain_options(Some(&t.path), &filters);
+            match section {
+                1 => o.top_files = Some(None),
+                2 => o.by_type = true,
+                3 => o.by_directory = true,
+                4 => o.stale = Some(&stale),
+                5 => o.duplicates = true,
+                _ => {}
+            }
+            crate::report::report_text(&t.db, &o, width)
+        });
     }
 
     fn save_form(&mut self, mut form: Form) {

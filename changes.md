@@ -1,5 +1,35 @@
 # diskUnder — Change Log
 
+## v5.5.2 — interactive app: Search, Duplicates, Reports, Browse
+
+The rest of the Results menu, for the selected job or indexed path:
+
+- **Search…** (`/`) — the `search` filters as a form (name, types, larger / smaller than,
+  older / newer than, under, duplicates only, sort). Results update once typing pauses; a
+  value that doesn't parse shows its error where the results go. Shows the first 200 and the
+  total.
+- **Duplicates** (`d`) — every group by wasted space, with the selected group's copies below
+  (hard links marked). `f` sets the duplicate filters (min size, min copies, min wasted,
+  types, under); Esc cancels an edit.
+- **Reports…** (`p`) — overview, largest files, by type, by folder, stale (1 year),
+  duplicates — the same text as `diskunder report`, worked out in the background.
+- **Browse** (`b`) — folders by size with file counts, share of the space, and how much is
+  in files that have another copy in the index. `⏎` / `→` goes into a folder, `⌫` / `←` back.
+
+As everywhere in the app, the footer shows the equivalent command — `search … --name …`,
+`report … --duplicates --min-size …`, `report FOLDER --by-directory`.
+
+Checked on a synthetic million-row index: Browse, Duplicates and Search all respond in a
+second or two.
+
+**Internals:** `report` can produce its text and notes for the app instead of printing them,
+and exposes duplicate groups and their copies as data — the same queries as the command line.
+
+**Tests:** 102 in total (was 98): app tests for Search (filtering as you type, choice fields,
+errors), Duplicates (filters, cancelling an edit), Browse (into folders and back) and Reports.
+
+---
+
 ## v5.5.1 — interactive app: main window, Jobs and Results
 
 `diskunder` with no command, in a terminal, opens the app (outside a terminal it prints the

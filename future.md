@@ -171,7 +171,7 @@ Possible actions: `flag` (mark in DB), `report` (print to stdout), `delete` (wit
 explicit confirmation prompt — never silent).
 
 ### Interactive app (TUI)
-**In progress (5.5.1 done)** — design in [v5-plan.md](v5-plan.md). Replaces the earlier "results
+**In progress (5.5.1 and 5.5.2 done)** — design in [v5-plan.md](v5-plan.md). Replaces the earlier "results
 browser TUI" idea with a full app: `diskunder` with no subcommand opens a main window listing
 jobs and indexed paths (with status and last-run details), and menus for **Jobs** (create,
 run, test, edit, status, remove), **Results** (latest, search, duplicates, reports, browse,

@@ -68,11 +68,11 @@ fn screen(app: &App) -> String {
 /// Let background work finish
 fn settle(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while (app.running.is_some() || app.testing.is_some()) && Instant::now() < deadline {
+    while (app.running.is_some() || app.pending.is_some()) && Instant::now() < deadline {
         app.tick();
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(app.running.is_none() && app.testing.is_none(), "background work didn't finish");
+    assert!(app.running.is_none() && app.pending.is_none(), "background work didn't finish");
 }
 
 /// A share with a job over it, and a second indexed path with no job
@@ -231,4 +231,113 @@ fn selecting_a_path_with_no_job_shows_its_index() {
 fn base64_for_the_terminal_clipboard() {
     assert_eq!(base64(b"diskunder run nightly"), "ZGlza3VuZGVyIHJ1biBuaWdodGx5");
     assert_eq!(base64(b"ab"), "YWI=");
+}
+
+
+// ─── Results views (5.5.2) ───────────────────────────────────────────────────
+
+/// The share plus a duplicate and a subfolder, indexed by running the job
+fn indexed() -> (Tmp, App) {
+    let (t, mut app) = setup();
+    t.file("share/copy-of-p0.jpg", "photo 0\n");
+    t.file("share/sub/deep/big.mov", &"m".repeat(400));
+    press(&mut app, &[KeyCode::Enter]);
+    settle(&mut app);
+    (t, app)
+}
+
+fn wait_for_search(app: &mut App) {
+    std::thread::sleep(Duration::from_millis(350));
+    app.tick();
+}
+
+#[test]
+fn search_updates_as_you_type() {
+    let (_t, mut app) = indexed();
+    press(&mut app, &[KeyCode::Char('/')]);
+    let s = screen(&app);
+    assert!(s.contains("Search — nightly") && s.contains("5 matches"), "all files (x.tmp excluded by the job) to start with:\n{}", s);
+    type_text(&mut app, "p1*");
+    wait_for_search(&mut app);
+    let s = screen(&app);
+    assert!(s.contains("1 matches") && s.contains("p1.jpg"), "{}", s);
+    assert!(app.command().contains("--name 'p1*'"), "{}", app.command());
+
+    // Back to all names; sort by size via the choice field
+    press(&mut app, &[KeyCode::Backspace, KeyCode::Backspace, KeyCode::Backspace]);
+    for _ in 0..8 {
+        press(&mut app, &[KeyCode::Tab]);
+    }
+    press(&mut app, &[KeyCode::Char(' ')]);
+    wait_for_search(&mut app);
+    assert!(app.command().ends_with(&format!("--sort size --db {}", app.jobs[0].job.db)), "{}", app.command());
+    press(&mut app, &[KeyCode::Enter]);
+    if let View::Search(x) = &app.view {
+        assert!(x.in_results && x.results[0].path.ends_with("big.mov"), "largest first");
+    } else {
+        panic!("still in search");
+    }
+
+    // A bad value shows where the results go, and nothing breaks. (The first Tab leaves the
+    // results; then Sort → Name → Types → Larger than.)
+    press(&mut app, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Tab, KeyCode::Tab]);
+    type_text(&mut app, "lots");
+    wait_for_search(&mut app);
+    assert!(screen(&app).contains("isn't a size"), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Esc]);
+    assert!(matches!(app.view, View::Main));
+}
+
+#[test]
+fn duplicates_view_with_filters() {
+    let (_t, mut app) = indexed();
+    press(&mut app, &[KeyCode::Char('d')]);
+    let s = screen(&app);
+    assert!(s.contains("1 groups · 8 B wasted"), "{}", s);
+    assert!(s.contains("copy-of-p0.jpg") && s.contains("p0.jpg"), "the selected group's copies:\n{}", s);
+
+    press(&mut app, &[KeyCode::Char('f')]);
+    assert!(screen(&app).contains("Duplicate filters"));
+    type_text(&mut app, "1K");
+    press(&mut app, &[KeyCode::Enter]);
+    let s = screen(&app);
+    assert!(s.contains("0 groups") && s.contains("min size 1K"), "{}", s);
+    assert!(app.command().contains("--duplicates --min-size 1K"), "{}", app.command());
+
+    press(&mut app, &[KeyCode::Char('f'), KeyCode::Char('x'), KeyCode::Esc]);
+    assert!(app.command().contains("--min-size 1K --db"), "Esc cancels the edit: {}", app.command());
+}
+
+#[test]
+fn browse_goes_into_folders_and_back() {
+    let (t, mut app) = indexed();
+    press(&mut app, &[KeyCode::Char('b')]);
+    let s = screen(&app);
+    assert!(s.contains("sub/") && s.contains("(files in this folder)"), "{}", s);
+    assert!(s.contains("DUPLICATED") && s.contains("16 B"), "the jpg and its copy count as duplicated:\n{}", s);
+    // sub/ holds the 400-byte mov, so it's first
+    press(&mut app, &[KeyCode::Enter]);
+    assert!(app.command().contains(&format!("report {} --by-directory", t.s("share/sub"))), "{}", app.command());
+    assert!(screen(&app).contains("deep/"));
+    press(&mut app, &[KeyCode::Backspace]);
+    assert!(app.command().contains(&format!("report {} --by-directory", t.s("share"))), "{}", app.command());
+    press(&mut app, &[KeyCode::Esc]);
+    assert!(matches!(app.view, View::Main));
+}
+
+#[test]
+fn reports_menu_shows_the_report() {
+    let (_t, mut app) = indexed();
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert!(screen(&app).contains("Space by folder"));
+    press(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]); // Space by type
+    settle(&mut app);
+    let s = screen(&app);
+    assert!(s.contains("Space by type — nightly") && s.contains("TYPE") && s.contains("jpg"), "{}", s);
+    assert!(app.command().contains("--by-type --db"), "{}", app.command());
+
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('p'), KeyCode::Enter]); // Overview
+    settle(&mut app);
+    let s = screen(&app);
+    assert!(s.contains("Overview — nightly") && s.contains("Duplicates             1 group"), "{}", s);
 }
