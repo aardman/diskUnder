@@ -419,6 +419,8 @@ same store holds the 5.5 settings.
 **5.5.3 done:** Database and Settings menus, the `settings` table and command, `@type` groups
 in every type filter, configurable run-log folder and rotation, and `db backup`. **5.5 is
 complete.**
+**5.5.4 done:** Test job (sample data from the Jobs menu), Test renamed Dry run (`y`), and a
+Host menu / `diskunder host` listing local drives and network mounts.
 
 `diskunder` with no subcommand, in a terminal, opens a full-screen app. With a subcommand,
 piped or from cron, nothing changes. It's a front end to 5.0–5.4: every screen runs the same

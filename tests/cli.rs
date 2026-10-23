@@ -2285,3 +2285,15 @@ fn db_backup_makes_a_usable_copy() {
     assert!(again.code == 1 && again.stderr.contains("already exists"), "never overwrites: {}", again.stderr);
     assert_eq!(log_lines(&db).len(), 2, "a backup changes nothing, so it isn't logged");
 }
+
+// ─── Host (5.5.4) ────────────────────────────────────────────────────────────
+
+#[test]
+fn host_lists_local_and_network_mounts() {
+    let tmp = TempDir::new();
+    let out = ok(jobs_cmd(&tmp, &["host"]));
+    assert!(out.stdout.contains("jobs store") && out.stdout.contains("store/diskunder.db"), "{}", out.stdout);
+    assert!(out.stdout.contains("\nLocal drives\n") && out.stdout.contains("\nNetwork mounts\n"), "{}", out.stdout);
+    assert!(out.stdout.contains("MOUNT") && out.stdout.contains("FREE"), "{}", out.stdout);
+    assert!(!tmp.path().join("store").exists(), "host doesn't create the store");
+}

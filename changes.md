@@ -1,5 +1,25 @@
 # diskUnder — Change Log
 
+## v5.5.4 — test job, dry run, Host menu
+
+### Jobs menu
+
+- **Dry run** (`y`) is the old *Test*: what a run of the selected job would change, without
+  hashing or writing (`diskunder run NAME --dry-run`).
+- **Test job…** (`t`) steps through creating a job named `test` over generated sample files,
+  running it (the results open when it ends), seeing the results, and removing the job, its
+  index and the sample files. The files go in a `test` folder beside the jobs store, marked
+  so only that folder is ever removed. A job of yours called `test` is left alone.
+- The welcome pane (no jobs yet) lists `t` and `q quit`.
+
+### Host
+
+- **`diskunder host`**: host, system, user, CPUs, where the jobs store, database and run logs
+  are, then **Local drives** and **Network mounts** — mount, filesystem, size, used, free,
+  source. System and pseudo filesystems are left out.
+- **Host menu** in the app: Drives & mounts (the same two sections; `n` starts a new job for
+  the selected mount) and Host info.
+
 ## v5.5.3 — interactive app: Database and Settings; settings and type groups
 
 ### Database menu

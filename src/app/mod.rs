@@ -5,6 +5,7 @@ mod draw;
 mod form;
 mod results;
 mod settings_view;
+mod testjob;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
@@ -24,6 +25,7 @@ use std::{
 
 use crate::db::{file_tables, load_roots, table_duplicates, RootRow};
 use crate::dryrun::dry_run_report;
+use crate::host::{host_info, mounts, Mount};
 use crate::jobs::{
     begin_run, create_job, delete_job, job_history, job_run_ids, job_summaries, run_errors, ActiveRun, Job,
     JobSettings, JobSummary, RunRow,
@@ -61,7 +63,7 @@ pub(crate) enum View {
     Main,
     /// Every job and its last run
     Status,
-    /// A scrollable report: Latest, Errors, or a Test (dry run)
+    /// A scrollable report: Latest, Errors, a dry run, Host info
     Text { title: String, lines: Vec<String>, scroll: usize, command: String },
     History { job: String, runs: Vec<RunRow>, selected: usize },
     Logs { job: Option<String>, db: String, all: bool, lines: Vec<String>, scroll: usize },
@@ -69,6 +71,8 @@ pub(crate) enum View {
     Duplicates(Box<Dups>),
     Browse(Box<Browse>),
     Settings(Box<SettingsView>),
+    /// Drives & mounts: local first, then network
+    Drives { mounts: Vec<Mount>, selected: usize },
 }
 
 /// An index the Database menu can drop: (label, table, the job that uses it)
@@ -104,13 +108,24 @@ pub(crate) enum Dialog {
     Vacuum,
     DropIndex { items: Vec<DropItem>, selected: usize, confirm: bool },
     Input { purpose: InputFor, value: String },
+    /// The test job's steps; `made`/`ran` tick them off, `clash` is a job of yours called test
+    TestJob { selected: usize, made: bool, ran: bool, clash: bool },
 }
+
+/// The test job's steps: (label, what it does)
+pub(crate) const TEST_STEPS: [(&str, &str); 4] = [
+    ("Create", "sample files (photos, copies, a film project) and a job named test"),
+    ("Run", "index the sample files — the results open when it finishes"),
+    ("See results", "the run's summary; then try d duplicates, p reports, / search"),
+    ("Remove", "the test job, its index and the sample files"),
+];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Action {
     NewJob,
     Run,
-    Test,
+    DryRun,
+    TestJob,
     Edit,
     Status,
     Remove,
@@ -128,22 +143,25 @@ pub(crate) enum Action {
     DbDrop,
     DbOpen,
     DbBackup,
+    Drives,
+    HostInfo,
     Settings(usize), // opens at this section
     Help,
     Quit,
 }
 
 /// The menu bar: (title, [(item, key hint, action)])
-pub(crate) const MENUS: [(&str, &[(&str, &str, Action)]); 5] = [
+pub(crate) const MENUS: [(&str, &[(&str, &str, Action)]); 6] = [
     (
         "Jobs",
         &[
             ("Create…", "n", Action::NewJob),
             ("Run", "⏎", Action::Run),
-            ("Test", "t", Action::Test),
+            ("Dry run", "y", Action::DryRun),
             ("Edit…", "e", Action::Edit),
             ("Status", "s", Action::Status),
             ("Remove…", "x", Action::Remove),
+            ("Test job…", "t", Action::TestJob),
         ],
     ),
     (
@@ -170,6 +188,7 @@ pub(crate) const MENUS: [(&str, &[(&str, &str, Action)]); 5] = [
             ("Backup…", "", Action::DbBackup),
         ],
     ),
+    ("Host", &[("Drives & mounts", "", Action::Drives), ("Host info", "", Action::HostInfo)]),
     (
         "Settings",
         &[
@@ -210,7 +229,8 @@ pub(crate) struct App {
     pub(crate) menu: Option<Menu>,
     pub(crate) running: Option<RunningJob>,
     pub(crate) finished: Option<String>, // the strip's last line once a run ends
-    pending: Option<Pending>, // a test or report working in the background
+    pending: Option<Pending>, // a dry run or report working in the background
+    follow_test: bool,        // open the test job's results when its run ends
     pub(crate) message: Option<String>, // one-line feedback in the footer
     pub(crate) settings: Settings,
     pub(crate) quit: bool,
@@ -246,6 +266,7 @@ impl App {
             running: None,
             finished: None,
             pending: None,
+            follow_test: false,
             message: None,
             settings: Settings::default(),
             quit: false,
@@ -357,6 +378,14 @@ impl App {
             Some(Dialog::Input { purpose: InputFor::Backup, value }) => {
                 return format!("diskunder db backup {} --db {}", value, self.db)
             }
+            Some(Dialog::TestJob { selected, .. }) => {
+                return match selected {
+                    0 => testjob::add_command(&self.store),
+                    1 => "diskunder run test".into(),
+                    2 => "diskunder jobs show test".into(),
+                    _ => "diskunder jobs remove test --drop-index".into(),
+                }
+            }
             _ => {}
         }
         match &self.view {
@@ -368,6 +397,7 @@ impl App {
             View::Duplicates(x) => x.command(),
             View::Browse(x) => x.command(),
             View::Settings(x) => x.command(&self.settings),
+            View::Drives { .. } => "diskunder host".into(),
             View::Main => match self.selected() {
                 Selected::Job(s) => format!("diskunder run {}", s.job.name),
                 Selected::Path(p) => match &p.root {
@@ -471,6 +501,9 @@ impl App {
             self.message = Some(reason.to_string());
         }
         self.refresh();
+        if run.name == testjob::NAME && std::mem::take(&mut self.follow_test) && matches!(self.view, View::Main) && self.dialog.is_none() {
+            self.show_test_results();
+        }
     }
 
     fn run_job(&mut self) {
@@ -505,9 +538,9 @@ impl App {
         }
     }
 
-    fn test_job(&mut self) {
+    fn dry_run(&mut self) {
         let Some(job) = self.selected_job() else {
-            self.message = Some("select a job to test".into());
+            self.message = Some("select a job for a dry run".into());
             return;
         };
         let root = match fs::canonicalize(&job.path) {
@@ -517,12 +550,98 @@ impl App {
                 return;
             }
         };
-        let title = format!("Test — {} (dry run)", job.name);
+        let title = format!("Dry run — {}", job.name);
         let command = format!("diskunder run {} --dry-run", job.name);
         self.spawn_text(title, command, move || {
             let (report, warnings) = dry_run_report(&job.db, &job.path, &root, job.upsert, &job.overrides())?;
             Ok((report, warnings.iter().map(|w| format!("warn: {}", w)).collect()))
         });
+    }
+
+    // ─── The test job ────────────────────────────────────────────────────────
+
+    fn test_dialog(&self, selected: usize) -> Dialog {
+        let job = self.jobs.iter().find(|s| s.job.name == testjob::NAME);
+        let ours = job.is_some_and(|s| testjob::is_ours(&self.store, &s.job));
+        Dialog::TestJob { selected, made: ours, ran: ours && job.is_some_and(|s| s.last.is_some()), clash: job.is_some() && !ours }
+    }
+
+    fn select_test_job(&mut self) -> bool {
+        match self.jobs.iter().position(|s| s.job.name == testjob::NAME) {
+            Some(i) => {
+                self.selected = i;
+                true
+            }
+            None => {
+                self.message = Some("create the test job first".into());
+                false
+            }
+        }
+    }
+
+    fn test_step(&mut self, step: usize, made: bool, clash: bool) {
+        if clash && step != 2 {
+            self.message = Some("you have a job called test — rename or remove it to use the test job".into());
+            return;
+        }
+        match step {
+            0 if made => {
+                self.message = Some("the test job is ready — run it next".into());
+                self.dialog = Some(self.test_dialog(1));
+            }
+            0 => match testjob::create(&self.store) {
+                Ok(msg) => {
+                    self.message = Some(msg);
+                    self.refresh();
+                    self.select_test_job();
+                    self.dialog = Some(self.test_dialog(1));
+                }
+                Err(e) => self.message = Some(e),
+            },
+            1 => {
+                if made && self.select_test_job() {
+                    self.run_job();
+                    self.follow_test = self.running.as_ref().is_some_and(|r| r.name == testjob::NAME);
+                } else if !made {
+                    self.message = Some("create the test job first".into());
+                }
+            }
+            2 => {
+                if self.select_test_job() {
+                    self.show_test_results();
+                }
+            }
+            _ => {
+                if self.running.as_ref().is_some_and(|r| r.name == testjob::NAME) {
+                    self.message = Some("the test job is running — wait for it to finish".into());
+                    return;
+                }
+                let job = self.jobs.iter().find(|s| s.job.name == testjob::NAME).map(|s| s.job.clone());
+                self.message = Some(testjob::remove(&self.store, job.as_ref()).unwrap_or_else(|e| e));
+                self.refresh();
+            }
+        }
+    }
+
+    /// Latest for the test job, with what to try next
+    fn show_test_results(&mut self) {
+        if !self.select_test_job() {
+            return;
+        }
+        self.show_latest();
+        if let View::Text { title, lines, .. } = &mut self.view {
+            *title = "Test job — results".into();
+            lines.extend(
+                [
+                    "",
+                    "The sample has copies of photos in backup/ and an old copy of a project file, so try",
+                    "(Esc back first):  d duplicates · p reports · / search · b browse · y dry run",
+                    "The job skips *.tmp files and .snapshot folders — Browse shows they're not indexed.",
+                    "t then Remove deletes the test job and its sample files.",
+                ]
+                .map(String::from),
+            );
+        }
     }
 
     // ─── Views ───────────────────────────────────────────────────────────────
@@ -624,7 +743,15 @@ impl App {
         match action {
             Action::NewJob => self.dialog = Some(Dialog::Form(Form::new_job(&self.db, &self.settings))),
             Action::Run => self.run_job(),
-            Action::Test => self.test_job(),
+            Action::DryRun => self.dry_run(),
+            Action::TestJob => {
+                let next = match self.test_dialog(0) {
+                    Dialog::TestJob { made: false, .. } => 0,
+                    Dialog::TestJob { ran: false, .. } => 1,
+                    _ => 2,
+                };
+                self.dialog = Some(self.test_dialog(next));
+            }
             Action::Edit => match self.selected_job() {
                 Some(job) => self.dialog = Some(Dialog::Form(Form::edit_job(&job))),
                 None => self.message = Some("select a job to edit".into()),
@@ -685,6 +812,12 @@ impl App {
                 let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
                 self.dialog = Some(Dialog::Input { purpose: InputFor::Backup, value: format!("{}.backup-{}", self.db, stamp) });
             }
+            Action::Drives => self.view = View::Drives { mounts: mounts(), selected: 0 },
+            Action::HostInfo => {
+                let log = self.settings.get("log.folder").to_string();
+                let lines = host_info(&self.store, &self.db, &log).into_iter().map(|(k, v)| format!("{:<11} {}", k, v)).collect();
+                self.view = View::Text { title: "Host info".into(), lines, scroll: 0, command: "diskunder host".into() };
+            }
             Action::Settings(section) => {
                 self.view = View::Settings(Box::new(SettingsView::new(&self.store, &self.settings, section)));
             }
@@ -731,7 +864,8 @@ impl App {
                 Selected::Path(_) => self.act(Action::Latest),
                 Selected::Nothing => self.act(Action::NewJob),
             },
-            KeyCode::Char('t') => self.act(Action::Test),
+            KeyCode::Char('y') => self.act(Action::DryRun),
+            KeyCode::Char('t') => self.act(Action::TestJob),
             KeyCode::Char('n') => self.act(Action::NewJob),
             KeyCode::Char('e') => self.act(Action::Edit),
             KeyCode::Char('x') | KeyCode::Delete => self.act(Action::Remove),
@@ -789,6 +923,23 @@ impl App {
                     self.message = Some(msg);
                 }
                 SettingsOutcome::Message(msg) => self.message = Some(msg),
+            }
+            return;
+        }
+        if let View::Drives { mounts, selected } = &mut self.view {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(mounts.len().saturating_sub(1)),
+                KeyCode::Char('n') | KeyCode::Enter => {
+                    if let Some(m) = mounts.get(*selected) {
+                        let form = Form::new_job_at(&self.db, &self.settings, &m.point);
+                        self.view = View::Main;
+                        self.dialog = Some(Dialog::Form(form));
+                    }
+                }
+                KeyCode::Char('c') => self.copy_command(),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => self.view = View::Main,
+                _ => {}
             }
             return;
         }
@@ -853,7 +1004,13 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(runs.len().saturating_sub(1)),
                 _ => {}
             },
-            View::Status | View::Main | View::Search(_) | View::Duplicates(_) | View::Browse(_) | View::Settings(_) => {}
+            View::Status
+            | View::Main
+            | View::Search(_)
+            | View::Duplicates(_)
+            | View::Browse(_)
+            | View::Settings(_)
+            | View::Drives { .. } => {}
         }
         // Keys that open another view
         match (&self.view, key.code) {
@@ -964,6 +1121,23 @@ impl App {
                     self.dialog = Some(Dialog::Input { purpose, value });
                 }
                 _ => self.dialog = Some(Dialog::Input { purpose, value }),
+            },
+            Dialog::TestJob { selected, made, ran, clash } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.dialog = Some(Dialog::TestJob { selected: selected.saturating_sub(1), made, ran, clash })
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let selected = (selected + 1).min(TEST_STEPS.len() - 1);
+                    self.dialog = Some(Dialog::TestJob { selected, made, ran, clash })
+                }
+                KeyCode::Char(c @ '1'..='4') => self.test_step(c as usize - '1' as usize, made, clash),
+                KeyCode::Enter => self.test_step(selected, made, clash),
+                KeyCode::Char('c') => {
+                    self.dialog = Some(Dialog::TestJob { selected, made, ran, clash });
+                    self.copy_command();
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                _ => self.dialog = Some(Dialog::TestJob { selected, made, ran, clash }),
             },
             Dialog::Form(mut form) => match form.handle_key(key) {
                 FormKey::Continue => self.dialog = Some(Dialog::Form(form)),

@@ -368,7 +368,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Settings  Help                       diskUnder v5.5.3 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.5.4 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -382,13 +382,21 @@ diskunder --db /data/index.db
 ──────────────────────────────────────────────────────────────────────────────────────────────────
  projects  42%  17,304 / 41,200  /Volumes/Proj/renders/shot_041.exr
 $ diskunder run nas-nightly
-⏎ run · t test · n new · e edit · x remove · r results · m menus · c copy command · ? help · q quit
+⏎ run · y dry run · n new · e edit · x remove · r results · t test job · m menus · c copy command · ? help · q quit
 ```
 
 - **Main window:** your jobs with their last result, and paths indexed in the open database
   (`--db`) that no job covers. The right-hand pane shows the selection's details.
-- **Jobs menu** (`m`): Create… (`n`), Run (`⏎`), Test (`t` — a dry run), Edit… (`e`),
-  Status (`s` — every job), Remove… (`x` — optionally with its index).
+- **Jobs menu** (`m`): Create… (`n`), Run (`⏎`), Dry run (`y` — what a run would change),
+  Edit… (`e`), Status (`s` — every job), Remove… (`x` — optionally with its index), and
+  Test job… (`t`).
+- **Test job** (`t`): try diskunder without real data. It steps you through **creating** a job
+  named `test` over generated sample files (photos with copies in `backup/`, a hard link, a
+  film project, a temp file and a `.snapshot` folder the job's filters leave out), **running**
+  it (the results open when it finishes), **seeing the results** — then try `d`, `p`, `/` and
+  `b` on it — and **removing** the job, its index and the sample files. The files live in a
+  `test` folder beside the jobs store; a job of yours that happens to be called `test` is left
+  alone.
 - **Results menu** (`r`), for the selected job or indexed path:
   - Latest (`l`), History (`h` — `⏎` on a run shows its errors), Errors (`o`), Logs (`g` —
     the job's lines from the run log; `a` shows every run)
@@ -401,6 +409,10 @@ $ diskunder run nas-nightly
   during a run asks first, and records it as stopped by user.
 - **Database menu**, for the open database: Info, Check, Vacuum…, Drop path… (warns if a job
   uses the index), Open… (another database), Backup… (a consistent copy — see `db backup`).
+- **Host menu**: Drives & mounts — local drives and network mounts in two sections, with
+  filesystem, size, used, free and source; `n` (or `⏎`) starts a new job for the selected
+  mount. Host info — this machine, your user, CPUs, and where the jobs store, database and run
+  logs are. Both are `diskunder host` on the command line.
 - **Settings menu**: Start, Defaults, File types, Deletion, Logging — the settings below,
   edited in place (`⏎` edits or toggles, `x` puts one back to its default).
 - Outside a terminal (cron, pipes), `diskunder` with no command prints the help, as before.
@@ -460,7 +472,7 @@ always apply.
 | `diskunder jobs edit NAME` | change only what's given: `--mode`, `--path`, `--db`, `--threads`, filters |
 | `diskunder jobs remove NAME` | remove the job and its history (asks; `--yes` in scripts); `--drop-index` also removes its index |
 | `diskunder run NAME` | run it (cron-friendly); `--threads`, `--no-tui`, `--log` / `--no-log` apply to this run only |
-| `diskunder run NAME --dry-run` | test it — what it would do, without hashing or writing |
+| `diskunder run NAME --dry-run` | dry run — what it would do, without hashing or writing |
 | `diskunder run` | list the jobs |
 
 ```text
@@ -629,6 +641,8 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Interactive app — main window, Jobs / Results / Database / Settings menus | No | No | No | No | No | Yes (5.5) |
 | Settings — app start-up, job defaults, `@type` groups, log folder and rotation | No | No | No | No | No | Yes (5.5.3) |
 | `db backup` — consistent copy of an index database | No | No | No | No | No | Yes (5.5.3) |
+| Host — drives and mounts split into local / network (`diskunder host`, app Host menu) | No | No | No | No | No | Yes (5.5.4) |
+| Test job — sample data to try the app on, created and removed from the Jobs menu | No | No | No | No | No | Yes (5.5.4) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
@@ -673,9 +687,10 @@ diskunder/
 │   ├── run.rs         #   one index / update run (shared by jobs)
 │   ├── jobs.rs        #   jobs and run history
 │   ├── app/           #   the interactive app: state and keys, drawing, the job form,
-│   │                  #   Search / Duplicates / Browse, Settings view, tests
+│   │                  #   Search / Duplicates / Browse, Settings view, test job, tests
 │   ├── settings.rs    #   settings and type groups
 │   ├── maintenance.rs #   db info / drop / vacuum / check
+│   ├── host.rs        #   drives and mounts, host info
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
 ├── diskunder-macos    # Compiled macOS binary (arm64)

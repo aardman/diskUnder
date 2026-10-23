@@ -74,6 +74,13 @@ impl Form {
         f
     }
 
+    /// A new job for `path` (from Drives & mounts): the name is next to fill in
+    pub(crate) fn new_job_at(db: &str, settings: &Settings, path: &str) -> Self {
+        let mut f = Form::new_job(db, settings);
+        f.fields[PATH].value = path.to_string();
+        f
+    }
+
     fn empty(db: &str) -> Self {
         Form {
             editing: None,

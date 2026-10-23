@@ -160,6 +160,8 @@ pub(crate) enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// This machine: host details, and its drives and mounts split into local and network
+    Host,
     /// Settings: list them, or `settings set KEY VALUE` / `settings unset KEY`
     Settings {
         #[command(subcommand)]

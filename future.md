@@ -171,11 +171,11 @@ Possible actions: `flag` (mark in DB), `report` (print to stdout), `delete` (wit
 explicit confirmation prompt — never silent).
 
 ### Interactive app (TUI)
-**Done in 5.5 (5.5.1–5.5.3)** — design in [v5-plan.md](v5-plan.md). Replaces the earlier "results
+**Done in 5.5 (5.5.1–5.5.4)** — design in [v5-plan.md](v5-plan.md). Replaces the earlier "results
 browser TUI" idea with a full app: `diskunder` with no subcommand opens a main window listing
 jobs and indexed paths (with status and last-run details), and menus for **Jobs** (create,
-run, test, edit, status, remove), **Results** (latest, search, duplicates, reports, browse,
-history, errors, logs), **Database** (info, check, vacuum, drop, open, backup) and
+run, dry run, edit, status, remove, test job), **Results** (latest, search, duplicates, reports, browse,
+history, errors, logs), **Database** (info, check, vacuum, drop, open, backup), **Host** (drives & mounts, host info) and
 **Settings** (start-up, defaults, file types, deletion, logging). Every screen shows the
 equivalent CLI command. It also absorbs the dedupe "TUI selection" idea below for v6.
 

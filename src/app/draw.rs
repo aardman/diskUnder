@@ -10,7 +10,8 @@ use ratatui::{
 };
 
 use super::results::{Browse, Dups, Fields, Search};
-use super::{App, Dialog, InputFor, PathEntry, Selected, View, MENUS, REPORTS};
+use super::{App, Dialog, InputFor, PathEntry, Selected, View, MENUS, REPORTS, TEST_STEPS};
+use crate::host::{mount_rows, Mount};
 use crate::cli::display_version;
 use crate::fmt::{fmt_bytes, fmt_count, fmt_local, truncate_path};
 use crate::jobs::{fmt_secs, opt_count, status, JobSummary, RunRow};
@@ -68,6 +69,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         View::Duplicates(x) => draw_dups(f, x, rows[1]),
         View::Browse(x) => draw_browse(f, x, rows[1]),
         View::Settings(x) => x.draw(f, &app.settings, rows[1]),
+        View::Drives { mounts, selected } => draw_drives(f, mounts, *selected, rows[1]),
     }
     if strip > 0 {
         draw_strip(f, app, rows[2]);
@@ -160,8 +162,10 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
                 Line::from("Jobs are saved index / update runs."),
                 Line::from(""),
                 Line::from("  n      create a job"),
+                Line::from("  t      try the test job on sample files"),
                 Line::from("  m      open the menus (or F10)"),
                 Line::from("  ?      all keys"),
+                Line::from("  q      quit"),
             ],
         ),
     };
@@ -451,7 +455,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         "←→ menus · ↑↓ items · ⏎ choose · Esc close"
     } else {
         match &app.view {
-            View::Main => "⏎ run · t test · n new · e edit · x remove · r results · m menus · c copy command · ? help · q quit",
+            View::Main => "⏎ run · y dry run · n new · e edit · x remove · r results · t test job · m menus · c copy command · ? help · q quit",
+            View::Drives { .. } => "↑↓ select · n / ⏎ new job for this mount · c copy command · Esc back",
             View::History { .. } => "↑↓ select · ⏎ errors · c copy command · Esc back",
             View::Logs { .. } => "↑↓ PgUp PgDn scroll · a all runs · c copy command · Esc back",
             View::Search(x) if x.in_results => "↑↓ results · Tab back to the filters · c copy command · Esc back",
@@ -493,6 +498,52 @@ fn draw_menu(f: &mut Frame, open: usize, item: usize, body: Rect) {
     );
 }
 
+/// Drives & mounts: a Local section then a Network one; `selected` counts mounts only
+fn draw_drives(f: &mut Frame, mounts: &[Mount], selected: usize, area: Rect) {
+    let cells = mount_rows(mounts);
+    let mut rows: Vec<Row> = Vec::new();
+    let mut at = 0; // table row of the selection, for scrolling
+    for (title, network) in [("Local drives", false), ("Network mounts", true)] {
+        if !rows.is_empty() {
+            rows.push(Row::new(vec![""]));
+        }
+        rows.push(Row::new(vec![Span::styled(title, BOLD)]));
+        let mut any = false;
+        for (i, (m, c)) in mounts.iter().zip(&cells).enumerate().filter(|(_, (m, _))| m.network == network) {
+            any = true;
+            let style = if i == selected {
+                at = rows.len();
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            let mut c = c.clone();
+            c[0] = format!("  {}", m.point);
+            rows.push(Row::new(c).style(style));
+        }
+        if !any {
+            rows.push(Row::new(vec![Span::styled("  (none)", DIM)]));
+        }
+    }
+    let visible = area.height.saturating_sub(3) as usize;
+    let skip = at.saturating_sub(visible.saturating_sub(1));
+    let widths = [
+        Constraint::Min(24),
+        Constraint::Length(8),
+        Constraint::Length(9),
+        Constraint::Length(15),
+        Constraint::Length(9),
+        Constraint::Min(16),
+    ];
+    let header = Row::new(vec!["MOUNT", "TYPE", "SIZE", "USED", "FREE", "SOURCE"]).style(DIM);
+    f.render_widget(
+        Table::new(rows.into_iter().skip(skip), widths)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title(" Drives & mounts ")),
+        area,
+    );
+}
+
 fn centered(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
@@ -506,8 +557,9 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 "Main window",
                 "  ↑↓ / j k   select a job or path",
                 "  ⏎          run the job (or Latest for a path)",
-                "  t          test: dry run of the job",
+                "  y          dry run: what the job would change",
                 "  n / e / x  new, edit, remove a job",
+                "  t          test job: try diskunder on sample files",
                 "  s          status of every job",
                 "  l h o g    latest · history · errors · logs",
                 "  r          Results menu    m / F10  menus",
@@ -631,6 +683,29 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 .block(Block::default().borders(Borders::ALL).title(" Remove job ")),
                 area,
             );
+        }
+        Dialog::TestJob { selected, made, ran, clash } => {
+            let done = [*made, *ran, false, false];
+            let mut lines: Vec<Line> = vec![
+                Line::from("A job over generated sample files, to see diskunder work without real data."),
+                Line::from(""),
+            ];
+            for (i, ((label, about), done)) in TEST_STEPS.iter().zip(done).enumerate() {
+                let style = if i == *selected { Style::new().bg(Color::Cyan).fg(Color::Black) } else { Style::new() };
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {} {}  {:<12}", i + 1, if done { "✓" } else { " " }, label), style),
+                    Span::styled(format!(" {}", about), DIM),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(if *clash {
+                Line::from(Span::styled("You already have a job called test — rename or remove it first.", Style::new().fg(Color::Yellow)))
+            } else {
+                Line::from(Span::styled("↑↓ step · ⏎ do it (or 1–4) · c copy command · Esc close", DIM))
+            });
+            let area = centered(96, lines.len() as u16 + 2, area);
+            f.render_widget(Clear, area);
+            f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Test job ")), area);
         }
         Dialog::Form(form) => {
             let height = form.fields.len() as u16 * 2 + 5;

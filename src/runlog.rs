@@ -208,7 +208,7 @@ fn fmt_duration(d: Duration) -> String {
 }
 
 /// cron usually sets LOGNAME but not USER; USERNAME covers Windows
-fn user() -> String {
+pub(crate) fn user() -> String {
     ["USER", "LOGNAME", "USERNAME"]
         .iter()
         .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))
@@ -216,7 +216,7 @@ fn user() -> String {
 }
 
 #[cfg(unix)]
-fn host() -> String {
+pub(crate) fn host() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: buf is valid for buf.len() bytes, and gethostname writes at most that many
     let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
@@ -228,6 +228,6 @@ fn host() -> String {
 }
 
 #[cfg(not(unix))]
-fn host() -> String {
+pub(crate) fn host() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string())
 }

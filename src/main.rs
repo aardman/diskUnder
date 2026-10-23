@@ -7,6 +7,7 @@ mod db;
 mod dryrun;
 mod filters;
 mod fmt;
+mod host;
 mod jobs;
 mod maintenance;
 mod output;
@@ -88,6 +89,7 @@ fn main() {
                 run_jobs_command(&store, cmd, &log_args)
             }
         }
+        Command::Host => host::run_host_command(&store, &db, settings.get("log.folder")),
         Command::Settings { action } => {
             let cmd = match action {
                 None => SettingsCommand::List,

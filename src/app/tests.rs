@@ -112,7 +112,7 @@ fn setup() -> (Tmp, App) {
 fn main_window_lists_jobs_and_paths_with_no_job() {
     let (t, app) = setup();
     let s = screen(&app);
-    assert!(s.contains("Jobs  Results  Database  Settings  Help"), "{}", s);
+    assert!(s.contains("Jobs  Results  Database  Host  Settings  Help"), "{}", s);
     assert!(s.contains("nightly") && s.contains("– never run"), "{}", s);
     assert!(s.contains("Indexed paths with no job") && s.contains("/other  index "), "long paths shortened from the left:\n{}", s);
     assert!(app.paths.iter().any(|p| p.root.as_ref().is_some_and(|r| r.root == t.s("other"))));
@@ -144,14 +144,89 @@ fn running_a_job_from_the_app() {
 }
 
 #[test]
-fn testing_a_job_shows_the_dry_run() {
+fn dry_run_of_a_job() {
     let (_t, mut app) = setup();
-    press(&mut app, &[KeyCode::Char('t')]);
+    press(&mut app, &[KeyCode::Char('y')]);
     settle(&mut app);
     let s = screen(&app);
-    assert!(s.contains("Test — nightly (dry run)") && s.contains("Would hash       3 files"), "{}", s);
+    assert!(s.contains("Dry run — nightly") && s.contains("Would hash       3 files"), "{}", s);
     assert!(s.contains("$ diskunder run nightly --dry-run"), "{}", s);
-    assert!(job_history(&app.store, "nightly", None).unwrap().is_empty(), "a test isn't a run");
+    assert!(job_history(&app.store, "nightly", None).unwrap().is_empty(), "a dry run isn't a run");
+}
+
+#[test]
+fn test_job_is_created_run_shown_and_removed() {
+    let (t, mut app) = setup();
+    press(&mut app, &[KeyCode::Char('t')]);
+    let s = screen(&app);
+    assert!(s.contains(" Test job ") && s.contains("1    Create") && s.contains("4    Remove"), "{}", s);
+    assert!(app.command().starts_with("diskunder jobs add test update ") && app.command().contains("--exclude-path .snapshot"));
+
+    press(&mut app, &[KeyCode::Enter]); // Create
+    let folder = t.path("store/test");
+    assert!(folder.join("share/backup/img1.jpg").exists() && folder.join(".diskunder-test").exists());
+    assert!(app.jobs.iter().any(|s| s.job.name == "test"), "{:?}", app.message);
+    assert!(matches!(app.dialog, Some(Dialog::TestJob { selected: 1, made: true, ran: false, .. })), "on to Run");
+    assert!(screen(&app).contains("1 ✓  Create"));
+
+    press(&mut app, &[KeyCode::Enter]); // Run
+    assert!(app.running.is_some(), "{:?}", app.message);
+    settle(&mut app);
+    let s = screen(&app);
+    assert!(s.contains("Test job — results") && s.contains("d duplicates"), "the results open when it ends:\n{}", s);
+    assert!(s.contains("excluded    1 files, 1 folders skipped") && s.contains("duplicates  3 groups"), "the tmp file and the snapshot are left out:\n{}", s);
+
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('d')]);
+    settle(&mut app);
+    let s = screen(&app);
+    assert!(s.contains("img1.jpg") && s.contains("edit.prproj"), "copies show as duplicates:\n{}", s);
+
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('t')]);
+    assert!(matches!(app.dialog, Some(Dialog::TestJob { selected: 2, ran: true, .. })), "reopens at See results");
+    press(&mut app, &[KeyCode::Char('4')]); // Remove
+    assert!(!folder.exists() && !app.jobs.iter().any(|s| s.job.name == "test"), "{:?}", app.message);
+    assert!(app.jobs.iter().any(|s| s.job.name == "nightly"), "other jobs are untouched");
+}
+
+#[test]
+fn a_job_of_yours_called_test_is_left_alone() {
+    let (t, mut app) = setup();
+    let settings = JobSettings { upsert: None, path: Some(&t.s("other")), db: None, threads: None, overrides: Overrides::default() };
+    create_job(&app.store, "test", &settings).unwrap();
+    app.refresh();
+    press(&mut app, &[KeyCode::Char('t')]);
+    assert!(screen(&app).contains("You already have a job called test"));
+    press(&mut app, &[KeyCode::Char('4')]);
+    assert!(app.jobs.iter().any(|s| s.job.name == "test") && t.path("other/a.txt").exists());
+    assert!(app.message.as_deref().unwrap_or("").contains("rename or remove it"));
+}
+
+#[test]
+fn host_menu_shows_drives_and_host_info() {
+    let (_t, mut app) = setup();
+    press(&mut app, &[KeyCode::Char('m'), KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Enter]); // Host → Drives & mounts
+    let s = screen(&app);
+    assert!(s.contains("Drives & mounts") && s.contains("Local drives") && s.contains("Network mounts"), "{}", s);
+    assert!(s.contains("MOUNT") && s.contains("FREE"), "{}", s);
+    assert_eq!(app.command(), "diskunder host");
+    let View::Drives { mounts, .. } = &app.view else { panic!("not the drives view") };
+    let first = mounts[0].point.clone();
+    press(&mut app, &[KeyCode::Char('n')]);
+    match &app.dialog {
+        Some(Dialog::Form(f)) => assert_eq!(f.fields[2].value, first, "n starts a job for the mount"),
+        _ => panic!("no form"),
+    }
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Down, KeyCode::Enter]);
+    let s = screen(&app);
+    assert!(s.contains("Host info") && s.contains("jobs store") && s.contains("diskunder.db"), "{}", s);
+}
+
+#[test]
+fn welcome_lists_the_basics() {
+    let t = Tmp::new();
+    let app = App::new(t.path("store/diskunder.db"), &t.s("index.db"), None, true);
+    let s = screen(&app);
+    assert!(s.contains("t      try the test job") && s.contains("q      quit"), "{}", s);
 }
 
 #[test]
@@ -209,7 +284,7 @@ fn menus_open_views() {
     press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
     assert!(matches!(app.view, View::Status));
     assert!(screen(&app).contains("Status — all jobs"));
-    press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Enter]); // Database → Info
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Enter]); // Database → Info
     settle(&mut app);
     assert!(screen(&app).contains("database: "), "{}", screen(&app));
     press(&mut app, &[KeyCode::Esc, KeyCode::Char('?')]);
