@@ -2,6 +2,8 @@
 
 A command-line tool for indexing file metadata and detecting duplicate files/folders across a filesystem or network share — a CLI equivalent of [DiskOver](https://diskoverdata.com/). File metadata is stored in a local SQLite database, enabling fast queries for duplicates, large files, and directory summaries.
 
+![The diskunder app: the Jobs menu open over the welcome pane](images/diskunder-screen.jpg)
+
 ---
 
 ## How It Works
@@ -423,6 +425,8 @@ diskunder --db /data/index.db
 $ diskunder run nas-nightly
 ⏎ run · y dry run · n new · e edit · x remove · r results · t test job · m menus · c copy command · ? help · q quit
 ```
+
+![The Duplicates view on the test job: groups by wasted space, and the selected group's copies](images/diskunder-duplicates.jpg)
 
 - **Main window:** your jobs with their last result, and paths indexed in the open database
   (`--db`) that no job covers. The right-hand pane shows the selection's details.
