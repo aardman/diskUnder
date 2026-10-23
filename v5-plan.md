@@ -414,6 +414,9 @@ same store holds the 5.5 settings.
 
 ## 5.5 — Interactive app (TUI)
 
+**5.5.1 done:** main window, Jobs menu, and Results' run views (Latest, History, Errors, Logs).
+Next: 5.5.2 (Search, Duplicates, Reports, Browse), 5.5.3 (Database and Settings).
+
 `diskunder` with no subcommand, in a terminal, opens a full-screen app. With a subcommand,
 piped or from cron, nothing changes. It's a front end to 5.0–5.4: every screen runs the same
 code as a CLI command, and shows that command so it can be copied into a script, cron line

@@ -54,23 +54,46 @@ impl FileRow {
     }
 }
 
-/// Buffered stdout that exits quietly when the reader goes away (e.g. `| head`)
-pub(crate) struct Out(BufWriter<Stdout>);
+/// Buffered stdout that exits quietly when the reader goes away (e.g. `| head`) — or a
+/// text buffer, for output the interactive app shows itself
+pub(crate) enum Out {
+    Stdout(BufWriter<Stdout>),
+    Buffer(String),
+}
 
 impl Out {
     pub(crate) fn new() -> Self {
-        Out(BufWriter::new(io::stdout()))
+        Out::Stdout(BufWriter::new(io::stdout()))
+    }
+
+    pub(crate) fn buffer() -> Self {
+        Out::Buffer(String::new())
+    }
+
+    /// What was written to a buffer (empty for stdout)
+    pub(crate) fn into_text(self) -> String {
+        match self {
+            Out::Buffer(s) => s,
+            Out::Stdout(_) => String::new(),
+        }
     }
 
     pub(crate) fn write(&mut self, s: &str) {
-        if let Err(e) = self.0.write_all(s.as_bytes()) {
-            Self::fail(e);
+        match self {
+            Out::Stdout(w) => {
+                if let Err(e) = w.write_all(s.as_bytes()) {
+                    Self::fail(e);
+                }
+            }
+            Out::Buffer(b) => b.push_str(s),
         }
     }
 
     pub(crate) fn flush(&mut self) {
-        if let Err(e) = self.0.flush() {
-            Self::fail(e);
+        if let Out::Stdout(w) = self {
+            if let Err(e) = w.flush() {
+                Self::fail(e);
+            }
         }
     }
 

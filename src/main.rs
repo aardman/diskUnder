@@ -1,6 +1,7 @@
 // diskUnder — file indexer with live TUI progress, duplicate detection and database maintenance
 // See changes.md for full change history
 
+mod app;
 mod cli;
 mod db;
 mod dryrun;
@@ -19,8 +20,8 @@ mod scan;
 mod search;
 mod tui;
 
-use clap::Parser;
-use std::fs;
+use clap::{CommandFactory, Parser};
+use std::{fs, io::IsTerminal};
 
 use crate::cli::{Cli, Command, JobsAction, Mode};
 use crate::dryrun::run_dry_run;
@@ -37,7 +38,15 @@ fn main() {
     let log_args = LogArgs { log: args.log.clone(), no_log: args.no_log, no_tui: args.no_tui };
     let store = store_path(args.config_db.as_deref());
 
-    let code = match &args.cmd {
+    let Some(cmd) = &args.cmd else {
+        // No command: the interactive app — only in a terminal; otherwise, the help
+        if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+            std::process::exit(app::run_app(store, &db, args.log.clone(), args.no_log));
+        }
+        let _ = Cli::command().print_help();
+        std::process::exit(2);
+    };
+    let code = match cmd {
         Command::Index { path, dry_run, types } => index(&args, &db, false, path, *dry_run, types.overrides()),
         Command::Update { path, dry_run, types } => index(&args, &db, true, path, *dry_run, types.overrides()),
         Command::Jobs { action } => {

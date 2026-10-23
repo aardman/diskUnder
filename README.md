@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 0.5.4`:
+**Check it worked** — this should print `diskunder 5.5.1`:
 
 ```bash
 diskunder --version
@@ -357,6 +357,49 @@ duplicate groups and wasted space count hard links as one copy.
 
 ---
 
+## Interactive app
+
+Run `diskunder` with no command, in a terminal, to open the app — a front end to jobs and
+their results. Every screen shows its equivalent command in the footer (`c` copies it), so
+anything you do here can go into a script or cron line.
+
+```bash
+diskunder --db /data/index.db
+```
+
+```text
+ Jobs  Results  Database  Settings  Help                       diskUnder v5.5.1 · /data/index.db
+┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
+│▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
+│  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
+│  photos         – never run           ││database  /data/index.db                             │
+│                                       ││filters   exclude log,tmp · exclude .snapshot        │
+│  Indexed paths with no job            ││                                                     │
+│  /Volumes/Archive  index 2026-10-03   ││last run  2026-10-23 02:00, completed in 14m33s      │
+│                                       ││  772,087 files · 137 written · 12 removed           │
+│                                       ││duplicates  1,408 groups · 3.2 GB wasted             │
+└───────────────────────────────────────┘└─────────────────────────────────────────────────────┘
+──────────────────────────────────────────────────────────────────────────────────────────────────
+ projects  42%  17,304 / 41,200  /Volumes/Proj/renders/shot_041.exr
+$ diskunder run nas-nightly
+⏎ run · t test · n new · e edit · x remove · r results · m menus · c copy command · ? help · q quit
+```
+
+- **Main window:** your jobs with their last result, and paths indexed in the open database
+  (`--db`) that no job covers. The right-hand pane shows the selection's details.
+- **Jobs menu** (`m`): Create… (`n`), Run (`⏎`), Test (`t` — a dry run), Edit… (`e`),
+  Status (`s` — every job), Remove… (`x` — optionally with its index).
+- **Results menu** (`r`): Latest (`l`), History (`h` — `⏎` on a run shows its errors),
+  Errors (`o`), Logs (`g` — the job's lines from the run log; `a` shows every run).
+- **Runs carry on in the bottom strip** while you use the menus — one at a time. Quitting
+  during a run asks first, and records it as stopped by user.
+- Outside a terminal (cron, pipes), `diskunder` with no command prints the help, as before.
+
+The Database and Settings menus, and Search, Duplicates, Reports and Browse under Results,
+arrive in the next 5.5 steps — the command line has all of them already.
+
+---
+
 ## Jobs
 
 Save a run's settings under a name, then run it by name — from cron, or by hand — and keep a
@@ -546,7 +589,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Include / exclude file types — `--include-ext`, `--exclude-ext`, stored per path | No | No | No | No | No | Yes (5.2) |
 | Ignore — exclude paths by `.gitignore`-style pattern, with exceptions; excluded folders never entered | No | No | No | No | No | Yes (5.3) |
 | Jobs — named, saved runs: `jobs add/list/show/edit/remove`, `run NAME`, run history (menu in 5.5) | No | No | No | No | No | Yes (5.4) |
-| Interactive app — main window plus Jobs / Results / Database / Settings menus | No | No | No | No | No | Planned (5.5) |
+| Interactive app — main window, Jobs and Results menus (more Results, Database and Settings to follow) | No | No | No | No | No | Partly (5.5.1) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
@@ -561,7 +604,7 @@ The project was developed in multiple languages, each addressing the limitations
 - **Rust v2:** All known bugs fixed, plain-text output only
 - **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
 - **Rust v4:** Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
-- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters, 5.4 adds jobs; the rest is planned in [v5-plan.md](v5-plan.md)
+- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters, 5.4 adds jobs, 5.5 the interactive app (in steps); the rest is planned in [v5-plan.md](v5-plan.md)
 
 Only the current Rust version is kept in this repository; the earlier versions were not committed.
 
@@ -590,6 +633,7 @@ diskunder/
 │   ├── filters.rs     #   file-type and path filters
 │   ├── run.rs         #   one index / update run (shared by jobs)
 │   ├── jobs.rs        #   jobs and run history
+│   ├── app/           #   the interactive app: state and keys, drawing, the job form, tests
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)

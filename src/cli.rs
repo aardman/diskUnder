@@ -8,10 +8,11 @@ use crate::query::{parse_ext_list, parse_size, ExtList, FilterArgs, SortKey};
 use crate::report::{parse_age_arg, Age, StaleBy};
 
 #[derive(Parser)]
-#[command(name = "diskunder", about = "File indexer with live TUI progress", version)]
+#[command(name = "diskunder", about = "File indexer: duplicates, search, reports and saved jobs. Run with no command, in a terminal, for the interactive app", version)]
 pub(crate) struct Cli {
+    /// With no command, in a terminal: the interactive app
     #[command(subcommand)]
-    pub(crate) cmd: Command,
+    pub(crate) cmd: Option<Command>,
 
     /// SQLite database file, created if absent [default: fileindex.db]
     #[arg(long, global = true, value_name = "FILE")]
@@ -321,7 +322,8 @@ impl Cli {
     }
 }
 
-/// "0.4.1" → "4.1": the project numbers releases v1, v2, … while the crate stays at 0.x
+/// The release number, e.g. "5.5.1". (Up to v5.4 the crate version was 0.x — "0.5.4" was
+/// v5.4; from 5.5.1 it is the release number itself.)
 pub(crate) fn display_version() -> &'static str {
-    env!("CARGO_PKG_VERSION").trim_start_matches("0.")
+    env!("CARGO_PKG_VERSION")
 }

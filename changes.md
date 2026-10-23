@@ -1,5 +1,40 @@
 # diskUnder — Change Log
 
+## v5.5.1 — interactive app: main window, Jobs and Results
+
+`diskunder` with no command, in a terminal, opens the app (outside a terminal it prints the
+help, as before). Every screen shows its equivalent command in the footer; `c` copies it
+(pbcopy / wl-copy / xclip, else the terminal's OSC 52).
+
+- **Main window:** jobs with their last result (✓ completed, ✗ failed, ● running, – never),
+  then paths indexed in the open database (`--db`) that no job covers. The details pane shows
+  the selected job's settings, last run (counts, errors, duplicates) and previous results, or
+  the selected path's index.
+- **Jobs menu:** Create… and Edit… (a form, checked with the same rules as the command line),
+  Run, Test (the dry run, on its own thread so the screen stays responsive), Status (every
+  job), Remove… (optionally with its index).
+- **Results menu:** Latest (every count and the errors of the last run), History (every run;
+  ⏎ shows a run's errors), Errors, Logs (the job's lines from the run log, `a` for all).
+- **Runs happen in the background,** with progress in a strip at the bottom, while you keep
+  using the menus — one at a time. They're recorded in the job's history and the run log
+  (`run NAME [app]`) exactly like `diskunder run NAME`. Quitting during a run asks first and
+  records it as stopped by user.
+- The Database and Settings menus point to the command line until 5.5.3.
+
+**Version numbers:** from this release the program's version is the release number itself —
+`diskunder --version` prints `diskunder 5.5.1` (up to v5.4 it printed 0.x, e.g. `0.5.4`).
+
+**Internals:** starting and finishing a run are separate steps (`run.rs`), so the app can run
+one in the background; the jobs module now has a data layer the CLI and the app share; the
+dry run can return its report as text; output can go to a buffer as well as stdout.
+
+**Tests:** 98 in total (was 90): 8 app tests that drive it with key presses and read the
+screen from ratatui's test backend — main window, running a job to completion, testing,
+creating and editing through the form (with validation), removing with the index, menus,
+paths with no job — plus a unit test for the clipboard encoding.
+
+---
+
 ## v5.4 — jobs
 
 ### `jobs` and `run`

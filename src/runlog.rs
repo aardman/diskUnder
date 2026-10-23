@@ -45,17 +45,17 @@ impl RunLog {
         }
     }
 
+    /// Start, recording this process's command line
     pub(crate) fn start(&mut self) {
+        let command: Vec<String> = std::env::args().skip(1).map(|a| shell_quote(&a)).collect();
+        self.start_as(&command.join(" "));
+    }
+
+    /// Start, recording `command` — for runs started from the app, which has no command line
+    pub(crate) fn start_as(&mut self, command: &str) {
         self.rotate_if_large();
         self.started = Instant::now();
-        let command: Vec<String> = std::env::args().skip(1).map(|a| shell_quote(&a)).collect();
-        let line = format!(
-            "{}  (user={} host={} version={})",
-            command.join(" "),
-            user(),
-            host(),
-            display_version()
-        );
+        let line = format!("{}  (user={} host={} version={})", command, user(), host(), display_version());
         self.write("start", &line);
     }
 

@@ -89,7 +89,16 @@ fn plural(n: i64, word: &str) -> String {
     format!("{} {}{}", fmt_count(n), word, if n == 1 { "" } else { "s" })
 }
 
-fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, overrides: &Overrides) -> Result<(), String> {
+/// Writes the report to `out`; traversal warnings go to `warnings`
+fn dry_run(
+    db_path: &str,
+    typed: &str,
+    root: &str,
+    upsert: bool,
+    overrides: &Overrides,
+    out: &mut Out,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
     let mode = if upsert { "update" } else { "index" };
     let (mut indexed, recorded, mut notes) = load_indexed(db_path, typed, root)?;
     // Same rule as the real run: command-line filters replace stored ones of the same kind
@@ -158,11 +167,11 @@ fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, overrides: &Ove
                     (Some(p), Some(list)) => list.push(p.to_owned()),
                     _ => unreadable = None,
                 }
-                eprintln!(
-                    "warn: {} — {}",
+                warnings.push(format!(
+                    "{} — {}",
                     err.path().map(|p| p.display().to_string()).unwrap_or_default(),
                     err
-                );
+                ));
             }
         }
     }
@@ -246,7 +255,6 @@ fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, overrides: &Ove
             format!("{} — rows under {} are kept", plural(errors, "folder"), if errors == 1 { "it" } else { "them" }),
         ));
     }
-    let mut out = Out::new();
     out.write(&format!("Dry run — {} {} (nothing hashed or written)\n", mode, root));
     for note in &notes {
         out.write(&format!("  note: {}\n", note));
@@ -259,9 +267,8 @@ fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, overrides: &Ove
         out.write(&format!("  {}\n", note));
     }
 
-    write_types(&mut out, "Would hash, by type", by_type, hash.bytes);
-    write_types(&mut out, "Excluded by filters, by type", excluded_by_type, excluded.bytes);
-    out.flush();
+    write_types(out, "Would hash, by type", by_type, hash.bytes);
+    write_types(out, "Excluded by filters, by type", excluded_by_type, excluded.bytes);
     Ok(())
 }
 
@@ -292,11 +299,32 @@ fn write_types(out: &mut Out, title: &str, by_type: HashMap<String, Tally>, tota
 
 /// `typed` is the path as given; `root` its canonical form
 pub(crate) fn run_dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, filter: &Overrides) -> i32 {
-    match dry_run(db_path, typed, root, upsert, filter) {
+    let mut out = Out::new();
+    let mut warnings = Vec::new();
+    let result = dry_run(db_path, typed, root, upsert, filter, &mut out, &mut warnings);
+    for w in &warnings {
+        eprintln!("warn: {}", w);
+    }
+    out.flush();
+    match result {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("error: {}", e);
             1
         }
     }
+}
+
+/// The dry-run report as text, with any traversal warnings — for the interactive app
+pub(crate) fn dry_run_report(
+    db_path: &str,
+    typed: &str,
+    root: &str,
+    upsert: bool,
+    filter: &Overrides,
+) -> Result<(String, Vec<String>), String> {
+    let mut out = Out::buffer();
+    let mut warnings = Vec::new();
+    dry_run(db_path, typed, root, upsert, filter, &mut out, &mut warnings)?;
+    Ok((out.into_text(), warnings))
 }
