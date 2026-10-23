@@ -7,6 +7,7 @@ use std::{
     path::Path,
 };
 
+use crate::db::lock_db;
 use crate::cli::DbAction;
 use crate::db::{db_file_bytes, file_tables, load_roots, table_disk_bytes, table_duplicates, table_exists, table_name_for};
 use crate::fmt::{fmt_bytes, fmt_count, fmt_local};
@@ -66,6 +67,14 @@ fn db_info(conn: &Connection, db_path: &str, out: &mut Out) -> DbResult<()> {
                 }
                 if !r.filter.paths.is_empty() {
                     w!(out, "  paths       {}", r.filter.paths.describe());
+                }
+                if let Some(v) = &r.volume {
+                    w!(out, "  volume      {}  ({})", v.id, v.path);
+                    for (other, o) in &roots {
+                        if other.as_str() != t.as_str() && o.volume.as_ref().is_some_and(|ov| crate::volume::overlaps(ov, v)) {
+                            w!(out, "  overlaps    {} — same files; duplicates count them once", o.root);
+                        }
+                    }
                 }
             }
             None => w!(out, 
@@ -192,6 +201,7 @@ fn logged(runlog: &mut RunLog, action: impl FnOnce() -> Result<String, String>) 
 pub(crate) fn drop_table(db_path: &str, table: &str, runlog: &mut RunLog) -> Result<String, String> {
     let conn = open_existing(db_path)?;
     let target = resolve_drop(&conn, None, Some(table))?;
+    let _lock = lock_db(db_path, "diskunder db drop [app]")?;
     logged(runlog, || perform_drop(&conn, &target))
 }
 
@@ -203,6 +213,7 @@ pub(crate) fn drop_index(db_path: &str, root: &str, runlog: &mut RunLog) -> Resu
     }
     let conn = Connection::open(db_path).map_err(|e| format!("{}: {}", db_path, e))?;
     let target = resolve_drop(&conn, Some(root), None)?;
+    let _lock = lock_db(db_path, "diskunder jobs remove --drop-index")?;
     logged(runlog, || perform_drop(&conn, &target))
 }
 
@@ -232,6 +243,7 @@ pub(crate) fn check_text(db_path: &str) -> Result<(String, bool), String> {
 /// `db vacuum`, logged — for the app
 pub(crate) fn vacuum(db_path: &str, runlog: &mut RunLog) -> Result<String, String> {
     let conn = open_existing(db_path)?;
+    let _lock = lock_db(db_path, "diskunder db vacuum [app]")?;
     logged(runlog, || perform_vacuum(&conn, db_path).map_err(|e| e.to_string()))
 }
 
@@ -297,7 +309,6 @@ fn db_check(conn: &Connection, out: &mut Out) -> DbResult<bool> {
     Ok(problems.is_empty())
 }
 
-/// Runs a `db` action; returns the process exit code
 /// Runs a `db` action; returns the process exit code. Only `drop` and `vacuum` change the
 /// database, so only they are logged.
 pub(crate) fn run_db_command(db_path: &str, action: &DbAction, runlog: &mut RunLog) -> i32 {
@@ -316,11 +327,11 @@ pub(crate) fn run_db_command(db_path: &str, action: &DbAction, runlog: &mut RunL
     let mut out = Out::new();
     let result = match action {
         DbAction::Info => db_info(&conn, db_path, &mut out).map_err(|e| e.to_string()),
-        DbAction::Drop { path, table, yes } => {
-            db_drop(&conn, path.as_deref(), table.as_deref(), *yes, runlog)
-        }
-        DbAction::Vacuum => logged(runlog, || perform_vacuum(&conn, db_path).map_err(|e| e.to_string()))
-            .map(|summary| println!("{}", summary)),
+        DbAction::Drop { path, table, yes } => lock_db(db_path, "diskunder db drop")
+            .and_then(|_lock| db_drop(&conn, path.as_deref(), table.as_deref(), *yes, runlog)),
+        DbAction::Vacuum => lock_db(db_path, "diskunder db vacuum").and_then(|_lock| {
+            logged(runlog, || perform_vacuum(&conn, db_path).map_err(|e| e.to_string())).map(|summary| println!("{}", summary))
+        }),
         DbAction::Check => match db_check(&conn, &mut out) {
             Ok(true) => Ok(()),
             Ok(false) => {

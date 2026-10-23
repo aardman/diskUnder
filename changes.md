@@ -1,5 +1,30 @@
 # diskUnder — Change Log
 
+## v5.6.0 — duplicates across shares and servers
+
+### Volume identity
+
+Every run records the volume its path is on — `smb://server/share`, `nfs://server/export`,
+`uuid:…` for a Linux disk, `local://host/dev/…` for a macOS disk — and where the path is
+inside it (schema 4: `volume` and `volume_path` on `roots`; older paths get theirs on their
+next run).
+
+Copies are now counted by volume and inode (before: device and inode, which differ from one
+machine or mount to the next). So the same file reached through two mounts, or held by two
+overlapping indexed paths, is one copy — before, it could show as a duplicate of itself.
+Duplicate lists mark it `(same file, another mount)`. A run whose path overlaps one already
+indexed says so; `db info` shows each path's volume and overlaps.
+
+### One run at a time per database
+
+Index and update runs, `db drop` and `db vacuum` hold a lock on `<db>.lock`. A second is
+refused straight away with who holds it, instead of failing part-way with SQLite's "database
+is locked". Reading is never blocked; the lock goes when the process ends, however it ends.
+
+### App
+
+- **Duplicates:** `a` switches between the selected job or path and every path in its database.
+
 ## v5.5.6 — browse drives for a job; clearer last-run strip
 
 - **Drives & mounts:** `⏎` browses into a mount's folders (`⌫` / `←` back up; up from the
@@ -337,7 +362,7 @@ argument rules.
 
 ## v5.0 — search, export and a run log
 
-First of the small v5 releases (plan: [v5-plan.md](v5-plan.md)).
+First of the small v5 releases.
 
 ### `search`
 

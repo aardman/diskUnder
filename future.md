@@ -2,11 +2,37 @@
 
 Inspired by feature parity with [Diskover](https://diskoverdata.com/). Items are grouped by effort and value. None of these are commitments — just ideas worth revisiting.
 
-**Planned for v5** (small releases — see [v5-plan.md](v5-plan.md) for design, schema changes
-and sizing): 5.0 run log, `search` and `export` (**done**) · 5.1 `report` with duplicate filtering (**done**) · 5.2
+**Done in v5** (small releases — see [changes.md](changes.md)): 5.0 run log, `search` and `export` (**done**) · 5.1 `report` with duplicate filtering (**done**) · 5.2
 include/exclude file types and `--dry-run` preview (**done**) · 5.3 path patterns (Ignore) (**done**) · 5.4 Jobs (**done**) ·
 5.5 interactive app (TUI) (**done**). **Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
 original ideas.
+
+### Plan for large estates (hundreds of TB, 10–20 servers)
+
+Decided October 2026: **one shared index database**, runs one at a time (never two jobs on
+the same mount at once). Comparing several databases at query time (SQLite `ATTACH`, about
+10 at once by default) and runs at the same time are left until someone asks for them.
+
+- **5.6 (done):** volume identity per indexed path, so one share reached through different
+  mounts or machines — or overlapping indexed paths — isn't counted as duplicates of itself;
+  one run per database (a lock with a clear message); all-paths Duplicates in the app.
+- **5.7 — read less:** `index` hashes every byte today, which at this scale is days to weeks
+  over the network. Instead, hash only files whose size another file shares (across every
+  share, which one database makes possible), first a quick hash of the start and end, and a
+  full hash only for those still matching — typically 70–95% less reading. A file's checksum
+  stays empty until another of its size appears. Then a duplicate summary table (checksum →
+  copies, size) kept up to date by each run, so duplicate reports stay instant over hundreds
+  of millions of rows — measured first on a synthetic index of about 50 million rows.
+- **v6 — quarantine, then dedupe:** volume identity decides what's possible. Copies on the
+  same filesystem can share blocks (Linux `FIDEDUPERANGE` on XFS / Btrfs, run on the server:
+  the kernel checks the bytes match before sharing them, so a changed file is never touched)
+  or be hard-linked; copies on different volumes can only be kept once and the rest
+  quarantined. The reflink section below should say `FIDEDUPERANGE`, not `FICLONE`, for
+  existing files.
+- **Access times:** on Linux (`relatime`) a full `index` sets each file's access time as it
+  reads it; `update` doesn't read unchanged files. `O_NOATIME` would prevent it for files the
+  indexing user owns (or when run as root). macOS local disks don't change; NFS / SMB depend
+  on the server — being tested.
 
 ---
 
@@ -76,7 +102,7 @@ diskunder update /nas                       # reuses the filters stored for /nas
 diskunder index /nas --dry-run --exclude-ext tmp   # preview counts by type, no hashing
 ```
 
-**Assessment** (full version in [v5-plan.md](v5-plan.md), release 5.2): the
+**Assessment** (done in release 5.2): the
 filter itself is a one-line check during the walk. The real work is consistency:
 
 - filters are stored per path (in `roots`) so `update` reuses them
@@ -171,7 +197,7 @@ Possible actions: `flag` (mark in DB), `report` (print to stdout), `delete` (wit
 explicit confirmation prompt — never silent).
 
 ### Interactive app (TUI)
-**Done in 5.5 (5.5.1–5.5.4)** — design in [v5-plan.md](v5-plan.md). Replaces the earlier "results
+**Done in 5.5 (5.5.1–5.5.6)**. Replaces the earlier "results
 browser TUI" idea with a full app: `diskunder` with no subcommand opens a main window listing
 jobs and indexed paths (with status and last-run details), and menus for **Jobs** (create,
 run, dry run, edit, status, remove, test job), **Results** (latest, search, duplicates, reports, browse,
@@ -185,12 +211,44 @@ equivalent CLI command. It also absorbs the dedupe "TUI selection" idea below fo
 
 **Planned for v6, in this order:** quarantine (with manifest, `purge`, `restore` and a
 `status` column), then `dedupe` built on it, with `--dry-run`. Default copy to keep: the
-oldest modified. The `dedupe` design is in [v5-plan.md](v5-plan.md#deferred-to-v6--quarantine-then-dedupe).
+oldest modified. The `dedupe` design is [below](#dedupe-command--design).
 
 Deletion is the most dangerous operation the tool could perform, especially on a network
 share where mistakes are hard to reverse. All deletion features should be off by default
 and require an explicit flag or confirmation step. The options below are roughly ordered
 from safest to most aggressive.
+
+### `dedupe` command — design
+
+Worked out during v5, for v6:
+
+```text
+diskunder dedupe /nas --dry-run
+diskunder dedupe /nas --dry-run --min-size 500MB --remove-under /nas/backup
+diskunder dedupe /nas --dry-run --keep newest --plan dedupe-plan.csv
+```
+
+```text
+render.mov — 1.6 GB × 3 copies
+  KEEP    /nas/projects/2024/final/render.mov     modified 2024-11-01
+  REMOVE  /nas/backup/render.mov                  modified 2023-06-14
+  REMOVE  /nas/temp/render.mov                    modified 2023-06-14
+
+Would remove 2 files, freeing 3.2 GB (dry run — nothing was changed)
+```
+
+- **Choosing the copy to keep:** `--keep oldest` (**default** — earliest modified, usually
+  the original) `| newest | shortest-path | first-path`; `--keep-under PATH` prefers copies
+  there.
+- **Limiting removals:** `--remove-under PATH` only ever proposes removing copies under PATH
+  (e.g. backup folders); the 5.1 duplicate filters apply too.
+- **Hard links:** paths sharing a device and inode are one copy. A hard link to the kept copy
+  is shown as `LINKED` (removing it frees nothing) and is never proposed for removal.
+- **`--plan FILE`** writes a CSV (group, action, path, size, checksum, modified, device,
+  inode) to review or edit; `dedupe --apply FILE` acts on a reviewed plan, re-checking each
+  file before touching it.
+- **`--verify`** checks each path still exists with the indexed size and modified time
+  (stat only, no hashing) and flags anything that's changed since indexing.
 
 ### Dry run — always available, never touches files
 
@@ -418,9 +476,9 @@ Would require an `ANTHROPIC_API_KEY` environment variable and the `anthropic` Ru
 
 Some features above would benefit from schema changes. Notes for when that work starts:
 
-- `include_ext` / `exclude_ext` on `roots` — stored file-type filters (5.2, see v5-plan.md)
-- `exclude_paths` on `roots` — stored path patterns (5.3, see v5-plan.md)
-- Lowercase `extension` and `PRAGMA user_version` migrations — see v5-plan.md
+- `include_ext` / `exclude_ext` on `roots` — stored file-type filters (done in 5.2)
+- `exclude_paths` on `roots` — stored path patterns (done in 5.3)
+- Lowercase `extension` and `PRAGMA user_version` migrations — done in 5.2
 - ~~Per-path run metadata~~ — done in v4.1 as the `roots` table (path, first/last run, mode,
   whether the last run finished); `diskunder db info` reads it
 - `last_seen` column — timestamp of last successful index pass; enables true stale
@@ -435,4 +493,4 @@ Some features above would benefit from schema changes. Notes for when that work 
 - Separate `manifests` table — records every dedupe action for audit and restore support
 - `jobs`, `job_runs`, `job_run_errors` and `settings` tables (in the per-user store, not the
   index database) — saved jobs, one row per run with timings, outcome, summary counts and up
-  to 50 errors, and app settings (5.4 / 5.5, see v5-plan.md)
+  to 50 errors, and app settings (done in 5.4 / 5.5)

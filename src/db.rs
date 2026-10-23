@@ -1,5 +1,6 @@
 //! SQLite schema, migrations and queries for index tables and the roots table
 
+use crate::volume::Volume;
 use rusqlite::{params, Connection, OptionalExtension, Result as DbResult};
 use std::{
     collections::HashMap,
@@ -95,7 +96,8 @@ pub(crate) fn migrate_legacy_table(conn: &mut Connection, typed: &str, root: &st
 ///   1 — v5.0: file extensions stored lowercase
 ///   2 — v5.2: file-type filter columns on `roots`
 ///   3 — v5.3: path filter columns on `roots`
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+///   4 — v5.6: volume identity columns on `roots`
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) fn schema_version(conn: &Connection) -> DbResult<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -166,6 +168,24 @@ pub(crate) fn migrate_schema(conn: &mut Connection) -> Result<Vec<String>, Strin
         tx.commit().map_err(db)?;
         if added {
             applied.push("schema 3: added path filter columns to the roots table".to_string());
+        }
+    }
+
+    if version < 4 {
+        let tx = conn.transaction().map_err(db)?;
+        let mut added = false;
+        if table_exists(&tx, "roots").map_err(db)? {
+            for col in ["volume", "volume_path"] {
+                if !has_column(&tx, "roots", col).map_err(db)? {
+                    tx.execute(&format!("ALTER TABLE roots ADD COLUMN {col} TEXT"), []).map_err(db)?;
+                    added = true;
+                }
+            }
+        }
+        tx.pragma_update(None, "user_version", 4).map_err(db)?;
+        tx.commit().map_err(db)?;
+        if added {
+            applied.push("schema 4: added volume columns to the roots table".to_string());
         }
     }
 
@@ -249,7 +269,9 @@ const ROOTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS roots (
     include_ext   TEXT,            -- file-type filters: comma-separated, \"none\" = no extension
     exclude_ext   TEXT,
     exclude_paths TEXT,            -- path patterns, one per line
-    include_paths TEXT             -- exceptions to exclude_paths
+    include_paths TEXT,            -- exceptions to exclude_paths
+    volume        TEXT,            -- the volume it's on, however it's mounted: smb://server/share
+    volume_path   TEXT             -- where the path is inside that volume
 )";
 
 /// Records the run's start, and the filters it uses (so `update` can reuse them)
@@ -259,20 +281,32 @@ pub(crate) fn roots_run_started(
     root: &str,
     mode: &str,
     filter: &IndexFilter,
+    volume: Option<&Volume>,
 ) -> DbResult<()> {
     conn.execute(ROOTS_SCHEMA, [])?;
     let (include_ext, exclude_ext) = filter.types.to_db();
     let (exclude_paths, include_paths) = filter.paths.to_db();
     conn.execute(
         "INSERT INTO roots (table_name, root, first_run, last_started, last_finished, last_mode,
-                            include_ext, exclude_ext, exclude_paths, include_paths)
-         VALUES (?1, ?2, datetime('now'), datetime('now'), NULL, ?3, ?4, ?5, ?6, ?7)
+                            include_ext, exclude_ext, exclude_paths, include_paths, volume, volume_path)
+         VALUES (?1, ?2, datetime('now'), datetime('now'), NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(table_name) DO UPDATE SET
            root = excluded.root, last_started = excluded.last_started,
            last_finished = NULL, last_mode = excluded.last_mode,
            include_ext = excluded.include_ext, exclude_ext = excluded.exclude_ext,
-           exclude_paths = excluded.exclude_paths, include_paths = excluded.include_paths",
-        params![table, root, mode, include_ext, exclude_ext, exclude_paths, include_paths],
+           exclude_paths = excluded.exclude_paths, include_paths = excluded.include_paths,
+           volume = excluded.volume, volume_path = excluded.volume_path",
+        params![
+            table,
+            root,
+            mode,
+            include_ext,
+            exclude_ext,
+            exclude_paths,
+            include_paths,
+            volume.map(|v| &v.id),
+            volume.map(|v| &v.path)
+        ],
     )?;
     Ok(())
 }
@@ -442,6 +476,7 @@ pub(crate) struct RootRow {
     pub(crate) last_finished: Option<String>,
     pub(crate) last_mode: String,
     pub(crate) filter: IndexFilter,
+    pub(crate) volume: Option<Volume>, // None until a v5.6 run records it
 }
 
 /// table name → its roots row (empty if the roots table doesn't exist yet)
@@ -450,8 +485,9 @@ pub(crate) fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>
         return Ok(HashMap::new());
     }
     let mut stmt = conn.prepare(&format!(
-        "SELECT table_name, root, first_run, last_started, last_finished, last_mode, {} FROM roots",
-        filter_columns(conn)?
+        "SELECT table_name, root, first_run, last_started, last_finished, last_mode, {}, {} FROM roots",
+        filter_columns(conn)?,
+        if has_column(conn, "roots", "volume")? { "volume, volume_path" } else { "NULL, NULL" }
     ))?;
     let rows = stmt
         .query_map([], |row| {
@@ -464,6 +500,10 @@ pub(crate) fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>
                     last_finished: row.get(4)?,
                     last_mode: row.get(5)?,
                     filter: filter_from_row(row, 6)?,
+                    volume: match (row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?) {
+                        (Some(id), Some(path)) => Some(Volume { id, path }),
+                        _ => None,
+                    },
                 },
             ))
         })?
@@ -514,4 +554,68 @@ pub(crate) fn table_disk_bytes(conn: &Connection, t: &str) -> Option<i64> {
 pub(crate) fn db_file_bytes(db_path: &str) -> u64 {
     let size = |p: &str| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     size(db_path) + size(&format!("{}-wal", db_path))
+}
+
+/// Held while something writes to a database — an index or update run, a drop, a vacuum — so a
+/// second one is refused with who has it, instead of failing part-way with "database is locked".
+/// The lock is the operating system's on `<db>.lock`: released when this is dropped or the
+/// process ends, however it ends.
+pub(crate) struct DbLock {
+    _file: fs::File,
+}
+
+pub(crate) fn lock_db(db: &str, what: &str) -> Result<DbLock, String> {
+    use std::io::{Read, Seek, Write};
+    let path = format!("{}.lock", db);
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("can't create {}: {}", path, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: flock on a file descriptor we own
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let mut holder = String::new();
+            let _ = file.read_to_string(&mut holder);
+            let holder = holder.trim();
+            return Err(format!(
+                "{} is in use{} — one run at a time per database",
+                db,
+                if holder.is_empty() { String::new() } else { format!(" ({})", holder) }
+            ));
+        }
+    }
+    let _ = file.set_len(0);
+    let _ = file.rewind();
+    let _ = write!(
+        file,
+        "{} — pid {} on {}, since {}\n",
+        what,
+        std::process::id(),
+        crate::runlog::host(),
+        chrono::Local::now().format("%Y-%m-%d %H:%M")
+    );
+    Ok(DbLock { _file: file })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_writer_per_database() {
+        let dir = std::env::temp_dir().join(format!("diskunder-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db").to_string_lossy().into_owned();
+        let first = lock_db(&db, "diskunder index /nas").unwrap();
+        let err = lock_db(&db, "diskunder db vacuum").err().expect("a second writer is refused");
+        assert!(err.contains("is in use (diskunder index /nas — pid") && err.contains("one run at a time per database"), "{}", err);
+        drop(first);
+        assert!(lock_db(&db, "diskunder db vacuum").is_ok(), "free once the first is done");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

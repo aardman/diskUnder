@@ -99,6 +99,10 @@ pub(crate) fn start_run(r: &IndexRun, runlog: &mut RunLog, command: Option<Strin
         })?;
     }
 
+    // One writer per database; held by the worker until the run ends
+    let what = command.clone().unwrap_or_else(|| std::env::args().skip(1).collect::<Vec<_>>().join(" "));
+    let lock = crate::db::lock_db(&r.db, &format!("diskunder {}", what)).map_err(RunOutcome::failed)?;
+
     match command {
         Some(c) => runlog.start_as(&c),
         None => runlog.start(),
@@ -107,7 +111,10 @@ pub(crate) fn start_run(r: &IndexRun, runlog: &mut RunLog, command: Option<Strin
     {
         let (path, typed, db) = (path.clone(), r.typed.clone(), r.db.clone());
         let (threads, upsert, overrides) = (r.threads, r.upsert, r.overrides.clone());
-        std::thread::spawn(move || run_worker(path, typed, db, threads, upsert, overrides, tx));
+        std::thread::spawn(move || {
+            let _lock = lock;
+            run_worker(path, typed, db, threads, upsert, overrides, tx)
+        });
     }
     Ok(Started { rx, state: AppState::new(mode, &path, &r.db) })
 }

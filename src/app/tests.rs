@@ -444,6 +444,29 @@ fn duplicates_view_with_filters() {
 }
 
 #[test]
+fn duplicates_across_every_path_in_the_database() {
+    let (t, mut app) = indexed();
+    t.file("other/p0-again.jpg", "photo 0\n");
+    let mut runlog = RunLog::new(&app.db, None, true);
+    let run = IndexRun { upsert: true, typed: t.s("other"), db: app.db.clone(), threads: 1, overrides: Overrides::default(), no_tui: true };
+    let Started { rx, mut state } = start_run(&run, &mut runlog, None).ok().unwrap();
+    for msg in rx {
+        state.apply(msg);
+    }
+    finish_run(&state, &mut runlog);
+
+    press(&mut app, &[KeyCode::Char('d')]);
+    assert!(screen(&app).contains("Duplicates — nightly — 1 groups · 8 B wasted"), "just the job: {}", screen(&app));
+    press(&mut app, &[KeyCode::Char('a')]);
+    let s = screen(&app);
+    assert!(s.contains("Duplicates — all paths in index.db — 1 groups · 16 B wasted"), "{}", s);
+    assert!(s.contains("p0-again.jpg"), "the copy in the other path:\n{}", s);
+    assert!(app.command().starts_with("diskunder report --duplicates --db "), "{}", app.command());
+    press(&mut app, &[KeyCode::Char('a')]);
+    assert!(screen(&app).contains("Duplicates — nightly — 1 groups · 8 B wasted"), "a again: back to the job");
+}
+
+#[test]
 fn browse_goes_into_folders_and_back() {
     let (t, mut app) = indexed();
     press(&mut app, &[KeyCode::Char('b')]);

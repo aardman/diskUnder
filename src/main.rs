@@ -21,6 +21,7 @@ mod scan;
 mod settings;
 mod search;
 mod tui;
+mod volume;
 
 use clap::{CommandFactory, Parser};
 use std::{fs, io::IsTerminal};

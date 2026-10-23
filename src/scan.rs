@@ -227,7 +227,19 @@ pub(crate) fn run_worker(
     let root = PathBuf::from(&path);
 
     let mode = if upsert { "update" } else { "index" };
-    if let Err(e) = roots_run_started(&conn, &table_name, &path, mode, &filter) {
+    let volume = crate::volume::volume_of(&root);
+    if let Some(v) = &volume {
+        // Another indexed path over the same files, e.g. the same share mounted elsewhere
+        for (t, r) in crate::db::load_roots(&conn).unwrap_or_default() {
+            if t != table_name && r.volume.as_ref().is_some_and(|o| crate::volume::overlaps(o, v)) {
+                let _ = tx.send(WorkerMsg::Info(format!(
+                    "note: {} overlaps {}, already indexed here (same volume) — duplicates count shared files once",
+                    path, r.root
+                )));
+            }
+        }
+    }
+    if let Err(e) = roots_run_started(&conn, &table_name, &path, mode, &filter, volume.as_ref()) {
         let _ = tx.send(WorkerMsg::Error {
             context: "db".to_string(),
             error: format!("could not record run in roots table: {}", e),

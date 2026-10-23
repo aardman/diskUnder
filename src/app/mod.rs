@@ -359,6 +359,7 @@ impl App {
                     last_finished: r.last_finished.clone(),
                     last_mode: r.last_mode.clone(),
                     filter: r.filter.clone(),
+                    volume: r.volume.clone(),
                 });
                 PathEntry { table: t, root, details: None }
             })

@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 5.5.3`:
+**Check it worked** — this should print `diskunder 5.6.0`:
 
 ```bash
 diskunder --version
@@ -357,6 +357,45 @@ duplicate groups and wasted space count hard links as one copy.
 
 ---
 
+## Duplicates across shares and servers
+
+Index every share into **one database** — the same `--db`, or jobs that share one — and
+duplicates are found across all of them: `report --duplicates` or `search --duplicate` with
+no path, or `a` in the app's Duplicates view. Give a path to look within just that share.
+
+```bash
+diskunder run nas01-projects
+diskunder run nas02-archive
+diskunder report --duplicates --min-size 1GB --db /data/index.db
+```
+
+**One run at a time per database.** A run (or `db drop` / `db vacuum`) holds a lock on
+`<db>.lock`; a second one is refused with who has it — `/data/index.db is in use (diskunder
+run nas01-projects — pid 4121 on indexer, since 2026-10-23 02:00)`. Reading — search, report,
+the app — is never blocked. The lock is released however the run ends.
+
+**Volumes.** Each run records the volume its path is on, as an identity that's the same
+however it's mounted:
+
+| Where | Volume |
+|---|---|
+| SMB share | `smb://nas01/projects` — server name without its domain, lowercase share |
+| NFS export | `nfs://nas01/export/projects` |
+| Linux disk | `uuid:…` (the filesystem's UUID) |
+| macOS disk | `local://this-mac/dev/disk3s5` |
+
+Copies are counted by volume and inode, so the same file reached two ways is one copy, not a
+duplicate of itself: one share mounted on two machines, or two indexed paths that overlap
+(`/Volumes/NAS` and `/Volumes/NAS/projects`). Overlaps are noted when the run starts and in
+`db info`; a file the duplicate lists reach both ways is marked `(same file, another mount)`.
+Totals in the report overview still add up each path's own index.
+
+Limits: storage shared over both SMB and NFS has two different identities, and the same-file
+check across mounts relies on the server giving stable inode numbers (NFS does; most SMB
+servers do). Paths indexed before 5.6 get their volume on their next run.
+
+---
+
 ## Interactive app
 
 Run `diskunder` with no command, in a terminal, to open the app — a front end to jobs and
@@ -368,7 +407,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.5.6 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.6.0 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -403,7 +442,8 @@ $ diskunder run nas-nightly
     the job's lines from the run log; `a` shows every run)
   - Search… (`/`) — the `search` filters as a form; results update as you type
   - Duplicates (`d`) — groups by wasted space with the selected group's copies (hard links
-    marked); `f` sets the duplicate filters
+    marked); `f` sets the duplicate filters; `a` switches to every path in the database —
+    duplicates across shares — and back
   - Reports… (`p`) — overview, largest files, by type, by folder, stale, duplicates
   - Browse (`b`) — folders by size with files, share and duplicated space; `⏎` goes in, `⌫` up
 - **Runs carry on in the bottom strip** while you use the menus — one at a time. Quitting
@@ -520,6 +560,8 @@ A cron line:
 | `diskunder db check` | Runs SQLite's integrity check (exit code 2 if it finds problems) and lists tables with no recorded path |
 | `diskunder db backup FILE` | Copies the database to FILE — consistent and compacted, safe while it's in use; never overwrites |
 
+`db info` also shows each path's volume, and any other indexed path that overlaps it.
+
 ```bash
 diskunder db info   --db /data/index.db
 diskunder db drop   /Volumes/OldShare --db /data/index.db
@@ -568,11 +610,13 @@ CREATE TABLE roots (
     include_ext   TEXT,               -- file-type filters: comma-separated, "none" = no extension
     exclude_ext   TEXT,
     exclude_paths TEXT,               -- path patterns, one per line
-    include_paths TEXT                -- exceptions to exclude_paths
+    include_paths TEXT,               -- exceptions to exclude_paths
+    volume        TEXT,               -- the volume it's on: smb://server/share, uuid:…
+    volume_path   TEXT                -- where the path is inside that volume
 );
 ```
 
-The layout version is kept in SQLite's `PRAGMA user_version` (v5.3+: `3`). `index` and
+The layout version is kept in SQLite's `PRAGMA user_version` (v5.6+: `4`). `index` and
 `update` bring an older database up to date; a database written by a newer diskunder is
 refused rather than modified.
 
@@ -648,6 +692,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | `db backup` — consistent copy of an index database | No | No | No | No | No | Yes (5.5.3) |
 | Host — drives and mounts split into local / network (`diskunder host`, app Host menu) | No | No | No | No | No | Yes (5.5.4) |
 | Test job — sample data to try the app on, created and removed from the Jobs menu | No | No | No | No | No | Yes (5.5.4) |
+| Duplicates across shares — volume identity, the same file via two mounts counted once, one run per database | No | No | No | No | No | Yes (5.6) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
@@ -662,7 +707,7 @@ The project was developed in multiple languages, each addressing the limitations
 - **Rust v2:** All known bugs fixed, plain-text output only
 - **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
 - **Rust v4:** Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
-- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters, 5.4 adds jobs, 5.5 the interactive app and settings; v6 is planned in [v5-plan.md](v5-plan.md)
+- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters, 5.4 adds jobs, 5.5 the interactive app and settings; v6 ideas are in [future.md](future.md)
 
 Only the current Rust version is kept in this repository; the earlier versions were not committed.
 
@@ -696,6 +741,7 @@ diskunder/
 │   ├── settings.rs    #   settings and type groups
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   ├── host.rs        #   drives and mounts, host info
+│   ├── volume.rs      #   which volume a path is on
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
 ├── diskunder-macos    # Compiled macOS binary (arm64)
@@ -705,8 +751,7 @@ diskunder/
 ├── Cargo.toml         # Rust project config
 ├── Cargo.lock         # Locked dependency versions — ensures reproducible builds
 ├── changes.md         # Full change log (v1 → v5)
-├── future.md          # Feature ideas
-└── v5-plan.md         # v5 plan: search, report, export, filters, jobs, interactive app
+└── future.md          # Feature ideas, and the v6 plan (quarantine, then dedupe)
 ```
 
 > **Note:** `*.db` files are excluded from version control (`.gitignore`) as they contain

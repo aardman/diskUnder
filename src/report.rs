@@ -361,8 +361,7 @@ impl Report<'_> {
         let sql = format!(
             "{}, groups AS (
                  SELECT checksum, MAX(size) AS size, MIN(path) AS first_path,
-                        COUNT(DISTINCT CASE WHEN inode IS NOT NULL THEN device || ':' || inode END)
-                          + SUM(inode IS NULL) AS copies
+                        COUNT(DISTINCT copy_id) AS copies
                  FROM files
                  WHERE size > 0 AND checksum IS NOT NULL AND checksum != ''
                  GROUP BY checksum)
@@ -382,18 +381,16 @@ impl Report<'_> {
         Ok(groups)
     }
 
-    /// Every copy of the given groups: checksum → [(path, modified, device, inode)], by path
-    fn group_members(
-        &self,
-        checksums: &[&str],
-    ) -> Result<HashMap<String, Vec<(String, String, Option<i64>, Option<i64>)>>, String> {
+    /// Every copy of the given groups: checksum → [(path, modified, device, inode, copy_id)], by
+    /// path. A path that overlapping indexed paths both hold is listed once.
+    fn group_members(&self, checksums: &[&str]) -> Result<HashMap<String, Vec<MemberRow>>, String> {
         let with = build_parts(&self.conn, &self.scope, &FilterArgs::default()).map_err(Self::db)?.with;
         let mut members: HashMap<String, Vec<_>> = HashMap::new();
         // In chunks, so --limit 0 on a share with many groups stays under SQLite's variable limit
         for chunk in checksums.chunks(500) {
             let sql = format!(
-                "{} SELECT checksum, path, modified_date, device, inode FROM files \
-                 WHERE checksum IN ({}) ORDER BY checksum, path",
+                "{} SELECT checksum, path, MIN(modified_date), MIN(device), MIN(inode), MIN(copy_id) FROM files \
+                 WHERE checksum IN ({}) GROUP BY checksum, path ORDER BY checksum, path",
                 with,
                 vec!["?"; chunk.len()].join(", ")
             );
@@ -407,6 +404,7 @@ impl Report<'_> {
                             r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                             r.get::<_, Option<i64>>(3)?,
                             r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, String>(5)?,
                         ),
                     ))
                 })
@@ -432,7 +430,7 @@ impl Report<'_> {
         if self.format != Format::Table {
             let mut cells = Vec::new();
             for (i, (checksum, size, copies, wasted, _)) in shown.iter().enumerate() {
-                for (path, modified, device, inode) in members.get(checksum).into_iter().flatten() {
+                for (path, modified, device, inode, _) in members.get(checksum).into_iter().flatten() {
                     let iso = if modified.is_empty() { String::new() } else { format!("{}Z", modified.replacen(' ', "T", 1)) };
                     cells.push(vec![
                         Cell::Int(i as i64 + 1),
@@ -474,13 +472,10 @@ impl Report<'_> {
                 copies
             ));
             let list = members.get(checksum).map(Vec::as_slice).unwrap_or(&[]);
-            let mut seen: HashSet<(i64, i64)> = HashSet::new();
+            let mut seen = SameFile::default();
             let cap = paths_per_group.unwrap_or(list.len());
-            for (path, modified, device, inode) in list.iter().take(cap) {
-                let link = match (device, inode) {
-                    (Some(d), Some(i)) if !seen.insert((*d, *i)) => "  (hard link)",
-                    _ => "",
-                };
+            for (path, modified, device, inode, copy_id) in list.iter().take(cap) {
+                let link = seen.note(*device, *inode, copy_id);
                 let when = if modified.is_empty() { "-".to_string() } else { fmt_local(modified) };
                 let line = format!("    {:<16}  {}{}\n", when, self.fit(path, 22 + link.len()), link);
                 self.out.write(&line);
@@ -665,11 +660,33 @@ pub(crate) struct GroupInfo {
     pub(crate) name: String,
 }
 
-/// One copy in a duplicate group; `hard_link` marks a path sharing an earlier copy's data
+/// (path, modified, device, inode, copy_id) — one row of a duplicate group
+type MemberRow = (String, String, Option<i64>, Option<i64>, String);
+
+/// Marks paths in a group that are an earlier copy's file: a hard link (same device and inode),
+/// or the same file reached through another mount (same volume and inode)
+#[derive(Default)]
+struct SameFile {
+    ids: HashSet<String>,
+    inodes: HashSet<(i64, i64)>,
+}
+
+impl SameFile {
+    fn note(&mut self, device: Option<i64>, inode: Option<i64>, copy_id: &str) -> &'static str {
+        let same_inode = matches!((device, inode), (Some(d), Some(i)) if !self.inodes.insert((d, i)));
+        match (self.ids.insert(copy_id.to_string()), same_inode) {
+            (true, _) => "",
+            (false, true) => "  (hard link)",
+            (false, false) => "  (same file, another mount)",
+        }
+    }
+}
+
+/// One copy in a duplicate group; `note` marks a path that is an earlier copy's file
 pub(crate) struct Member {
     pub(crate) path: String,
     pub(crate) modified: String,
-    pub(crate) hard_link: bool,
+    pub(crate) note: String, // "(hard link)", "(same file, another mount)" or empty
 }
 
 /// Every duplicate group matching the options (with their duplicate filters), most wasted
@@ -686,14 +703,14 @@ pub(crate) fn duplicate_groups_for(db_path: &str, o: &ReportOptions) -> Result<V
 pub(crate) fn group_members_for(db_path: &str, o: &ReportOptions, checksum: &str) -> Result<Vec<Member>, String> {
     let r = open(db_path, o, Out::buffer(), None)?;
     let mut members = r.group_members(&[checksum])?;
-    let mut seen = HashSet::new();
+    let mut seen = SameFile::default();
     Ok(members
         .remove(checksum)
         .unwrap_or_default()
         .into_iter()
-        .map(|(path, modified, device, inode)| {
-            let hard_link = matches!((device, inode), (Some(d), Some(i)) if !seen.insert((d, i)));
-            Member { path, modified, hard_link }
+        .map(|(path, modified, device, inode, copy_id)| {
+            let note = seen.note(device, inode, &copy_id).trim().to_string();
+            Member { path, modified, note }
         })
         .collect())
 }

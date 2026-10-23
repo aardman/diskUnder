@@ -6,3 +6,4 @@
 *.db-shm
 *.db.log
 *.db.log.1
+*.db.lock

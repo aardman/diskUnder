@@ -869,7 +869,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     let db = tmp.path().join("t.db");
     let db_s = db.to_str().unwrap();
     run_in(tmp.path(), &["index", "data", "--db", db_s]);
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let t = table_for(&data);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension IN ('jpg', 'mov')", t)), 2);
 
@@ -882,7 +882,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     write(&data.join("c.PNG"), "c\n");
     let run = run_in(tmp.path(), &["update", "data", "--db", db_s]);
     assert!(run.stderr.contains("schema 1: stored 1 file extensions in lowercase"), "{}", run.stderr);
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension != lower(extension)", t)), 0);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension = 'png'", t)), 1);
 
@@ -1599,7 +1599,7 @@ fn dry_run_reports_what_the_run_would_do_first() {
     create_v3_table(&db, "data/", &[("data/a", "sum-a")]);
 
     let q = dry(&tmp, &["index", "data/", "--db", db.to_str().unwrap()]);
-    assert!(q.stdout.contains("would first update the database schema to version 3"), "{}", q.stdout);
+    assert!(q.stdout.contains("would first update the database schema to version 4"), "{}", q.stdout);
     assert!(q.stdout.contains("would first migrate 1 rows from the table for \"data/\""), "{}", q.stdout);
     assert_eq!(dry_value(&q.stdout, "Already indexed"), 1, "migrated rows aren't re-hashed");
     assert_eq!(dry_value(&q.stdout, "Would hash"), 1);
@@ -1788,7 +1788,7 @@ fn schema_1_databases_are_read_and_upgraded() {
     assert_eq!(query(tmp.path(), &["search", "share", "--db", db_s]).code, 0);
     let upd = run_in(tmp.path(), &["update", "share", "--exclude-ext", "tmp", "--db", db_s]);
     assert!(upd.stderr.contains("schema 2: added file-type filter columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     assert_eq!(stored_filters(&db), (None, Some("tmp".to_string())));
 }
 
@@ -1974,7 +1974,7 @@ fn path_filters_show_in_db_info_and_queries_and_schema_2_upgrades() {
     assert_eq!(db_cmd(tmp.path(), &["info", "--db", db_s]).code, 0, "read-only commands cope");
     let upd = run_in(tmp.path(), &index_args("update", db_s, &["--exclude-path", "@eaDir"]));
     assert!(upd.stderr.contains("schema 3: added path filter columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
 }
 
 // ─── Jobs (5.4) ──────────────────────────────────────────────────────────────
@@ -2296,4 +2296,107 @@ fn host_lists_local_and_network_mounts() {
     assert!(out.stdout.contains("\nLocal drives\n") && out.stdout.contains("\nNetwork mounts\n"), "{}", out.stdout);
     assert!(out.stdout.contains("MOUNT") && out.stdout.contains("FREE"), "{}", out.stdout);
     assert!(!tmp.path().join("store").exists(), "host doesn't create the store");
+}
+
+// ─── Volumes and the database lock (5.6) ─────────────────────────────────────
+
+fn roots_volume(db: &Path, root: &Path) -> (Option<String>, Option<String>) {
+    let conn = Connection::open(db).unwrap();
+    conn.query_row("SELECT volume, volume_path FROM roots WHERE root = ?1", [root.to_str().unwrap()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+}
+
+#[test]
+fn overlapping_paths_count_shared_files_once() {
+    let tmp = TempDir::new();
+    let d = tmp.path().join("nas");
+    write(&d.join("a.bin"), "same\n");
+    write(&d.join("proj/b.bin"), "same\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "nas", "--db", db_s]);
+    let sub = run_in(tmp.path(), &["index", "nas/proj", "--db", db_s]);
+    assert!(sub.stderr.contains("overlaps") && sub.stderr.contains("same volume"), "{}", sub.stderr);
+
+    let (volume, inside) = roots_volume(&db, &d.join("proj"));
+    assert!(volume.is_some() && inside.as_deref().is_some_and(|p| p.ends_with("/nas/proj")), "{:?} {:?}", volume, inside);
+    let info = db_cmd(tmp.path(), &["info", "--db", db_s]);
+    assert!(info.stdout.contains("  volume      ") && info.stdout.contains("  overlaps    "), "{}", info.stdout);
+
+    // b.bin is in both indexes: still two copies (a and b), listed once each
+    let r = ok(report(&tmp, &db, &["--duplicates"]));
+    assert!(r.stdout.contains("× 2 copies") && r.stdout.matches("b.bin").count() == 1, "{}", r.stdout);
+    let found = query(tmp.path(), &["search", "--duplicate", "--format", "csv", "--db", db_s]);
+    assert_eq!(found.stdout.lines().filter(|l| l.contains("/proj/b.bin,")).count(), 2, "search lists each index's row: {}", found.stdout);
+}
+
+#[test]
+fn the_same_file_through_another_mount_is_one_copy() {
+    let tmp = TempDir::new();
+    write(&tmp.path().join("mac/x.bin"), "film\n");
+    write(&tmp.path().join("mac/old/x.bin"), "film\n");
+    write(&tmp.path().join("linux/x.bin"), "film\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "mac", "--db", db_s]);
+    run_in(tmp.path(), &["index", "linux", "--db", db_s]);
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("× 3 copies"), "three real copies");
+
+    // Make the two paths one share seen from two machines: same volume, same inode,
+    // different device numbers
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("UPDATE roots SET volume = 'smb://nas01/projects', volume_path = '/'", []).unwrap();
+    let mac = table_for(&tmp.path().join("mac"));
+    let linux = table_for(&tmp.path().join("linux"));
+    let ino: i64 = conn.query_row(&format!("SELECT inode FROM {} WHERE filename = 'x.bin' AND directory NOT LIKE '%/old'", mac), [], |r| r.get(0)).unwrap();
+    conn.execute(&format!("UPDATE {} SET inode = ?1, device = device + 1", linux), [ino]).unwrap();
+    drop(conn);
+    let r = ok(report(&tmp, &db, &["--duplicates"]));
+    assert!(r.stdout.contains("× 2 copies"), "linux/x.bin is mac/x.bin: {}", r.stdout);
+    assert!(r.stdout.contains("mac/x.bin  (same file, another mount)"), "{}", r.stdout);
+}
+
+#[test]
+fn schema_4_records_volumes_on_the_next_run() {
+    let tmp = TempDir::new();
+    let d = tmp.path().join("share");
+    write(&d.join("a"), "a\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--db", db_s]);
+    // Back to a v5.5 database
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("ALTER TABLE roots DROP COLUMN volume; ALTER TABLE roots DROP COLUMN volume_path;").unwrap();
+    conn.pragma_update(None, "user_version", 3).unwrap();
+    drop(conn);
+    assert_eq!(db_cmd(tmp.path(), &["info", "--db", db_s]).code, 0, "read-only commands cope");
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups"));
+    let upd = run_in(tmp.path(), &["update", "share", "--db", db_s]);
+    assert!(upd.stderr.contains("schema 4: added volume columns to the roots table"), "{}", upd.stderr);
+    assert_eq!(user_version(&db), 4);
+    assert!(roots_volume(&db, &d).0.is_some());
+}
+
+#[test]
+fn one_run_at_a_time_per_database() {
+    use std::os::unix::io::AsRawFd;
+    let tmp = TempDir::new();
+    write(&tmp.path().join("share/a"), "a\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--db", db_s]);
+
+    // Another process holds it
+    let lock = std::fs::File::create(tmp.path().join("t.db.lock")).unwrap();
+    std::fs::write(tmp.path().join("t.db.lock"), "diskunder run nightly — pid 1 on server\n").unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    let busy = query(tmp.path(), &["update", "share", "--db", db_s, "--no-tui"]);
+    assert_eq!(busy.code, 1);
+    assert!(busy.stderr.contains("is in use (diskunder run nightly — pid 1 on server)"), "{}", busy.stderr);
+    let vac = db_cmd(tmp.path(), &["vacuum", "--db", db_s]);
+    assert!(vac.code == 1 && vac.stderr.contains("is in use"), "{}", vac.stderr);
+    assert_eq!(db_cmd(tmp.path(), &["info", "--db", db_s]).code, 0, "reading isn't blocked");
+
+    drop(lock);
+    run_in(tmp.path(), &["update", "share", "--db", db_s]);
 }

@@ -285,6 +285,7 @@ pub(crate) struct Dups {
     pub(crate) selected: usize,
     pub(crate) members: Vec<Member>,
     pub(crate) error: Option<String>,
+    pub(crate) all: bool, // every path in the database, not just the target's
 }
 
 impl Dups {
@@ -299,9 +300,23 @@ impl Dups {
             ],
             focus: 0,
         };
-        let mut d = Dups { target, settings, filters, groups: Vec::new(), selected: 0, members: Vec::new(), error: None };
+        let mut d = Dups { target, settings, filters, groups: Vec::new(), selected: 0, members: Vec::new(), error: None, all: false };
         d.reload();
         d
+    }
+
+    /// The path the view covers; None for every path in the database
+    fn scope(&self) -> Option<&str> {
+        (!self.all).then_some(self.target.path.as_str())
+    }
+
+    /// What the view covers, for its title
+    pub(crate) fn label(&self) -> String {
+        if self.all {
+            format!("all paths in {}", Path::new(&self.target.db).file_name().map_or(self.target.db.clone(), |n| n.to_string_lossy().into_owned()))
+        } else {
+            self.target.label.clone()
+        }
     }
 
     /// (shared filters, min size, min copies, min wasted) from the filter fields
@@ -325,7 +340,7 @@ impl Dups {
         let result = (|| -> Result<Vec<GroupInfo>, String> {
             let (filters, min_size, min_copies, min_wasted) = self.parsed()?;
             open(&self.target)?;
-            let mut o = plain_options(Some(&self.target.path), &filters);
+            let mut o = plain_options(self.scope(), &filters);
             o.min_size = min_size;
             o.min_copies = min_copies;
             o.min_wasted = min_wasted;
@@ -346,7 +361,7 @@ impl Dups {
         self.members = match self.groups.get(self.selected) {
             Some(g) => {
                 let filters = FilterArgs::default();
-                let o = plain_options(Some(&self.target.path), &filters);
+                let o = plain_options(self.scope(), &filters);
                 group_members_for(&self.target.db, &o, &g.checksum).unwrap_or_default()
             }
             None => Vec::new(),
@@ -359,7 +374,10 @@ impl Dups {
 
     pub(crate) fn command(&self) -> String {
         let f = &self.filters;
-        let mut cmd = format!("diskunder report {} --duplicates", quote(&self.target.path));
+        let mut cmd = match self.scope() {
+            Some(p) => format!("diskunder report {} --duplicates", quote(p)),
+            None => "diskunder report --duplicates".to_string(),
+        };
         for (label, flag) in [
             ("Min size", "--min-size"),
             ("Min copies", "--min-copies"),
@@ -383,6 +401,11 @@ impl Dups {
             KeyCode::Down | KeyCode::Char('j') => self.selected = (self.selected + 1).min(self.groups.len().saturating_sub(1)),
             KeyCode::PageDown => self.selected = (self.selected + 10).min(self.groups.len().saturating_sub(1)),
             KeyCode::PageUp => self.selected = self.selected.saturating_sub(10),
+            KeyCode::Char('a') => {
+                self.all = !self.all;
+                self.reload();
+                return Outcome::Stay;
+            }
             _ => {}
         }
         if self.selected != before {
@@ -446,7 +469,7 @@ impl Browse {
             "{}, dups AS (
                  SELECT checksum FROM files
                  WHERE size > 0 AND checksum IS NOT NULL AND checksum != '' GROUP BY checksum
-                 HAVING COUNT(DISTINCT CASE WHEN inode IS NOT NULL THEN device || ':' || inode END) + SUM(inode IS NULL) > 1)
+                 HAVING COUNT(DISTINCT copy_id) > 1)
              SELECT directory, COUNT(*), COALESCE(SUM(size), 0),
                     COALESCE(SUM(CASE WHEN checksum IN (SELECT checksum FROM dups) THEN size ELSE 0 END), 0)
              FROM files{} GROUP BY directory",

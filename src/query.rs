@@ -249,6 +249,19 @@ pub(crate) struct Query {
     pub(crate) params: Vec<Value>,
 }
 
+/// What makes two rows the same file, so it counts as one copy. With a known volume: the volume
+/// and inode — the same however the volume is mounted, and hard links share it. Without one: the
+/// device and inode, as on the machine that indexed it. Without an inode: the path, which also
+/// counts a file once when overlapping indexed paths both hold it.
+fn copy_id_sql(volume: Option<&str>, has_inode: bool) -> String {
+    match (volume, has_inode) {
+        (_, false) => "'p:' || path".to_string(),
+        (Some(v), true) => format!("CASE WHEN inode IS NOT NULL THEN {} || inode ELSE 'p:' || path END", sql_literal(&format!("{}#", v))),
+        (None, true) => "CASE WHEN inode IS NOT NULL THEN device || ':' || inode ELSE 'p:' || path END".to_string(),
+    }
+}
+
+
 fn sql_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -263,13 +276,16 @@ fn source_select(conn: &Connection, scope: &Scope, t: &str, lowercase_ext: bool)
     } else {
         "NULL"
     };
-    let (device, inode) = if has_column(conn, t, "inode")? { ("device", "inode") } else { ("NULL", "NULL") };
+    let has_inode = has_column(conn, t, "inode")?;
+    let (device, inode) = if has_inode { ("device", "inode") } else { ("NULL", "NULL") };
     let ext = if lowercase_ext { "lower(extension)" } else { "extension" };
     Ok(format!(
         "SELECT {root} AS root, path, filename, directory, {ext} AS extension, size, \
-         modified_date, access_date, {birth} AS birth_date, checksum, {device} AS device, {inode} AS inode \
+         modified_date, access_date, {birth} AS birth_date, checksum, {device} AS device, {inode} AS inode, \
+         {copy_id} AS copy_id \
          FROM {t}",
         root = sql_literal(&scope.root_label(t)),
+        copy_id = copy_id_sql(scope.roots.get(t).and_then(|r| r.volume.as_ref()).map(|v| v.id.as_str()), has_inode),
     ))
 }
 
@@ -370,8 +386,7 @@ pub(crate) fn build_parts(conn: &Connection, scope: &Scope, filters: &FilterArgs
         conds.push(
             "checksum IN (SELECT checksum FROM files \
              WHERE size > 0 AND checksum IS NOT NULL AND checksum != '' GROUP BY checksum \
-             HAVING COUNT(DISTINCT CASE WHEN inode IS NOT NULL THEN device || ':' || inode END) \
-                    + SUM(inode IS NULL) > 1)"
+             HAVING COUNT(DISTINCT copy_id) > 1)"
                 .into(),
         );
     }

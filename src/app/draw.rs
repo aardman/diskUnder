@@ -478,7 +478,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             View::Logs { .. } => "↑↓ PgUp PgDn scroll · a all runs · c copy command · Esc back",
             View::Search(x) if x.in_results => "↑↓ results · Tab back to the filters · c copy command · Esc back",
             View::Search(_) => "type to filter — results update as you go · Tab / ↑↓ fields · space cycles choices · ⏎ results · Esc back",
-            View::Duplicates(_) => "↑↓ groups · f filters · c copy command · Esc back",
+            View::Duplicates(x) if x.all => "↑↓ groups · f filters · a just this job / path · c copy command · Esc back",
+            View::Duplicates(_) => "↑↓ groups · f filters · a all paths in the database · c copy command · Esc back",
             View::Browse(_) => "↑↓ select · ⏎ / → into folder · ⌫ / ← up · c copy command · Esc back",
             View::Settings(x) if x.editing.is_some() => "type the value · ⏎ save · Esc cancel · Ctrl-U clear",
             View::Settings(_) => "↑↓ select · ⏎ edit (or toggle) · x back to default / remove group · c copy command · Esc back",
@@ -782,10 +783,10 @@ fn draw_dups(f: &mut Frame, d: &Dups, area: Rect) {
         .collect();
     let filters = if active.is_empty() { "no filters".to_string() } else { active.join(" · ") };
     let title = match &d.error {
-        Some(e) => format!(" Duplicates — {} — {} ", d.target.label, e),
+        Some(e) => format!(" Duplicates — {} — {} ", d.label(), e),
         None => format!(
             " Duplicates — {} — {} groups · {} wasted — {} (f to change) ",
-            d.target.label,
+            d.label(),
             fmt_count(d.groups.len() as i64),
             fmt_bytes(d.wasted() as u64),
             filters
@@ -817,8 +818,8 @@ fn draw_dups(f: &mut Frame, d: &Dups, area: Rect) {
         .map(|m| {
             let when = if m.modified.is_empty() { "-".to_string() } else { fmt_local(&m.modified) };
             let mut spans = vec![Span::styled(format!("{:<17} ", when), DIM), Span::raw(truncate_path(&m.path, width))];
-            if m.hard_link {
-                spans.push(Span::styled("  (hard link)", DIM));
+            if !m.note.is_empty() {
+                spans.push(Span::styled(format!("  {}", m.note), DIM));
             }
             Line::from(spans)
         })
