@@ -422,6 +422,7 @@ complete.**
 **5.5.4 done:** Test job (sample data from the Jobs menu), Test renamed Dry run (`y`), and a
 Host menu / `diskunder host` listing local drives and network mounts. **5.5.5:** the test
 job's steps stay with you through its run and results; `m` goes back to the menu.
+**5.5.6:** browse a mount's folders to pick one for a job; a clearer last-run strip.
 
 `diskunder` with no subcommand, in a terminal, opens a full-screen app. With a subcommand,
 piped or from cron, nothing changes. It's a front end to 5.0–5.4: every screen runs the same

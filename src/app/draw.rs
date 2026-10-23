@@ -11,7 +11,6 @@ use ratatui::{
 
 use super::results::{Browse, Dups, Fields, Search};
 use super::{App, Dialog, InputFor, PathEntry, Selected, View, MENUS, REPORTS, TEST_STEPS};
-use crate::host::{mount_rows, Mount};
 use crate::cli::display_version;
 use crate::fmt::{fmt_bytes, fmt_count, fmt_local, truncate_path};
 use crate::jobs::{fmt_secs, opt_count, status, JobSummary, RunRow};
@@ -69,7 +68,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         View::Duplicates(x) => draw_dups(f, x, rows[1]),
         View::Browse(x) => draw_browse(f, x, rows[1]),
         View::Settings(x) => x.draw(f, &app.settings, rows[1]),
-        View::Drives { mounts, selected } => draw_drives(f, mounts, *selected, rows[1]),
+        View::Drives(x) => x.draw(f, rows[1]),
     }
     if strip > 0 {
         draw_strip(f, app, rows[2]);
@@ -251,7 +250,7 @@ fn job_details(s: &JobSummary, recent: Option<&Vec<RunRow>>, width: usize) -> Ve
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("⏎ run · t test · e edit · l latest · h history · o errors · g logs", DIM)));
+    lines.push(Line::from(Span::styled("⏎ run · y dry run · e edit · l latest · h history · o errors · g logs", DIM)));
     lines
 }
 
@@ -444,7 +443,25 @@ fn draw_strip(f: &mut Frame, app: &App, area: Rect) {
             inner,
         );
     } else if let Some(done) = &app.finished {
-        f.render_widget(Paragraph::new(truncate_path(done, inner.width as usize)).style(DIM), inner);
+        // Cut at the end, so the job's name and outcome always show
+        let fit = |s: String| {
+            let w = inner.width as usize;
+            if s.chars().count() <= w { s } else { format!("{}…", s.chars().take(w.saturating_sub(1)).collect::<String>()) }
+        };
+        let style = if done.headline.starts_with("completed") { Style::new().fg(Color::Green) } else { status_style(&done.headline) };
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("Last run: ", DIM),
+                    Span::styled(done.job.clone(), BOLD),
+                    Span::raw(" "),
+                    Span::styled(fit(done.headline.clone()), style),
+                    Span::styled(" · l for details", DIM),
+                ]),
+                Line::from(Span::styled(fit(done.details.clone()), DIM)),
+            ]),
+            inner,
+        );
     }
 }
 
@@ -456,7 +473,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else {
         match &app.view {
             View::Main => "⏎ run · y dry run · n new · e edit · x remove · r results · t test job · m menus · c copy command · ? help · q quit",
-            View::Drives { .. } => "↑↓ select · n / ⏎ new job for this mount · c copy command · Esc back",
+            View::Drives(x) => x.keys(),
             View::History { .. } => "↑↓ select · ⏎ errors · c copy command · Esc back",
             View::Logs { .. } => "↑↓ PgUp PgDn scroll · a all runs · c copy command · Esc back",
             View::Search(x) if x.in_results => "↑↓ results · Tab back to the filters · c copy command · Esc back",
@@ -495,52 +512,6 @@ fn draw_menu(f: &mut Frame, open: usize, item: usize, body: Rect) {
             .highlight_style(Style::new().bg(Color::Cyan).fg(Color::Black)),
         area,
         &mut state,
-    );
-}
-
-/// Drives & mounts: a Local section then a Network one; `selected` counts mounts only
-fn draw_drives(f: &mut Frame, mounts: &[Mount], selected: usize, area: Rect) {
-    let cells = mount_rows(mounts);
-    let mut rows: Vec<Row> = Vec::new();
-    let mut at = 0; // table row of the selection, for scrolling
-    for (title, network) in [("Local drives", false), ("Network mounts", true)] {
-        if !rows.is_empty() {
-            rows.push(Row::new(vec![""]));
-        }
-        rows.push(Row::new(vec![Span::styled(title, BOLD)]));
-        let mut any = false;
-        for (i, (m, c)) in mounts.iter().zip(&cells).enumerate().filter(|(_, (m, _))| m.network == network) {
-            any = true;
-            let style = if i == selected {
-                at = rows.len();
-                Style::new().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::new()
-            };
-            let mut c = c.clone();
-            c[0] = format!("  {}", m.point);
-            rows.push(Row::new(c).style(style));
-        }
-        if !any {
-            rows.push(Row::new(vec![Span::styled("  (none)", DIM)]));
-        }
-    }
-    let visible = area.height.saturating_sub(3) as usize;
-    let skip = at.saturating_sub(visible.saturating_sub(1));
-    let widths = [
-        Constraint::Min(24),
-        Constraint::Length(8),
-        Constraint::Length(9),
-        Constraint::Length(15),
-        Constraint::Length(9),
-        Constraint::Min(16),
-    ];
-    let header = Row::new(vec!["MOUNT", "TYPE", "SIZE", "USED", "FREE", "SOURCE"]).style(DIM);
-    f.render_widget(
-        Table::new(rows.into_iter().skip(skip), widths)
-            .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" Drives & mounts ")),
-        area,
     );
 }
 

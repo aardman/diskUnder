@@ -128,7 +128,8 @@ fn running_a_job_from_the_app() {
     assert!(app.running.is_some(), "{:?}", app.message);
     settle(&mut app);
     let s = screen(&app);
-    assert!(s.contains("nightly completed in"), "the strip reports the finished run:\n{}", s);
+    assert!(s.contains("Last run: nightly completed in") && s.contains("· l for details"), "the strip reports the finished run:\n{}", s);
+    assert!(s.contains("3 files · 3 written · 0 removed · 0 errors · 1 files, 0 folders excluded"), "{}", s);
     assert!(s.contains("✓") && s.contains("3 files · 3 written · 0 removed"), "{}", s);
 
     press(&mut app, &[KeyCode::Char('h')]);
@@ -194,6 +195,7 @@ fn test_job_is_created_run_shown_and_removed() {
     assert!(matches!(app.dialog, Some(Dialog::TestJob { selected: 3, ran: true, seen: true, .. })), "reopens at Remove");
     press(&mut app, &[KeyCode::Char('4')]); // Remove
     assert!(!folder.exists() && !app.jobs.iter().any(|s| s.job.name == "test"), "{:?}", app.message);
+    assert!(app.finished.is_none() && !screen(&app).contains("Last run"), "the strip goes with the job");
     assert!(app.jobs.iter().any(|s| s.job.name == "nightly"), "other jobs are untouched");
 }
 
@@ -218,9 +220,9 @@ fn host_menu_shows_drives_and_host_info() {
     assert!(s.contains("Drives & mounts") && s.contains("Local drives") && s.contains("Network mounts"), "{}", s);
     assert!(s.contains("MOUNT") && s.contains("FREE"), "{}", s);
     assert_eq!(app.command(), "diskunder host");
-    let View::Drives { mounts, .. } = &app.view else { panic!("not the drives view") };
-    let first = mounts[0].point.clone();
-    press(&mut app, &[KeyCode::Char('n')]);
+    let View::Drives(x) = &app.view else { panic!("not the drives view") };
+    let first = x.mounts[0].point.clone();
+    press(&mut app, &[KeyCode::Char(' ')]);
     match &app.dialog {
         Some(Dialog::Form(f)) => assert_eq!(f.fields[2].value, first, "n starts a job for the mount"),
         _ => panic!("no form"),
@@ -228,6 +230,36 @@ fn host_menu_shows_drives_and_host_info() {
     press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Down, KeyCode::Enter]);
     let s = screen(&app);
     assert!(s.contains("Host info") && s.contains("jobs store") && s.contains("diskunder.db"), "{}", s);
+}
+
+#[test]
+fn drives_browse_into_folders_and_pick_one_for_a_job() {
+    let (t, mut app) = setup();
+    t.file("vol/projects/film/a.mov", "a\n");
+    t.file("vol/projects/b.txt", "b\n");
+    t.file("vol/.hidden/c", "c\n");
+    let vol = t.s("vol");
+    let mount = crate::host::Mount { point: vol.clone(), source: "test".into(), fstype: "apfs".into(), total: 10, free: 5, network: false };
+    let jobs = vec![(t.s("vol/projects/film"), "films".to_string())];
+    app.view = View::Drives(Box::new(DrivesView::new(vec![mount], jobs)));
+    assert!(screen(&app).contains("jobs inside"), "{}", screen(&app));
+
+    press(&mut app, &[KeyCode::Enter]);
+    let s = screen(&app);
+    assert!(s.contains(". (this folder — 0 files, 2 folders)") && s.contains("projects/") && s.contains(".hidden/"), "{}", s);
+    press(&mut app, &[KeyCode::Down, KeyCode::Enter]); // into projects
+    let s = screen(&app);
+    assert!(s.contains("film/") && s.contains("job films") && s.contains("1 files, 1 folders"), "{}", s);
+    assert_eq!(app.command(), format!("diskunder jobs add NAME update {}/projects", vol));
+    press(&mut app, &[KeyCode::Left]);
+    assert_eq!(app.command(), format!("diskunder jobs add NAME update {}/projects", vol), "back up lands on the folder you left");
+    press(&mut app, &[KeyCode::Left]);
+    assert_eq!(app.command(), "diskunder host", "up from the mount: the drives list");
+    press(&mut app, &[KeyCode::Enter, KeyCode::Down, KeyCode::Enter, KeyCode::Down, KeyCode::Char(' ')]);
+    match &app.dialog {
+        Some(Dialog::Form(f)) => assert_eq!(f.fields[2].value, format!("{}/projects/film", vol), "space uses the folder"),
+        _ => panic!("no form"),
+    }
 }
 
 #[test]

@@ -2,6 +2,7 @@
 //! jobs and runs the command line already has — every screen shows its equivalent command.
 
 mod draw;
+mod drives;
 mod form;
 mod results;
 mod settings_view;
@@ -25,7 +26,8 @@ use std::{
 
 use crate::db::{file_tables, load_roots, table_duplicates, RootRow};
 use crate::dryrun::dry_run_report;
-use crate::host::{host_info, mounts, Mount};
+use crate::host::{host_info, mounts};
+use drives::{DrivesOutcome, DrivesView};
 use crate::jobs::{
     begin_run, create_job, delete_job, job_history, job_run_ids, job_summaries, run_errors, ActiveRun, Job,
     JobSettings, JobSummary, RunRow,
@@ -71,8 +73,8 @@ pub(crate) enum View {
     Duplicates(Box<Dups>),
     Browse(Box<Browse>),
     Settings(Box<SettingsView>),
-    /// Drives & mounts: local first, then network
-    Drives { mounts: Vec<Mount>, selected: usize },
+    /// Drives & mounts, and the folders in them
+    Drives(Box<DrivesView>),
 }
 
 /// An index the Database menu can drop: (label, table, the job that uses it)
@@ -230,7 +232,7 @@ pub(crate) struct App {
     pub(crate) dialog: Option<Dialog>,
     pub(crate) menu: Option<Menu>,
     pub(crate) running: Option<RunningJob>,
-    pub(crate) finished: Option<String>, // the strip's last line once a run ends
+    pub(crate) finished: Option<Finished>, // the strip once a run ends
     pending: Option<Pending>, // a dry run or report working in the background
     follow_test: bool,        // open the test job's results when its run ends
     test_seen: bool,          // the test job's results have been shown since it was made
@@ -238,6 +240,32 @@ pub(crate) struct App {
     pub(crate) message: Option<String>, // one-line feedback in the footer
     pub(crate) settings: Settings,
     pub(crate) quit: bool,
+}
+
+/// The last run, for the strip: (job, "completed in 3s at 12:01", the counts or the error)
+pub(crate) struct Finished {
+    pub(crate) job: String,
+    pub(crate) headline: String,
+    pub(crate) details: String,
+}
+
+/// A run's counts, short enough for one line
+fn short_counts(c: &crate::run::RunCounts) -> String {
+    let n = |x: usize| crate::fmt::fmt_count(x as i64);
+    let mut s = format!(
+        "{} files · {} written · {} removed · {} errors",
+        n(c.found),
+        n(c.written),
+        n(c.removed),
+        n(c.errors_unreadable + c.errors_unwritten + c.errors_other)
+    );
+    if c.dup_groups > 0 {
+        s.push_str(&format!(" · {} duplicate groups ({} wasted)", n(c.dup_groups), crate::fmt::fmt_bytes(c.wasted)));
+    }
+    if c.excluded_files + c.excluded_folders > 0 {
+        s.push_str(&format!(" · {} files, {} folders excluded", n(c.excluded_files), n(c.excluded_folders)));
+    }
+    s
 }
 
 /// Background work whose result becomes a text view
@@ -300,6 +328,9 @@ impl App {
             .filter_map(|s| job_history(&self.store, &s.job.name, Some(RECENT_RUNS)).ok().map(|r| (s.job.name.clone(), r)))
             .collect();
         self.paths = self.unjobbed_paths();
+        if self.finished.as_ref().is_some_and(|f| !self.jobs.iter().any(|s| s.job.name == f.job)) {
+            self.finished = None; // its job was removed
+        }
         let n = self.jobs.len() + self.paths.len();
         if n > 0 && self.selected >= n {
             self.selected = n - 1;
@@ -403,7 +434,7 @@ impl App {
             View::Duplicates(x) => x.command(),
             View::Browse(x) => x.command(),
             View::Settings(x) => x.command(&self.settings),
-            View::Drives { .. } => "diskunder host".into(),
+            View::Drives(x) => x.command(),
             View::Main => match self.selected() {
                 Selected::Job(s) => format!("diskunder run {}", s.job.name),
                 Selected::Path(p) => match &p.root {
@@ -502,7 +533,9 @@ impl App {
         if let Err(e) = run.active.finish(&outcome, &run.runlog) {
             self.message = Some(format!("couldn't record the run: {}", e));
         }
-        self.finished = Some(format!("{} {} in {} — {}", run.name, outcome.outcome, took, outcome.summary));
+        let at = chrono::Local::now().format("%H:%M");
+        let details = if outcome.outcome == "failed" { outcome.summary.clone() } else { short_counts(&outcome.counts) };
+        self.finished = Some(Finished { job: run.name.clone(), headline: format!("{} in {} at {}", outcome.outcome, took, at), details });
         if let Some(reason) = run.runlog.failure() {
             self.message = Some(reason.to_string());
         }
@@ -540,7 +573,7 @@ impl App {
             Err(failed) => {
                 // Recorded like any other failed run, with the reason
                 let _ = active.finish(&failed, &runlog);
-                self.finished = Some(format!("{} failed — {}", job.name, failed.summary));
+                self.finished = Some(Finished { job: job.name.clone(), headline: "failed to start".into(), details: failed.summary });
                 self.refresh();
             }
         }
@@ -829,7 +862,10 @@ impl App {
                 let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
                 self.dialog = Some(Dialog::Input { purpose: InputFor::Backup, value: format!("{}.backup-{}", self.db, stamp) });
             }
-            Action::Drives => self.view = View::Drives { mounts: mounts(), selected: 0 },
+            Action::Drives => {
+                let jobs = self.jobs.iter().map(|s| (s.job.path.clone(), s.job.name.clone())).collect();
+                self.view = View::Drives(Box::new(DrivesView::new(mounts(), jobs)));
+            }
             Action::HostInfo => {
                 let log = self.settings.get("log.folder").to_string();
                 let lines = host_info(&self.store, &self.db, &log).into_iter().map(|(k, v)| format!("{:<11} {}", k, v)).collect();
@@ -975,20 +1011,18 @@ impl App {
             }
             return;
         }
-        if let View::Drives { mounts, selected } = &mut self.view {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(mounts.len().saturating_sub(1)),
-                KeyCode::Char('n') | KeyCode::Enter => {
-                    if let Some(m) = mounts.get(*selected) {
-                        let form = Form::new_job_at(&self.db, &self.settings, &m.point);
-                        self.view = View::Main;
-                        self.dialog = Some(Dialog::Form(form));
-                    }
+        if let View::Drives(x) = &mut self.view {
+            if key.code == KeyCode::Char('c') {
+                return self.copy_command();
+            }
+            match x.key(key) {
+                DrivesOutcome::Stay => {}
+                DrivesOutcome::Back => self.view = View::Main,
+                DrivesOutcome::Message(m) => self.message = Some(m),
+                DrivesOutcome::Use(path) => {
+                    self.view = View::Main;
+                    self.dialog = Some(Dialog::Form(Form::new_job_at(&self.db, &self.settings, &path)));
                 }
-                KeyCode::Char('c') => self.copy_command(),
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => self.view = View::Main,
-                _ => {}
             }
             return;
         }
@@ -1062,7 +1096,7 @@ impl App {
             | View::Duplicates(_)
             | View::Browse(_)
             | View::Settings(_)
-            | View::Drives { .. } => {}
+            | View::Drives(_) => {}
         }
         // Keys that open another view
         match (&self.view, key.code) {

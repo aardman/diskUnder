@@ -368,7 +368,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.5.5 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.5.6 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -407,12 +407,15 @@ $ diskunder run nas-nightly
   - Reports… (`p`) — overview, largest files, by type, by folder, stale, duplicates
   - Browse (`b`) — folders by size with files, share and duplicated space; `⏎` goes in, `⌫` up
 - **Runs carry on in the bottom strip** while you use the menus — one at a time. Quitting
-  during a run asks first, and records it as stopped by user.
+  during a run asks first, and records it as stopped by user. Once a run ends the strip shows
+  it — `Last run: NAME completed in 3s at 12:01` with its counts — until the job is removed.
 - **Database menu**, for the open database: Info, Check, Vacuum…, Drop path… (warns if a job
   uses the index), Open… (another database), Backup… (a consistent copy — see `db backup`).
 - **Host menu**: Drives & mounts — local drives and network mounts in two sections, with
-  filesystem, size, used, free and source; `n` (or `⏎`) starts a new job for the selected
-  mount. Host info — this machine, your user, CPUs, and where the jobs store, database and run
+  filesystem, size, used, free, the jobs on each, and source. `⏎` browses down into a mount's
+  folders (`⌫` / `←` back up) and `space` starts a new job for the selected mount or folder;
+  folders a job covers are marked. Folders only, without sizes, so it's quick on network
+  shares. Host info — this machine, your user, CPUs, and where the jobs store, database and run
   logs are. Both are `diskunder host` on the command line.
 - **Settings menu**: Start, Defaults, File types, Deletion, Logging — the settings below,
   edited in place (`⏎` edits or toggles, `x` puts one back to its default).

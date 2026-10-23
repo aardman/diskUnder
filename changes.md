@@ -1,5 +1,17 @@
 # diskUnder — Change Log
 
+## v5.5.6 — browse drives for a job; clearer last-run strip
+
+- **Drives & mounts:** `⏎` browses into a mount's folders (`⌫` / `←` back up; up from the
+  mount returns to the list), and `space` starts a new job for the selected mount or folder.
+  `.` picks the folder you're in. Folders a job covers are marked `job NAME`, and ones with
+  jobs further down `jobs inside`; mounts get a JOBS column. Folders only, with a file count
+  but no sizes, so browsing a network share is quick.
+- **Last-run strip:** two lines — `Last run: NAME completed in 3s at 12:01 · l for details`,
+  then a shorter count line — cut at the end, not the start, so the job's name always shows.
+  It's cleared when that job is removed.
+- The job details pane's key hint says `y dry run` (it still said `t test`).
+
 ## v5.5.5 — app fixes
 
 - **Test job:** the steps stay up while the test job runs, and Esc (or `m`) from its results
