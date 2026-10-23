@@ -3,6 +3,7 @@
 use rayon::prelude::*;
 use rusqlite::Connection;
 use std::{
+    cell::Cell,
     collections::HashMap,
     fs::{self, File},
     io::{BufReader, Read},
@@ -12,7 +13,7 @@ use std::{
 use walkdir::WalkDir;
 
 use crate::db::{commit_batch, create_indexes, create_table, delete_paths, load_indexed, migrate_legacy_table, migrate_schema, roots_run_finished, roots_run_started, stored_filter, update_file_ids};
-use crate::filters::{ext_of, TypeFilter};
+use crate::filters::{filter_notes, Overrides};
 use crate::fmt::fmt_time;
 
 const BATCH_SIZE: usize = 1_000;
@@ -57,8 +58,8 @@ pub(crate) enum WorkerMsg {
     BatchWritten(usize),
     /// N rows removed for files no longer on disk (update mode)
     Removed(usize),
-    /// N files skipped during the walk by the file-type filters
-    Excluded(usize),
+    /// Files skipped during the walk by the filters, and folders not entered at all
+    Excluded { files: usize, folders: usize },
     /// N rows removed because their type is now excluded (update mode)
     RemovedExcluded(usize),
     /// A batch of `files` hashed files could not be committed
@@ -153,7 +154,7 @@ pub(crate) fn run_worker(
     db_path: String,
     threads: usize,
     upsert: bool,
-    filter_override: Option<TypeFilter>, // file-type filters from the command line, if any
+    overrides: Overrides, // filters from the command line; kinds not given reuse the stored ones
     tx: Sender<WorkerMsg>,
 ) {
     rayon::ThreadPoolBuilder::new()
@@ -217,19 +218,13 @@ pub(crate) fn run_worker(
             return;
         }
     };
-    // File-type filters: the command line's replace the stored ones; otherwise reuse those
+    // Filters: the command line's replace the stored ones of the same kind; otherwise reuse
     let recorded = stored_filter(&conn, &table_name).ok().flatten(); // None: no runs recorded yet
-    let stored = recorded.clone().unwrap_or_default();
-    let filter = filter_override.clone().unwrap_or_else(|| stored.clone());
-    if recorded.is_some() && filter != stored {
-        let _ = tx.send(WorkerMsg::Info(format!(
-            "file-type filters changed: {} → {}",
-            stored.describe(),
-            filter.describe()
-        )));
-    } else if !filter.is_empty() {
-        let _ = tx.send(WorkerMsg::Info(format!("file-type filters: {}", filter.describe())));
+    let filter = overrides.apply(&recorded.clone().unwrap_or_default());
+    for note in filter_notes(recorded.as_ref(), &filter, &overrides, false) {
+        let _ = tx.send(WorkerMsg::Info(note));
     }
+    let root = PathBuf::from(&path);
 
     let mode = if upsert { "update" } else { "index" };
     if let Err(e) = roots_run_started(&conn, &table_name, &path, mode, &filter) {
@@ -258,13 +253,22 @@ pub(crate) fn run_worker(
     // Paths that could not be traversed; rows beneath them are not treated as deleted.
     // None means an error had no path, so no deletions are safe.
     let mut unreadable: Option<Vec<PathBuf>> = Some(Vec::new());
-    let mut excluded = 0usize; // files skipped by the file-type filters (never stat'ed or hashed)
-    let mut now_excluded: Vec<String> = Vec::new(); // indexed rows whose type is now excluded
+    let mut excluded = 0usize; // files skipped by the filters (never stat'ed or hashed)
+    let mut now_excluded: Vec<String> = Vec::new(); // indexed rows the filters now exclude
+    // Excluded folders are never entered, unless an include pattern could match inside them
+    let pruned = Cell::new(0usize);
+    let walker = WalkDir::new(&path).into_iter().filter_entry(|e| {
+        let skip = e.depth() > 0 && e.file_type().is_dir() && filter.prunes_dir(e.path(), &root);
+        if skip {
+            pruned.set(pruned.get() + 1);
+        }
+        !skip
+    });
 
-    for entry in WalkDir::new(&path) {
+    for entry in walker {
         match entry {
             Ok(e) if e.file_type().is_file() => {
-                if !filter.allows(&ext_of(e.path())) {
+                if filter.skips_file(e.path(), &root) {
                     excluded += 1;
                     if let Some((p, _)) = indexed.remove_entry(e.path().to_string_lossy().as_ref()) {
                         now_excluded.push(p);
@@ -320,10 +324,21 @@ pub(crate) fn run_worker(
         }
     }
 
-    // Excluded files still prove the share is there, for the empty-walk safeguard below
-    let found_any = !files.is_empty() || skipped > 0 || excluded > 0;
-    if excluded > 0 {
-        let _ = tx.send(WorkerMsg::Excluded(excluded));
+    // Rows under folders the walk skipped weren't seen, but they're excluded, not deleted
+    if !filter.paths.is_empty() {
+        let under_skipped: Vec<String> =
+            indexed.keys().filter(|p| filter.excludes_row(p, &root)).cloned().collect();
+        for p in under_skipped {
+            indexed.remove(&p);
+            now_excluded.push(p);
+        }
+    }
+
+    // Excluded files and folders still prove the share is there, for the empty-walk safeguard
+    let pruned = pruned.get();
+    let found_any = !files.is_empty() || skipped > 0 || excluded > 0 || pruned > 0;
+    if excluded > 0 || pruned > 0 {
+        let _ = tx.send(WorkerMsg::Excluded { files: excluded, folders: pruned });
     }
     let _ = tx.send(WorkerMsg::TraversalComplete { to_hash: files.len(), skipped });
 
@@ -344,7 +359,7 @@ pub(crate) fn run_worker(
         } else {
             // index never removes rows
             let _ = tx.send(WorkerMsg::Info(format!(
-                "{} indexed files are now excluded by the file-type filters — `update` removes their rows",
+                "{} indexed files are now excluded by the filters — `update` removes their rows",
                 now_excluded.len()
             )));
         }

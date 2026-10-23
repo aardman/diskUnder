@@ -50,8 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut runlog = RunLog::new(&args.db, args.log.as_deref(), args.no_log);
 
     let (mode, typed, dry_run, filter) = match &args.cmd {
-        Command::Index { path, dry_run, types } => ("index", path.clone(), *dry_run, types.filter()),
-        Command::Update { path, dry_run, types } => ("update", path.clone(), *dry_run, types.filter()),
+        Command::Index { path, dry_run, types } => ("index", path.clone(), *dry_run, types.overrides()),
+        Command::Update { path, dry_run, types } => ("update", path.clone(), *dry_run, types.overrides()),
         Command::Db { action } => {
             let code = run_db_command(&args.db, action, &mut runlog);
             report_log_failure(&runlog);
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Changes nothing, so it isn't logged
     if dry_run {
-        std::process::exit(run_dry_run(&args.db, &typed, &path, upsert, filter.as_ref()));
+        std::process::exit(run_dry_run(&args.db, &typed, &path, upsert, &filter));
     }
 
     let db_path = args.db.clone();

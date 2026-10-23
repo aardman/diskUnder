@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::filters::TypeFilter;
+use crate::filters::{IndexFilter, PathFilter, TypeFilter};
 use crate::scan::{FileEntry, FileId};
 
 pub(crate) fn table_name_for(root: &str) -> String {
@@ -94,7 +94,8 @@ pub(crate) fn migrate_legacy_table(conn: &mut Connection, typed: &str, root: &st
 ///   0 — v4.1 and earlier
 ///   1 — v5.0: file extensions stored lowercase
 ///   2 — v5.2: file-type filter columns on `roots`
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+///   3 — v5.3: path filter columns on `roots`
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 pub(crate) fn schema_version(conn: &Connection) -> DbResult<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -147,6 +148,24 @@ pub(crate) fn migrate_schema(conn: &mut Connection) -> Result<Vec<String>, Strin
         tx.commit().map_err(db)?;
         if added {
             applied.push("schema 2: added file-type filter columns to the roots table".to_string());
+        }
+    }
+
+    if version < 3 {
+        let tx = conn.transaction().map_err(db)?;
+        let mut added = false;
+        if table_exists(&tx, "roots").map_err(db)? {
+            for col in ["exclude_paths", "include_paths"] {
+                if !has_column(&tx, "roots", col).map_err(db)? {
+                    tx.execute(&format!("ALTER TABLE roots ADD COLUMN {col} TEXT"), []).map_err(db)?;
+                    added = true;
+                }
+            }
+        }
+        tx.pragma_update(None, "user_version", 3).map_err(db)?;
+        tx.commit().map_err(db)?;
+        if added {
+            applied.push("schema 3: added path filter columns to the roots table".to_string());
         }
     }
 
@@ -228,40 +247,62 @@ const ROOTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS roots (
     last_finished TEXT,            -- NULL while a run is in progress or if it was interrupted
     last_mode     TEXT NOT NULL,   -- index | update
     include_ext   TEXT,            -- file-type filters: comma-separated, \"none\" = no extension
-    exclude_ext   TEXT
+    exclude_ext   TEXT,
+    exclude_paths TEXT,            -- path patterns, one per line
+    include_paths TEXT             -- exceptions to exclude_paths
 )";
 
-/// Records the run's start, and the file-type filters it uses (so `update` can reuse them)
+/// Records the run's start, and the filters it uses (so `update` can reuse them)
 pub(crate) fn roots_run_started(
     conn: &Connection,
     table: &str,
     root: &str,
     mode: &str,
-    filter: &TypeFilter,
+    filter: &IndexFilter,
 ) -> DbResult<()> {
     conn.execute(ROOTS_SCHEMA, [])?;
-    let (include, exclude) = filter.to_db();
+    let (include_ext, exclude_ext) = filter.types.to_db();
+    let (exclude_paths, include_paths) = filter.paths.to_db();
     conn.execute(
-        "INSERT INTO roots (table_name, root, first_run, last_started, last_finished, last_mode, include_ext, exclude_ext)
-         VALUES (?1, ?2, datetime('now'), datetime('now'), NULL, ?3, ?4, ?5)
+        "INSERT INTO roots (table_name, root, first_run, last_started, last_finished, last_mode,
+                            include_ext, exclude_ext, exclude_paths, include_paths)
+         VALUES (?1, ?2, datetime('now'), datetime('now'), NULL, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(table_name) DO UPDATE SET
            root = excluded.root, last_started = excluded.last_started,
            last_finished = NULL, last_mode = excluded.last_mode,
-           include_ext = excluded.include_ext, exclude_ext = excluded.exclude_ext",
-        params![table, root, mode, include, exclude],
+           include_ext = excluded.include_ext, exclude_ext = excluded.exclude_ext,
+           exclude_paths = excluded.exclude_paths, include_paths = excluded.include_paths",
+        params![table, root, mode, include_ext, exclude_ext, exclude_paths, include_paths],
     )?;
     Ok(())
 }
 
-/// The file-type filters stored for a table, if it has a roots row (and the columns exist)
-pub(crate) fn stored_filter(conn: &Connection, table: &str) -> DbResult<Option<TypeFilter>> {
-    if !table_exists(conn, "roots")? || !has_column(conn, "roots", "include_ext")? {
+/// Filter columns to select from `roots`: NULL for any that an older, un-migrated database
+/// doesn't have yet (read-only commands don't migrate)
+fn filter_columns(conn: &Connection) -> DbResult<String> {
+    let mut cols = Vec::new();
+    for col in ["include_ext", "exclude_ext", "exclude_paths", "include_paths"] {
+        cols.push(if has_column(conn, "roots", col)? { col } else { "NULL" });
+    }
+    Ok(cols.join(", "))
+}
+
+fn filter_from_row(r: &rusqlite::Row, first: usize) -> DbResult<IndexFilter> {
+    Ok(IndexFilter {
+        types: TypeFilter::from_db(r.get(first)?, r.get(first + 1)?),
+        paths: PathFilter::from_db(r.get(first + 2)?, r.get(first + 3)?),
+    })
+}
+
+/// The filters stored for a table, if it has a roots row
+pub(crate) fn stored_filter(conn: &Connection, table: &str) -> DbResult<Option<IndexFilter>> {
+    if !table_exists(conn, "roots")? {
         return Ok(None);
     }
     conn.query_row(
-        "SELECT include_ext, exclude_ext FROM roots WHERE table_name = ?1",
+        &format!("SELECT {} FROM roots WHERE table_name = ?1", filter_columns(conn)?),
         [table],
-        |r| Ok(TypeFilter::from_db(r.get(0)?, r.get(1)?)),
+        |r| filter_from_row(r, 0),
     )
     .optional()
 }
@@ -400,7 +441,7 @@ pub(crate) struct RootRow {
     pub(crate) last_started: String,
     pub(crate) last_finished: Option<String>,
     pub(crate) last_mode: String,
-    pub(crate) filter: TypeFilter,
+    pub(crate) filter: IndexFilter,
 }
 
 /// table name → its roots row (empty if the roots table doesn't exist yet)
@@ -408,10 +449,9 @@ pub(crate) fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>
     if !table_exists(conn, "roots")? {
         return Ok(HashMap::new());
     }
-    // Before schema 2 there are no filter columns; read-only commands don't migrate, so cope
-    let filters = if has_column(conn, "roots", "include_ext")? { "include_ext, exclude_ext" } else { "NULL, NULL" };
     let mut stmt = conn.prepare(&format!(
-        "SELECT table_name, root, first_run, last_started, last_finished, last_mode, {filters} FROM roots"
+        "SELECT table_name, root, first_run, last_started, last_finished, last_mode, {} FROM roots",
+        filter_columns(conn)?
     ))?;
     let rows = stmt
         .query_map([], |row| {
@@ -423,7 +463,7 @@ pub(crate) fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>
                     last_started: row.get(3)?,
                     last_finished: row.get(4)?,
                     last_mode: row.get(5)?,
-                    filter: TypeFilter::from_db(row.get(6)?, row.get(7)?),
+                    filter: filter_from_row(row, 6)?,
                 },
             ))
         })?

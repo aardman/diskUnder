@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 
 use crate::output::Format;
-use crate::filters::TypeFilter;
+use crate::filters::{parse_path_pattern, Overrides, PathFilter, TypeFilter};
 use crate::query::{parse_ext_list, parse_size, ExtList, FilterArgs, SortKey};
 use crate::report::{parse_age_arg, Age, StaleBy};
 
@@ -171,8 +171,8 @@ pub(crate) enum DbAction {
     Check,
 }
 
-/// File-type filters for `index` and `update`. Any of these replaces the filters stored for
-/// the path; with none, the stored filters are reused.
+/// Filters for `index` and `update`. Type options replace the stored type filters and path
+/// options the stored path filters; whatever isn't given is reused from the last run.
 #[derive(clap::Args)]
 pub(crate) struct TypeArgs {
     /// Only index these extensions, comma-separated, e.g. jpg,png,mov ("none" = no extension)
@@ -186,21 +186,43 @@ pub(crate) struct TypeArgs {
     /// Clear any stored file-type filters and index every type
     #[arg(long, conflicts_with_all = ["include_ext", "exclude_ext"])]
     pub(crate) all_types: bool,
+
+    /// Skip paths matching PATTERN, .gitignore-style and case-sensitive: a name like .snapshot
+    /// or *.tmp matches at any depth; a/b/c is from the indexed root; ** spans folders (repeatable)
+    #[arg(long, value_name = "PATTERN", value_parser = parse_path_pattern)]
+    pub(crate) exclude_path: Vec<String>,
+
+    /// Index paths matching PATTERN even if an --exclude-path matches them — exceptions only
+    #[arg(long, value_name = "PATTERN", value_parser = parse_path_pattern)]
+    pub(crate) include_path: Vec<String>,
+
+    /// Clear any stored path filters
+    #[arg(long, conflicts_with_all = ["exclude_path", "include_path"])]
+    pub(crate) no_path_filters: bool,
 }
 
 impl TypeArgs {
-    /// The filters to use from the command line, or None to reuse the stored ones
-    pub(crate) fn filter(&self) -> Option<TypeFilter> {
-        if self.all_types {
-            return Some(TypeFilter::default());
-        }
-        if self.include_ext.is_none() && self.exclude_ext.is_none() {
-            return None;
-        }
-        Some(TypeFilter {
-            include: self.include_ext.as_ref().map(|l| l.0.clone()),
-            exclude: self.exclude_ext.as_ref().map(|l| l.0.clone()).unwrap_or_default(),
-        })
+    /// The filters given on the command line; a kind not given is None (reuse the stored one)
+    pub(crate) fn overrides(&self) -> Overrides {
+        let types = if self.all_types {
+            Some(TypeFilter::default())
+        } else if self.include_ext.is_some() || self.exclude_ext.is_some() {
+            Some(TypeFilter {
+                include: self.include_ext.as_ref().map(|l| l.0.clone()),
+                exclude: self.exclude_ext.as_ref().map(|l| l.0.clone()).unwrap_or_default(),
+            })
+        } else {
+            None
+        };
+        let paths = if self.no_path_filters {
+            Some(PathFilter::default())
+        } else if !self.exclude_path.is_empty() || !self.include_path.is_empty() {
+            // Already checked by parse_path_pattern
+            PathFilter::new(self.exclude_path.clone(), self.include_path.clone()).ok()
+        } else {
+            None
+        };
+        Overrides { types, paths }
     }
 }
 

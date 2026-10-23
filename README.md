@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 0.5.2`:
+**Check it worked** — this should print `diskunder 0.5.3`:
 
 ```bash
 diskunder --version
@@ -121,6 +121,28 @@ says so). Passing `--include-ext` or `--exclude-ext` replaces them; `--all-types
 When a type becomes excluded, `update` removes its rows and reports them separately from
 deleted files (`index` never removes rows — it notes how many `update` would remove).
 `db info` shows each path's filters, and `search` and `report` note when an index is filtered.
+
+**Paths.** Skip folders and files by pattern — snapshot folders, NAS thumbnail caches, render
+caches, `node_modules`. Excluded folders are never entered, which can cut a share's file count
+dramatically. Patterns work like `.gitignore` and are **case-sensitive**:
+
+| Pattern | Matches |
+|---|---|
+| `.snapshot`, `@eaDir`, `*.tmp` | a name at any depth — and everything under a matching folder |
+| `projects/*/render-cache` | from the indexed root; `*` stays within one folder name |
+| `**/node_modules` | `**` spans any number of folders |
+| `build/` | a trailing `/` matches folders only |
+
+```bash
+diskunder index /Volumes/NAS --exclude-path .snapshot --exclude-path @eaDir --exclude-path "#recycle" --db /data/index.db
+diskunder index /Volumes/NAS --exclude-path "projects/*/render-cache" --include-path "projects/*/render-cache/keep" --db /data/index.db
+```
+
+`--include-path` makes exceptions: it indexes paths an `--exclude-path` would otherwise skip
+(on its own it does nothing). Path filters are stored and reused like file-type filters, and
+the two kinds are replaced independently — passing `--exclude-path` keeps the stored type
+filters. `--no-path-filters` clears them. Rows under a folder that becomes excluded are removed
+by `update` as excluded, never counted as deleted.
 
 Preview a run with `--dry-run`: it walks the tree and reports what `index` or `update` would
 do, using the same rules and safeguards, but hashes and writes nothing — no database is
@@ -394,11 +416,13 @@ CREATE TABLE roots (
     last_finished TEXT,               -- NULL if the last run was interrupted (or is still running)
     last_mode     TEXT NOT NULL,      -- index | update
     include_ext   TEXT,               -- file-type filters: comma-separated, "none" = no extension
-    exclude_ext   TEXT
+    exclude_ext   TEXT,
+    exclude_paths TEXT,               -- path patterns, one per line
+    include_paths TEXT                -- exceptions to exclude_paths
 );
 ```
 
-The layout version is kept in SQLite's `PRAGMA user_version` (v5.2+: `2`). `index` and
+The layout version is kept in SQLite's `PRAGMA user_version` (v5.3+: `3`). `index` and
 `update` bring an older database up to date; a database written by a newer diskunder is
 refused rather than modified.
 
@@ -467,7 +491,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | `export` — CSV / TSV / JSON for BI tools | No | No | No | No | No | Yes (5.0) |
 | Dry run — preview `index` / `update` without hashing or writing (dedupe previews come with v6) | No | No | No | No | No | Yes (5.2) |
 | Include / exclude file types — `--include-ext`, `--exclude-ext`, stored per path | No | No | No | No | No | Yes (5.2) |
-| Ignore — exclude paths/patterns from indexing | No | No | No | No | No | Planned (5.3) |
+| Ignore — exclude paths by `.gitignore`-style pattern, with exceptions; excluded folders never entered | No | No | No | No | No | Yes (5.3) |
 | Jobs — named, saved runs: run by name or pick from a menu, with last-run history | No | No | No | No | No | Planned (5.4) |
 | Interactive app — main window plus Jobs / Results / Database / Settings menus | No | No | No | No | No | Planned (5.5) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
@@ -484,7 +508,7 @@ The project was developed in multiple languages, each addressing the limitations
 - **Rust v2:** All known bugs fixed, plain-text output only
 - **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
 - **Rust v4:** Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
-- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters; the rest is planned in [v5-plan.md](v5-plan.md)
+- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters; the rest is planned in [v5-plan.md](v5-plan.md)
 
 Only the current Rust version is kept in this repository; the earlier versions were not committed.
 
@@ -510,7 +534,7 @@ diskunder/
 │   ├── search.rs      #   search and export commands
 │   ├── report.rs      #   report command
 │   ├── dryrun.rs      #   index / update --dry-run
-│   ├── filters.rs     #   file-type filters
+│   ├── filters.rs     #   file-type and path filters
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
@@ -558,6 +582,6 @@ checks both its summary output and the database it writes: resume, change detect
 path normalisation and v3 migration, error counting, duplicate totals, hard links, argument
 parsing, the `db` maintenance commands, schema migrations, the run log, `search`/`export`
 filters, scopes and formats, every `report` section and duplicate filter, `--dry-run` (checked against the real run that
-follows), and file-type filters. Unit tests in `src/query.rs` and `src/filters.rs` cover size,
-age and extension parsing and filter matching.
+follows), and file-type and path filters. Unit tests in `src/query.rs` and `src/filters.rs`
+cover size, age and extension parsing, and type and path-pattern matching.
 Tests that rely on file permissions skip themselves when run as root.

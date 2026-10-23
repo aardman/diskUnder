@@ -4,7 +4,7 @@ Inspired by feature parity with [Diskover](https://diskoverdata.com/). Items are
 
 **Planned for v5** (small releases — see [v5-plan.md](v5-plan.md) for design, schema changes
 and sizing): 5.0 run log, `search` and `export` (**done**) · 5.1 `report` with duplicate filtering (**done**) · 5.2
-include/exclude file types and `--dry-run` preview (**done**) · 5.3 path patterns (Ignore) · 5.4 Jobs ·
+include/exclude file types and `--dry-run` preview (**done**) · 5.3 path patterns (Ignore) (**done**) · 5.4 Jobs ·
 5.5 interactive app (TUI). **Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
 original ideas.
 

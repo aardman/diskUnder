@@ -39,7 +39,8 @@ pub(crate) struct AppState {
     pub(crate) files_hashed: usize,
     pub(crate) files_written: usize,
     pub(crate) files_removed: usize, // rows dropped for deleted files (update mode)
-    pub(crate) files_excluded: usize, // files skipped by the file-type filters
+    pub(crate) files_excluded: usize, // files skipped by the filters
+    pub(crate) folders_excluded: usize, // folders the walk didn't enter
     pub(crate) rows_excluded_removed: usize, // rows dropped because their type is now excluded
     pub(crate) files_errored: usize,  // queued files that could not be read or hashed
     pub(crate) files_unwritten: usize, // hashed files lost to a failed batch commit
@@ -73,6 +74,7 @@ impl AppState {
             files_written: 0,
             files_removed: 0,
             files_excluded: 0,
+            folders_excluded: 0,
             rows_excluded_removed: 0,
             files_errored: 0,
             files_unwritten: 0,
@@ -120,12 +122,16 @@ impl AppState {
         summary
     }
 
-    /// "120 excluded by filters, 3 rows removed as excluded" — None when filters changed nothing
+    /// "120 excluded by filters, 2 folders skipped, 3 rows removed as excluded" — None when the
+    /// filters left nothing out
     pub(crate) fn excluded_line(&self) -> Option<String> {
-        if self.files_excluded == 0 && self.rows_excluded_removed == 0 {
+        if self.files_excluded == 0 && self.folders_excluded == 0 && self.rows_excluded_removed == 0 {
             return None;
         }
         let mut line = format!("{} excluded by filters", fmt_count(self.files_excluded as i64));
+        if self.folders_excluded > 0 {
+            line.push_str(&format!(", {} folders skipped", fmt_count(self.folders_excluded as i64)));
+        }
         if self.rows_excluded_removed > 0 {
             line.push_str(&format!(", {} rows removed as excluded", fmt_count(self.rows_excluded_removed as i64)));
         }
@@ -271,9 +277,10 @@ impl AppState {
                 }
             }
             WorkerMsg::BatchWritten(n) => self.files_written += n,
-            WorkerMsg::Excluded(n) => {
-                self.files_excluded = n;
-                self.push_log(format!("{} files excluded by the file-type filters", n));
+            WorkerMsg::Excluded { files, folders } => {
+                self.files_excluded = files;
+                self.folders_excluded = folders;
+                self.push_log(format!("{} files and {} folders excluded by the filters", files, folders));
             }
             WorkerMsg::RemovedExcluded(n) => {
                 self.rows_excluded_removed = n;

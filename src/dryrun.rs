@@ -9,7 +9,7 @@ use std::{
 use walkdir::WalkDir;
 
 use crate::db::{file_tables, schema_version, stored_filter, table_exists, table_name_for, SCHEMA_VERSION};
-use crate::filters::{ext_of, TypeFilter};
+use crate::filters::{ext_of, filter_notes, IndexFilter, Overrides};
 use crate::fmt::{fmt_bytes, fmt_count, fmt_time};
 use crate::output::{write_text_table, Align, Out};
 
@@ -35,9 +35,9 @@ fn load_rows(conn: &Connection, t: &str) -> rusqlite::Result<Vec<(String, u64, S
     rows
 }
 
-/// What the real run would start from: its rows, the file-type filters recorded for the path
-/// (None if no runs are recorded), and notes about anything it would do first
-fn load_indexed(db_path: &str, typed: &str, root: &str) -> Result<(Indexed, Option<TypeFilter>, Vec<String>), String> {
+/// What the real run would start from: its rows, the filters recorded for the path (None if
+/// no runs are recorded), and notes about anything it would do first
+fn load_indexed(db_path: &str, typed: &str, root: &str) -> Result<(Indexed, Option<IndexFilter>, Vec<String>), String> {
     let mut notes = Vec::new();
     if !Path::new(db_path).exists() {
         notes.push(format!("no database at {} yet — the run would create it", db_path));
@@ -89,19 +89,13 @@ fn plural(n: i64, word: &str) -> String {
     format!("{} {}{}", fmt_count(n), word, if n == 1 { "" } else { "s" })
 }
 
-fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, override_filter: Option<&TypeFilter>) -> Result<(), String> {
+fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, overrides: &Overrides) -> Result<(), String> {
     let mode = if upsert { "update" } else { "index" };
     let (mut indexed, recorded, mut notes) = load_indexed(db_path, typed, root)?;
-    // Same rule as the real run: command-line filters replace the stored ones
-    let stored = recorded.clone().unwrap_or_default();
-    let filter = override_filter.cloned().unwrap_or_else(|| stored.clone());
-    if recorded.is_some() && filter != stored {
-        notes.push(format!("file-type filters would change: {} → {}", stored.describe(), filter.describe()));
-    } else if override_filter.is_none() && !filter.is_empty() {
-        notes.push(format!("using the stored file-type filters: {}", filter.describe()));
-    } else if !filter.is_empty() {
-        notes.push(format!("file-type filters: {}", filter.describe()));
-    }
+    // Same rule as the real run: command-line filters replace stored ones of the same kind
+    let filter = overrides.apply(&recorded.clone().unwrap_or_default());
+    notes.extend(filter_notes(recorded.as_ref(), &filter, overrides, true));
+    let root_path = PathBuf::from(root);
 
     let mut found = Tally::default();
     let mut kept = 0i64; // already indexed (index) or unchanged (update)
@@ -110,18 +104,26 @@ fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, override_filter
     let mut by_type: HashMap<String, Tally> = HashMap::new();
     let mut excluded = Tally::default();
     let mut excluded_by_type: HashMap<String, Tally> = HashMap::new();
-    let mut now_excluded = 0i64; // indexed rows whose type the filters now exclude
+    let mut now_excluded = 0i64; // indexed rows the filters now exclude
     let mut unreadable: Option<Vec<PathBuf>> = Some(Vec::new()); // None: an error had no path
     let mut errors = 0i64;
+    let pruned = std::cell::Cell::new(0i64); // folders the walk wouldn't enter
+    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+        let skip = e.depth() > 0 && e.file_type().is_dir() && filter.prunes_dir(e.path(), &root_path);
+        if skip {
+            pruned.set(pruned.get() + 1);
+        }
+        !skip
+    });
 
-    for entry in WalkDir::new(root) {
+    for entry in walker {
         match entry {
             Ok(e) if e.file_type().is_file() => {
                 let meta = e.metadata().ok();
                 let size = meta.as_ref().map_or(0, |m| m.len());
                 let key = e.path().to_string_lossy().into_owned();
                 let ext = ext_of(e.path());
-                if !filter.allows(&ext) {
+                if filter.skips_file(e.path(), &root_path) {
                     excluded.add(size);
                     excluded_by_type.entry(ext).or_default().add(size);
                     if indexed.remove(&key).is_some() {
@@ -165,13 +167,24 @@ fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, override_filter
         }
     }
 
+    // Rows under folders the walk would skip are excluded, not deleted
+    if !filter.paths.is_empty() {
+        let under_skipped: Vec<String> =
+            indexed.keys().filter(|p| filter.excludes_row(p, &root_path)).cloned().collect();
+        for p in under_skipped {
+            indexed.remove(&p);
+            now_excluded += 1;
+        }
+    }
+    let pruned = pruned.get();
+
     // What update would remove — with the real run's safeguards
     let mut removal_note = None;
     let mut remove = 0i64;
     if upsert && !indexed.is_empty() {
         match &unreadable {
-            // Excluded files still show the share is there
-            _ if found.files == 0 && excluded.files == 0 => {
+            // Excluded files and folders still show the share is there
+            _ if found.files == 0 && excluded.files == 0 && pruned == 0 => {
                 removal_note = Some(format!(
                     "nothing would be removed: no files found, which usually means an unmounted share ({} rows kept)",
                     fmt_count(indexed.len() as i64)
@@ -209,16 +222,17 @@ fn dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, override_filter
             },
         ),
     ];
-    if !filter.is_empty() {
+    if !filter.types.is_empty() || !filter.paths.is_empty() {
+        let folders = if pruned > 0 { format!(", {} not entered", plural(pruned, "folder")) } else { String::new() };
         summary.push((
             "Excluded".to_string(),
-            format!("{} · {}  ({})", plural(excluded.files, "file"), fmt_bytes(excluded.bytes as u64), filter.describe()),
+            format!("{} · {}{}", plural(excluded.files, "file"), fmt_bytes(excluded.bytes as u64), folders),
         ));
     }
     if upsert {
         summary.push(("Would remove".to_string(), format!("{} (no longer on disk)", plural(remove, "row"))));
         if now_excluded > 0 {
-            summary.push(("Now excluded".to_string(), format!("{} would be removed (type now excluded)", plural(now_excluded, "row"))));
+            summary.push(("Now excluded".to_string(), format!("{} would be removed (now excluded by filters)", plural(now_excluded, "row"))));
         }
     } else if now_excluded > 0 {
         notes.push(format!(
@@ -277,7 +291,7 @@ fn write_types(out: &mut Out, title: &str, by_type: HashMap<String, Tally>, tota
 }
 
 /// `typed` is the path as given; `root` its canonical form
-pub(crate) fn run_dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, filter: Option<&TypeFilter>) -> i32 {
+pub(crate) fn run_dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, filter: &Overrides) -> i32 {
     match dry_run(db_path, typed, root, upsert, filter) {
         Ok(()) => 0,
         Err(e) => {

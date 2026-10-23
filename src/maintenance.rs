@@ -52,8 +52,11 @@ fn db_info(conn: &Connection, db_path: &str) -> DbResult<()> {
                 };
                 println!("  last run    {} at {}, {}", r.last_mode, fmt_local(&r.last_started), outcome);
                 println!("  first run   {}", fmt_local(&r.first_run));
-                if !r.filter.is_empty() {
-                    println!("  filters     {}", r.filter.describe());
+                if !r.filter.types.is_empty() {
+                    println!("  filters     {}", r.filter.types.describe());
+                }
+                if !r.filter.paths.is_empty() {
+                    println!("  paths       {}", r.filter.paths.describe());
                 }
             }
             None => println!(

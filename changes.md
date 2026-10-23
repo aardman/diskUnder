@@ -1,5 +1,45 @@
 # diskUnder — Change Log
 
+## v5.3 — path filters
+
+### `--exclude-path`, `--include-path`, `--no-path-filters`
+
+`index` and `update` can skip paths by pattern. Patterns work like `.gitignore` and are
+case-sensitive (indexes can live on Linux filesystems even when diskunder runs on a Mac):
+
+- a pattern without `/` matches a name at any depth — `.snapshot`, `@eaDir`, `*.tmp`
+- a pattern with `/` is matched from the indexed root — `projects/*/render-cache`; `*` stays
+  within one folder name and `**` spans folders — `**/node_modules`
+- a trailing `/` matches folders only
+- a match on a folder covers everything under it
+
+Excluded folders are never entered — unless an `--include-path` could match something inside
+them. `--include-path` makes exceptions to `--exclude-path` (e.g. exclude a render cache but
+keep its `keep/` folder); on its own it does nothing, and the run says so. Both options repeat.
+
+Path filters are stored per path and reused by `update`, like file-type filters; the two kinds
+are replaced independently, and `--no-path-filters` clears path filters. Rows under folders
+that become excluded are removed by `update` as excluded — never counted as deleted — and the
+unmounted-share safeguard counts skipped folders as evidence the share is there. The summary's
+excluded line adds `N folders skipped`; the dry run shows `N folders not entered`; `db info`
+shows a `paths` line; `search` and `report` note on stderr when an index has path filters.
+
+New dependency: `globset` (the pattern matcher used by ripgrep).
+
+### Schema 3
+
+`roots` gains `exclude_paths` and `include_paths` (one pattern per line). Existing databases
+get them on their next `index` or `update`; read-only commands work on older databases.
+
+### Tests
+
+81 in total (was 71): 3 new unit tests for pattern matching, exceptions and pruning, storage
+and validation, and 7 end-to-end tests — including a locked excluded folder causing no error
+(proof it's never entered), filters replaced independently, rows under newly excluded folders
+kept apart from deleted ones, and the dry run's prediction matching the real run.
+
+---
+
 ## v5.2 — dry run and file-type filters
 
 ### `index --dry-run` / `update --dry-run`

@@ -198,11 +198,18 @@ impl Scope {
                         )),
                     }
                     // So "no duplicates" isn't mistaken for "no duplicates among types not indexed"
-                    if !r.filter.is_empty() {
+                    if !r.filter.types.is_empty() {
                         notes.push(format!(
                             "note: {} is indexed with file-type filters ({}) — other types aren't in the index",
                             r.root,
-                            r.filter.describe()
+                            r.filter.types.describe()
+                        ));
+                    }
+                    if !r.filter.paths.is_empty() {
+                        notes.push(format!(
+                            "note: {} is indexed with path filters ({}) — matching paths aren't in the index",
+                            r.root,
+                            r.filter.paths.describe()
                         ));
                     }
                 }

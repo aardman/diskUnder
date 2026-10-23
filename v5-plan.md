@@ -301,7 +301,13 @@ their definition.
 
 ---
 
-## 5.3 — Path patterns (Ignore)
+## 5.3 — Path patterns (Ignore) ✅
+
+**Done.** As designed below, with the two open questions settled: matching is
+**case-sensitive** (indexes can live on Linux filesystems even when run from a Mac), and
+**`--include-path`** makes exceptions to `--exclude-path` rather than acting as an allowlist.
+Also: a trailing `/` matches folders only, and `--no-path-filters` clears stored path filters.
+See [changes.md](changes.md).
 
 Skip folders and files by path — snapshot folders, NAS thumbnail caches, recycle bins,
 render caches.
@@ -542,7 +548,7 @@ Before the new commands:
 | 5.0 ✅ | Phase 0, run log, `search`, `export` | M |
 | 5.1 ✅ | `report`, including duplicate filtering and the summary | M |
 | 5.2 ✅ | Include / exclude file types; `index` / `update --dry-run` | M |
-| 5.3 | Path patterns (Ignore) | S–M |
+| 5.3 ✅ | Path patterns (Ignore) | S–M |
 | 5.4 | Jobs: saved runs, `run NAME`, test (`--dry-run`), run history | M |
 | 5.5 | Interactive app: main window, Jobs / Results / Database / Settings menus — can ship as 5.5.x steps | L |
 
@@ -565,12 +571,8 @@ and push routine as v4.1.
 - **Piped output keeps the readable table**; machine formats are explicit, and notes go to
   stderr (see [Output](#output)).
 
-## To settle when implementing 5.3
-
-1. **Path pattern case-sensitivity:** paths are case-sensitive on Linux but usually not on
-   macOS or SMB shares. Match case-insensitively by default, or follow the platform?
-2. **Include patterns too:** only `--exclude-path`, or also `--include-path` (index only
-   matching folders)? Exclude covers most needs; include can follow if asked for.
+- **Path patterns are case-sensitive**; **`--include-path` makes exceptions** to
+  `--exclude-path` (settled when implementing 5.3).
 
 ---
 

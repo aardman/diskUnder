@@ -861,7 +861,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     let db = tmp.path().join("t.db");
     let db_s = db.to_str().unwrap();
     run_in(tmp.path(), &["index", "data", "--db", db_s]);
-    assert_eq!(user_version(&db), 2);
+    assert_eq!(user_version(&db), 3);
     let t = table_for(&data);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension IN ('jpg', 'mov')", t)), 2);
 
@@ -874,7 +874,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     write(&data.join("c.PNG"), "c\n");
     let run = run_in(tmp.path(), &["update", "data", "--db", db_s]);
     assert!(run.stderr.contains("schema 1: stored 1 file extensions in lowercase"), "{}", run.stderr);
-    assert_eq!(user_version(&db), 2);
+    assert_eq!(user_version(&db), 3);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension != lower(extension)", t)), 0);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension = 'png'", t)), 1);
 
@@ -1591,7 +1591,7 @@ fn dry_run_reports_what_the_run_would_do_first() {
     create_v3_table(&db, "data/", &[("data/a", "sum-a")]);
 
     let q = dry(&tmp, &["index", "data/", "--db", db.to_str().unwrap()]);
-    assert!(q.stdout.contains("would first update the database schema to version 2"), "{}", q.stdout);
+    assert!(q.stdout.contains("would first update the database schema to version 3"), "{}", q.stdout);
     assert!(q.stdout.contains("would first migrate 1 rows from the table for \"data/\""), "{}", q.stdout);
     assert_eq!(dry_value(&q.stdout, "Already indexed"), 1, "migrated rows aren't re-hashed");
     assert_eq!(dry_value(&q.stdout, "Would hash"), 1);
@@ -1684,7 +1684,7 @@ fn changing_filters_removes_now_excluded_rows_separately_from_deleted_ones() {
     // index never removes rows — it says what update would do
     let idx = run_in(tmp.path(), &["index", "share", "--exclude-ext", "tmp", "--db", db_s]);
     assert!(idx.stderr.contains("file-type filters changed: all file types → exclude tmp"), "{}", idx.stderr);
-    assert!(idx.stderr.contains("4 indexed files are now excluded by the file-type filters — `update` removes their rows"), "{}", idx.stderr);
+    assert!(idx.stderr.contains("4 indexed files are now excluded by the filters — `update` removes their rows"), "{}", idx.stderr);
     assert_eq!(indexed_names(&db, &table_for(&d)).len(), 11);
 
     let upd = run_in(tmp.path(), &["update", "share", "--db", db_s]);
@@ -1780,6 +1780,191 @@ fn schema_1_databases_are_read_and_upgraded() {
     assert_eq!(query(tmp.path(), &["search", "share", "--db", db_s]).code, 0);
     let upd = run_in(tmp.path(), &["update", "share", "--exclude-ext", "tmp", "--db", db_s]);
     assert!(upd.stderr.contains("schema 2: added file-type filter columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 2);
+    assert_eq!(user_version(&db), 3);
     assert_eq!(stored_filters(&db), (None, Some("tmp".to_string())));
+}
+
+// ─── Path filters (5.3) ──────────────────────────────────────────────────────
+
+/// A NAS-like share: snapshots, Synology thumbnails, a render cache with an exception,
+/// node_modules, and a capitalised "Snapshot" folder that should be kept
+fn nas_share(tmp: &TempDir) -> PathBuf {
+    let d = tmp.path().join("share");
+    for f in [
+        "photos/a.jpg",
+        "photos/b.jpg",
+        "photos/@eaDir/a.jpg/thumb.jpg",
+        ".snapshot/daily/photos/a.jpg",
+        "projects/film/render-cache/f1.exr",
+        "projects/film/render-cache/f2.exr",
+        "projects/film/render-cache/keep/final.exr",
+        "projects/film/edit.prproj",
+        "web/node_modules/x/index.js",
+        "web/app.js",
+        "Snapshot/real.txt",
+    ] {
+        write(&d.join(f), &format!("{}\n", f));
+    }
+    d
+}
+
+const NAS_FILTERS: [&str; 10] = [
+    "--exclude-path", ".snapshot",
+    "--exclude-path", "@eaDir",
+    "--exclude-path", "projects/*/render-cache",
+    "--exclude-path", "**/node_modules",
+    "--include-path", "projects/*/render-cache/keep",
+];
+
+fn rel_paths(db: &Path, share: &Path) -> Vec<String> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn.prepare(&format!("SELECT path FROM {} ORDER BY path", table_for(share))).unwrap();
+    let prefix = format!("{}/", share.display());
+    let paths = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|p| p.unwrap().trim_start_matches(&prefix).to_string())
+        .collect();
+    paths
+}
+
+fn index_args<'a>(cmd: &'a str, db: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![cmd, "share", "--db", db];
+    args.extend_from_slice(extra);
+    args
+}
+
+#[test]
+fn path_patterns_skip_folders_and_files_with_exceptions() {
+    let tmp = TempDir::new();
+    let d = nas_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    let run = run_in(tmp.path(), &index_args("index", db_s, &NAS_FILTERS));
+    assert_eq!(
+        rel_paths(&db, &d),
+        [
+            "Snapshot/real.txt",
+            "photos/a.jpg",
+            "photos/b.jpg",
+            "projects/film/edit.prproj",
+            "projects/film/render-cache/keep/final.exr",
+            "web/app.js",
+        ],
+        "case-sensitive names, anchored wildcards, ** and an exception"
+    );
+    assert!(run.stderr.contains("\n2 excluded by filters, 3 folders skipped\n"), "{}", run.stderr);
+    assert!(run.stderr.contains("path filters: exclude .snapshot, @eaDir, projects/*/render-cache, **/node_modules · except projects/*/render-cache/keep"), "{}", run.stderr);
+}
+
+#[test]
+fn excluded_folders_are_never_entered() {
+    let tmp = TempDir::new();
+    let d = nas_share(&tmp);
+    chmod(&d.join(".snapshot"), "000");
+    if permissions_ignored(&d.join(".snapshot")) {
+        eprintln!("skipping: permissions not enforced (running as root?)");
+        return;
+    }
+    let db = tmp.path().join("t.db");
+    let run = run_in(tmp.path(), &index_args("index", db.to_str().unwrap(), &["--exclude-path", ".snapshot"]));
+    assert_eq!(run.summary.errors, "0 errors", "the locked .snapshot folder was never opened");
+    chmod(&d.join(".snapshot"), "755");
+}
+
+#[test]
+fn path_and_type_filters_are_stored_and_replaced_independently() {
+    let tmp = TempDir::new();
+    nas_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &index_args("index", db_s, &["--exclude-ext", "exr", "--exclude-path", ".snapshot"]));
+
+    let paths_only = run_in(tmp.path(), &index_args("update", db_s, &["--exclude-path", "@eaDir"]));
+    assert!(paths_only.stderr.contains("file-type filters: exclude exr"), "type filters kept:\n{}", paths_only.stderr);
+    assert!(paths_only.stderr.contains("path filters changed: exclude .snapshot → exclude @eaDir"), "{}", paths_only.stderr);
+
+    let cleared = run_in(tmp.path(), &index_args("update", db_s, &["--no-path-filters"]));
+    assert!(cleared.stderr.contains("path filters changed: exclude @eaDir → no path filters"), "{}", cleared.stderr);
+    let (exclude_paths, include_paths): (Option<String>, Option<String>) = Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT exclude_paths, include_paths FROM roots", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((exclude_paths, include_paths), (None, None));
+    assert_eq!(stored_filters(&db), (None, Some("exr".to_string())));
+
+    assert_eq!(query(tmp.path(), &index_args("index", db_s, &["--no-path-filters", "--exclude-path", "x"])).code, 2);
+    assert_eq!(query(tmp.path(), &index_args("index", db_s, &["--exclude-path", "a/[b"])).code, 2, "invalid pattern");
+}
+
+#[test]
+fn rows_under_newly_excluded_folders_are_excluded_not_deleted() {
+    let tmp = TempDir::new();
+    let d = nas_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &index_args("index", db_s, &[]));
+    fs::remove_file(d.join("web/app.js")).unwrap();
+
+    let idx = run_in(tmp.path(), &index_args("index", db_s, &["--exclude-path", ".snapshot", "--exclude-path", "photos"]));
+    assert!(idx.stderr.contains("4 indexed files are now excluded by the filters — `update` removes their rows"), "{}", idx.stderr);
+    assert_eq!(rel_paths(&db, &d).len(), 11, "index never removes rows");
+
+    let upd = run_in(tmp.path(), &index_args("update", db_s, &[]));
+    assert_eq!(upd.summary.removed, 1, "only the deleted web/app.js");
+    assert!(upd.stderr.contains("4 rows removed as excluded"), "{}", upd.stderr);
+    assert!(!rel_paths(&db, &d).iter().any(|p| p.starts_with("photos/") || p.starts_with(".snapshot/")));
+}
+
+#[test]
+fn include_path_alone_does_nothing_and_says_so() {
+    let tmp = TempDir::new();
+    nas_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let run = run_in(tmp.path(), &index_args("index", db.to_str().unwrap(), &["--include-path", "photos"]));
+    assert_eq!(run.summary.written, 11);
+    assert!(run.stderr.contains("--include-path only makes exceptions to --exclude-path"), "{}", run.stderr);
+}
+
+#[test]
+fn dry_run_predicts_path_filter_changes() {
+    let tmp = TempDir::new();
+    let d = nas_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &index_args("index", db_s, &[]));
+    fs::remove_file(d.join("web/app.js")).unwrap();
+
+    let q = dry(&tmp, &index_args("update", db_s, &NAS_FILTERS));
+    assert!(q.stdout.contains("path filters would change: no path filters → exclude .snapshot"), "{}", q.stdout);
+    assert!(q.stdout.contains(", 3 folders not entered"), "{}", q.stdout);
+    let real = run_in(tmp.path(), &index_args("update", db_s, &NAS_FILTERS));
+    assert_eq!(dry_value(&q.stdout, "Found") as usize, real.summary.found);
+    assert_eq!(dry_value(&q.stdout, "Would remove") as usize, real.summary.removed);
+    let now_excluded = dry_value(&q.stdout, "Now excluded");
+    assert!(real.stderr.contains(&format!("{} rows removed as excluded", now_excluded)), "{} vs\n{}", now_excluded, real.stderr);
+}
+
+#[test]
+fn path_filters_show_in_db_info_and_queries_and_schema_2_upgrades() {
+    let tmp = TempDir::new();
+    nas_share(&tmp);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &index_args("index", db_s, &["--exclude-path", ".snapshot"]));
+
+    assert!(db_cmd(tmp.path(), &["info", "--db", db_s]).stdout.contains("  paths       exclude .snapshot\n"));
+    assert!(query(tmp.path(), &["search", "share", "--db", db_s])
+        .stderr
+        .contains("is indexed with path filters (exclude .snapshot) — matching paths aren't in the index"));
+
+    // Back to a v5.2 database: no path filter columns, schema version 2
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("ALTER TABLE roots DROP COLUMN exclude_paths; ALTER TABLE roots DROP COLUMN include_paths;").unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    drop(conn);
+    assert_eq!(db_cmd(tmp.path(), &["info", "--db", db_s]).code, 0, "read-only commands cope");
+    let upd = run_in(tmp.path(), &index_args("update", db_s, &["--exclude-path", "@eaDir"]));
+    assert!(upd.stderr.contains("schema 3: added path filter columns to the roots table"), "{}", upd.stderr);
+    assert_eq!(user_version(&db), 3);
 }
