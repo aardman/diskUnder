@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 5.5.2`:
+**Check it worked** — this should print `diskunder 5.5.3`:
 
 ```bash
 diskunder --version
@@ -368,7 +368,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Settings  Help                       diskUnder v5.5.2 · /data/index.db
+ Jobs  Results  Database  Settings  Help                       diskUnder v5.5.3 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -399,10 +399,40 @@ $ diskunder run nas-nightly
   - Browse (`b`) — folders by size with files, share and duplicated space; `⏎` goes in, `⌫` up
 - **Runs carry on in the bottom strip** while you use the menus — one at a time. Quitting
   during a run asks first, and records it as stopped by user.
+- **Database menu**, for the open database: Info, Check, Vacuum…, Drop path… (warns if a job
+  uses the index), Open… (another database), Backup… (a consistent copy — see `db backup`).
+- **Settings menu**: Start, Defaults, File types, Deletion, Logging — the settings below,
+  edited in place (`⏎` edits or toggles, `x` puts one back to its default).
 - Outside a terminal (cron, pipes), `diskunder` with no command prints the help, as before.
 
-The Database and Settings menus arrive in 5.5.3 — the command line has them already
-(`diskunder db …`).
+---
+
+## Settings
+
+Kept in the per-user store with your jobs. Change them in the app's Settings menu, or:
+
+```bash
+diskunder settings
+diskunder settings set defaults.threads 8
+diskunder settings set types.raw cr2,nef,arw
+diskunder settings unset defaults.threads
+```
+
+| Setting | What it does |
+|---|---|
+| `start.db`, `start.select_last_job` | the database the app opens (unless `--db` is given), and whether it selects the last-run job |
+| `defaults.mode`, `.threads`, `.include_ext`, `.exclude_ext`, `.exclude_paths` | what the app's New job form starts with |
+| `types.NAME` | file-type groups — `@NAME` in any type filter, on the command line or in the app |
+| `deletion.*` | how v6's quarantine and dedupe behave — stored now, used from v6 |
+| `log.folder`, `log.rotate_mb` | where run logs go (blank: next to each database) and when they rotate |
+
+**Type groups** come built in — `@images`, `@video`, `@audio`, `@documents`, `@archives`,
+`@temporary` — and can be changed, removed (`settings set types.NAME ""`) or added to:
+
+```bash
+diskunder index /Volumes/Media --include-ext @video,@audio --db /data/index.db
+diskunder search --ext @archives --larger-than 1GB
+```
 
 ---
 
@@ -471,6 +501,7 @@ A cron line:
 | `diskunder db drop --table <NAME>` | Removes a table by name — for tables `db info` lists with no recorded path |
 | `diskunder db vacuum` | Compacts the file. SQLite reuses space freed by `update` and `drop` but doesn't shrink the file until vacuumed |
 | `diskunder db check` | Runs SQLite's integrity check (exit code 2 if it finds problems) and lists tables with no recorded path |
+| `diskunder db backup FILE` | Copies the database to FILE — consistent and compacted, safe while it's in use; never overwrites |
 
 ```bash
 diskunder db info   --db /data/index.db
@@ -595,7 +626,9 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Include / exclude file types — `--include-ext`, `--exclude-ext`, stored per path | No | No | No | No | No | Yes (5.2) |
 | Ignore — exclude paths by `.gitignore`-style pattern, with exceptions; excluded folders never entered | No | No | No | No | No | Yes (5.3) |
 | Jobs — named, saved runs: `jobs add/list/show/edit/remove`, `run NAME`, run history (menu in 5.5) | No | No | No | No | No | Yes (5.4) |
-| Interactive app — main window, Jobs and Results menus (Database and Settings to follow) | No | No | No | No | No | Partly (5.5.2) |
+| Interactive app — main window, Jobs / Results / Database / Settings menus | No | No | No | No | No | Yes (5.5) |
+| Settings — app start-up, job defaults, `@type` groups, log folder and rotation | No | No | No | No | No | Yes (5.5.3) |
+| `db backup` — consistent copy of an index database | No | No | No | No | No | Yes (5.5.3) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
@@ -610,7 +643,7 @@ The project was developed in multiple languages, each addressing the limitations
 - **Rust v2:** All known bugs fixed, plain-text output only
 - **Rust v3:** Full TUI with live progress and duplicate detection, with automatic plain-text fallback
 - **Rust v4:** Fixes — cheap resume, change detection in `update`, duplicate tracking that scales to large shares. v4.1 adds database maintenance (`diskunder db`)
-- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters, 5.4 adds jobs, 5.5 the interactive app (in steps); the rest is planned in [v5-plan.md](v5-plan.md)
+- **Rust v5** (current, `src/`): Features, in small releases — 5.0 adds `search`, `export` and a run log, 5.1 adds `report`, 5.2 adds `--dry-run` and file-type filters, 5.3 adds path filters, 5.4 adds jobs, 5.5 the interactive app and settings; v6 is planned in [v5-plan.md](v5-plan.md)
 
 Only the current Rust version is kept in this repository; the earlier versions were not committed.
 
@@ -640,7 +673,8 @@ diskunder/
 │   ├── run.rs         #   one index / update run (shared by jobs)
 │   ├── jobs.rs        #   jobs and run history
 │   ├── app/           #   the interactive app: state and keys, drawing, the job form,
-│   │                  #   Search / Duplicates / Browse, tests
+│   │                  #   Search / Duplicates / Browse, Settings view, tests
+│   ├── settings.rs    #   settings and type groups
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)

@@ -11,6 +11,7 @@ use std::{
 use crate::output::FileRow;
 use crate::query::{build_parts, build_query, parse_age, parse_ext_list, parse_size, resolve_scope, ExtList, FilterArgs, SortKey};
 use crate::report::{duplicate_groups_for, group_members_for, plain_options, GroupInfo, Member};
+use crate::settings::Settings;
 
 const SEARCH_ROWS: usize = 200;
 const SEARCH_PAUSE: Duration = Duration::from_millis(300); // re-run once typing pauses
@@ -109,6 +110,7 @@ pub(crate) enum Outcome {
 
 pub(crate) struct Search {
     pub(crate) target: Target,
+    settings: Settings, // for @groups in Types
     pub(crate) fields: Fields,
     pub(crate) results: Vec<FileRow>,
     pub(crate) total: usize,
@@ -121,11 +123,11 @@ pub(crate) struct Search {
 const SORTS: &[&str] = &["path", "size", "modified", "name"];
 
 impl Search {
-    pub(crate) fn new(target: Target) -> Self {
+    pub(crate) fn new(target: Target, settings: Settings) -> Self {
         let fields = Fields {
             items: vec![
                 Fields::text("Name", "e.g. *.mov — * and ? wildcards"),
-                Fields::text("Types", "extensions, e.g. jpg,mov (none = no extension)"),
+                Fields::text("Types", "extensions, e.g. jpg,mov or @video (none = no extension)"),
                 Fields::text("Larger than", "e.g. 500MB, 1.5GB"),
                 Fields::text("Smaller than", "e.g. 10K"),
                 Fields::text("Older than", "modified before: 90d, 6w, 3m, 1y or 2024-01-01"),
@@ -136,7 +138,7 @@ impl Search {
             ],
             focus: 0,
         };
-        let mut s = Search { target, fields, results: Vec::new(), total: 0, error: None, in_results: false, selected: 0, changed: None };
+        let mut s = Search { target, settings, fields, results: Vec::new(), total: 0, error: None, in_results: false, selected: 0, changed: None };
         s.refresh();
         s
     }
@@ -146,7 +148,7 @@ impl Search {
         let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
         let mut filters = FilterArgs { name: opt(f.get("Name")), under: opt(f.get("Under")), ..FilterArgs::default() };
         if !f.get("Types").is_empty() {
-            filters.ext = Some(parse_ext_list(f.get("Types"))?);
+            filters.ext = Some(parse_ext_list(&self.settings.expand_types(f.get("Types"))?)?);
         }
         if !f.get("Larger than").is_empty() {
             filters.larger_than = Some(parse_size(f.get("Larger than"))?);
@@ -277,6 +279,7 @@ impl Search {
 
 pub(crate) struct Dups {
     pub(crate) target: Target,
+    settings: Settings, // for @groups in Types
     pub(crate) filters: Fields,
     pub(crate) groups: Vec<GroupInfo>,
     pub(crate) selected: usize,
@@ -285,7 +288,7 @@ pub(crate) struct Dups {
 }
 
 impl Dups {
-    pub(crate) fn new(target: Target) -> Self {
+    pub(crate) fn new(target: Target, settings: Settings) -> Self {
         let filters = Fields {
             items: vec![
                 Fields::text("Min size", "each copy at least, e.g. 100MB"),
@@ -296,7 +299,7 @@ impl Dups {
             ],
             focus: 0,
         };
-        let mut d = Dups { target, filters, groups: Vec::new(), selected: 0, members: Vec::new(), error: None };
+        let mut d = Dups { target, settings, filters, groups: Vec::new(), selected: 0, members: Vec::new(), error: None };
         d.reload();
         d
     }
@@ -312,7 +315,8 @@ impl Dups {
         } else {
             f.get("Min copies").parse::<usize>().map_err(|_| "min copies must be a whole number".to_string())?
         };
-        let ext: Option<ExtList> = if f.get("Types").is_empty() { None } else { Some(parse_ext_list(f.get("Types"))?) };
+        let ext: Option<ExtList> =
+            if f.get("Types").is_empty() { None } else { Some(parse_ext_list(&self.settings.expand_types(f.get("Types"))?)?) };
         let under = (!f.get("Under").is_empty()).then(|| f.get("Under").to_string());
         Ok((FilterArgs { ext, under, ..FilterArgs::default() }, size("Min size")?, copies, size("Min wasted")?))
     }

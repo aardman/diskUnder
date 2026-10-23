@@ -5,7 +5,7 @@ Inspired by feature parity with [Diskover](https://diskoverdata.com/). Items are
 **Planned for v5** (small releases — see [v5-plan.md](v5-plan.md) for design, schema changes
 and sizing): 5.0 run log, `search` and `export` (**done**) · 5.1 `report` with duplicate filtering (**done**) · 5.2
 include/exclude file types and `--dry-run` preview (**done**) · 5.3 path patterns (Ignore) (**done**) · 5.4 Jobs (**done**) ·
-5.5 interactive app (TUI). **Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
+5.5 interactive app (TUI) (**done**). **Planned for v6:** quarantine, then `dedupe` with its dry run. The sections below are the
 original ideas.
 
 ---
@@ -171,7 +171,7 @@ Possible actions: `flag` (mark in DB), `report` (print to stdout), `delete` (wit
 explicit confirmation prompt — never silent).
 
 ### Interactive app (TUI)
-**In progress (5.5.1 and 5.5.2 done)** — design in [v5-plan.md](v5-plan.md). Replaces the earlier "results
+**Done in 5.5 (5.5.1–5.5.3)** — design in [v5-plan.md](v5-plan.md). Replaces the earlier "results
 browser TUI" idea with a full app: `diskunder` with no subcommand opens a main window listing
 jobs and indexed paths (with status and last-run details), and menus for **Jobs** (create,
 run, test, edit, status, remove), **Results** (latest, search, duplicates, reports, browse,

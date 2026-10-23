@@ -160,6 +160,11 @@ pub(crate) enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Settings: list them, or `settings set KEY VALUE` / `settings unset KEY`
+    Settings {
+        #[command(subcommand)]
+        action: Option<SettingsAction>,
+    },
     /// Inspect and maintain the index database
     Db {
         #[command(subcommand)]
@@ -216,6 +221,14 @@ pub(crate) enum JobsAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum SettingsAction {
+    /// Change a setting, e.g. `settings set log.rotate_mb 50` or `settings set types.raw cr2,nef`
+    Set { key: String, value: String },
+    /// Put a setting back to its default
+    Unset { key: String },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum DbAction {
     /// List indexed paths with file counts, duplicates, size and last run
     Info,
@@ -235,6 +248,11 @@ pub(crate) enum DbAction {
     Vacuum,
     /// Run SQLite's integrity check and report tables with no recorded path
     Check,
+    /// Copy the database to FILE — a consistent, compacted copy, safe while it's in use
+    Backup {
+        /// Where to write the copy (must not exist)
+        dest: String,
+    },
 }
 
 /// Filters for `index` and `update`. Type options replace the stored type filters and path

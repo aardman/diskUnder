@@ -1,5 +1,53 @@
 # diskUnder — Change Log
 
+## v5.5.3 — interactive app: Database and Settings; settings and type groups
+
+### Database menu
+
+For the open database: **Info** and **Check** (as `db info` / `db check`), **Vacuum…** (in the
+background), **Drop path…** (choose an index; warns when a job uses it), **Open…** another
+database, and **Backup…**. App actions are logged with what they did — e.g.
+`db vacuum --db … [app]` — rather than the app's empty command line.
+
+### `diskunder db backup FILE`
+
+A consistent, compacted copy of the database (SQLite's `VACUUM INTO`), safe while it's in use.
+Refuses to overwrite. It changes nothing, so it isn't logged.
+
+### Settings
+
+A `settings` table in the per-user store, edited in the app's Settings menu (`⏎` edits or
+toggles in place; `x` back to the default) or with `diskunder settings` / `settings set KEY
+VALUE` / `settings unset KEY`. Values are checked as they're set.
+
+- **Start:** the database the app opens when `--db` isn't given; select the last-run job.
+- **Defaults:** mode, threads, types and path patterns the New job form starts with.
+- **File type groups:** `@images`, `@video`, `@audio`, `@documents`, `@archives`, `@temporary`
+  built in; change, remove or add with `types.NAME`. `@NAME` works in every type filter —
+  `--include-ext`, `--exclude-ext`, `--ext`, and the app's fields; an unknown group is an error.
+- **Deletion:** dry run first, confirm before quarantine, purge after N days — stored now for
+  v6. Turning off dry run first asks for confirmation in the app.
+- **Logging:** a folder for run logs (instead of beside each database) and the rotation size.
+
+Every command now reads settings at start (cheaply; nothing is created if there's no store).
+The test suite points every command at a store that never exists, so tests can't see your
+real settings.
+
+### Build
+
+`make mac` / `make linux` remove the old binary before copying the new one: overwriting a
+binary that has already run makes macOS kill the new copy at launch (exit 137).
+
+### Tests
+
+113 in total (was 102): app tests for the Database menu (info, check, vacuum and its log line,
+backup, drop with the job warning, open) and the Settings view (editing, refusing bad values,
+the dry-run confirmation, adding a group, defaults in the New job form, @groups in Search and
+the form, selecting the last-run job); CLI tests for `settings`, @groups in every filter, the
+log folder and rotation, and `db backup`.
+
+---
+
 ## v5.5.2 — interactive app: Search, Duplicates, Reports, Browse
 
 The rest of the Results menu, for the selected job or indexed path:

@@ -56,6 +56,10 @@ CREATE TABLE IF NOT EXISTS job_run_errors (
     message       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_job_run_errors_run ON job_run_errors(run, seq);
+CREATE TABLE IF NOT EXISTS settings (
+    key           TEXT PRIMARY KEY,
+    value         TEXT NOT NULL
+);
 ";
 
 fn db_err(e: rusqlite::Error) -> String {
@@ -84,7 +88,7 @@ pub(crate) fn store_path(arg: Option<&str>) -> PathBuf {
 }
 
 /// Open the store. Commands that only read it don't create it.
-fn open_store(path: &Path, create: bool) -> Result<Option<Connection>, String> {
+pub(crate) fn open_store(path: &Path, create: bool) -> Result<Option<Connection>, String> {
     if !path.exists() {
         if !create {
             return Ok(None);

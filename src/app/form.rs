@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::filters::{parse_path_pattern, Overrides, PathFilter, TypeFilter};
 use crate::jobs::{check_name, Job};
 use crate::query::parse_ext_list;
+use crate::settings::Settings;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Kind {
@@ -62,7 +63,18 @@ fn ext_list(exts: &[String]) -> String {
 }
 
 impl Form {
-    pub(crate) fn new_job(db: &str) -> Self {
+    /// A blank job, prefilled with the defaults from settings
+    pub(crate) fn new_job(db: &str, settings: &Settings) -> Self {
+        let mut f = Form::empty(db);
+        f.fields[MODE].value = settings.get("defaults.mode").to_string();
+        f.fields[THREADS].value = settings.get("defaults.threads").to_string();
+        f.fields[INCLUDE_EXT].value = settings.get("defaults.include_ext").to_string();
+        f.fields[EXCLUDE_EXT].value = settings.get("defaults.exclude_ext").to_string();
+        f.fields[EXCLUDE_PATHS].value = settings.get("defaults.exclude_paths").to_string();
+        f
+    }
+
+    fn empty(db: &str) -> Self {
         Form {
             editing: None,
             fields: vec![
@@ -71,8 +83,8 @@ impl Form {
                 field("Path", String::new(), Kind::Text, "the directory to index"),
                 field("Database", db.to_string(), Kind::Text, "index database file — created on the first run"),
                 field("Threads", "4".into(), Kind::Text, "parallel hashing; keep low for network shares"),
-                field("Include types", String::new(), Kind::Text, "only these extensions, e.g. jpg,mov — blank for all"),
-                field("Exclude types", String::new(), Kind::Text, "skip these extensions, e.g. tmp,log"),
+                field("Include types", String::new(), Kind::Text, "only these extensions, e.g. jpg,mov or @images — blank for all"),
+                field("Exclude types", String::new(), Kind::Text, "skip these extensions, e.g. tmp,log or @temporary"),
                 field("Exclude paths", String::new(), Kind::Text, "patterns, comma-separated, e.g. .snapshot, @eaDir"),
                 field("Exceptions", String::new(), Kind::Text, "paths to index even if excluded, comma-separated"),
             ],
@@ -82,7 +94,7 @@ impl Form {
     }
 
     pub(crate) fn edit_job(job: &Job) -> Self {
-        let mut f = Form::new_job(&job.db);
+        let mut f = Form::empty(&job.db);
         f.editing = Some(job.name.clone());
         f.fields[NAME].value = job.name.clone();
         f.fields[NAME].locked = true;
@@ -142,7 +154,7 @@ impl Form {
     }
 
     /// Check every field; on failure, focus the field at fault
-    pub(crate) fn values(&mut self) -> Result<FormValues, String> {
+    pub(crate) fn values(&mut self, settings: &Settings) -> Result<FormValues, String> {
         let v = |i: usize| self.fields[i].value.trim().to_string();
         let fail = |form: &mut Form, i: usize, msg: String| -> Result<FormValues, String> {
             form.focus = i;
@@ -164,7 +176,7 @@ impl Form {
         };
         let exts = |i: usize| -> Result<Option<Vec<String>>, String> {
             let s = v(i);
-            if s.is_empty() { Ok(None) } else { parse_ext_list(&s).map(|l| Some(l.0)) }
+            if s.is_empty() { Ok(None) } else { parse_ext_list(&settings.expand_types(&s)?).map(|l| Some(l.0)) }
         };
         let include = match exts(INCLUDE_EXT) {
             Ok(x) => x,

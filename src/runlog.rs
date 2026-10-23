@@ -5,14 +5,29 @@ use chrono::{Local, SecondsFormat};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::cli::display_version;
 use crate::scan::WorkerMsg;
 
-const ROTATE_AT_BYTES: u64 = 10 * 1024 * 1024; // renamed to <log>.1 beyond this
+/// Where run logs go and when they rotate — from settings, set once at startup
+struct LogConfig {
+    folder: Option<PathBuf>, // None: next to each database
+    rotate_at: u64,          // bytes; the log is renamed to <log>.1 beyond this
+}
+
+static CONFIG: OnceLock<LogConfig> = OnceLock::new();
+
+pub(crate) fn configure(folder: Option<PathBuf>, rotate_mb: u64) {
+    let _ = CONFIG.set(LogConfig { folder, rotate_at: rotate_mb.max(1) * 1024 * 1024 });
+}
+
+fn rotate_at() -> u64 {
+    CONFIG.get().map_or(10 * 1024 * 1024, |c| c.rotate_at)
+}
 const MAX_ERRORS: usize = 50; // per run; any beyond this are counted, not written
 
 pub(crate) struct RunLog {
@@ -24,12 +39,22 @@ pub(crate) struct RunLog {
     errors_dropped: usize,
     errors: Vec<String>, // the errors logged (up to MAX_ERRORS), kept for job history
     failure: Option<String>,
+    command: Option<String>, // what `start` records, instead of this process's command line
 }
 
 impl RunLog {
     /// Logs to `log`, or `<db_path>.log` by default; `disabled` is `--no-log`
     pub(crate) fn new(db_path: &str, log: Option<&str>, disabled: bool) -> Self {
-        let path = (!disabled).then(|| PathBuf::from(log.map_or_else(|| format!("{}.log", db_path), str::to_owned)));
+        // --log, else the log folder from settings, else beside the database
+        let path = (!disabled).then(|| match (log, CONFIG.get().and_then(|c| c.folder.as_ref())) {
+            (Some(l), _) => PathBuf::from(l),
+            (None, Some(folder)) => {
+                let name = Path::new(db_path).file_name().map_or("index.db".into(), |n| n.to_string_lossy().into_owned());
+                let _ = fs::create_dir_all(folder);
+                folder.join(format!("{}.log", name))
+            }
+            (None, None) => PathBuf::from(format!("{}.log", db_path)),
+        });
         // Short id tying together the lines of one run when two runs share a log
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
         let id = format!("{:06x}", (nanos ^ std::process::id().wrapping_mul(2_654_435_761)) & 0xff_ffff);
@@ -42,13 +67,22 @@ impl RunLog {
             errors_dropped: 0,
             errors: Vec::new(),
             failure: None,
+            command: None,
         }
     }
 
-    /// Start, recording this process's command line
+    /// Start, recording this process's command line (or the command set with `for_command`)
     pub(crate) fn start(&mut self) {
-        let command: Vec<String> = std::env::args().skip(1).map(|a| shell_quote(&a)).collect();
-        self.start_as(&command.join(" "));
+        let command = self.command.clone().unwrap_or_else(|| {
+            std::env::args().skip(1).map(|a| shell_quote(&a)).collect::<Vec<_>>().join(" ")
+        });
+        self.start_as(&command);
+    }
+
+    /// Record `command` as what was run — for actions the app takes, which has no command line
+    pub(crate) fn for_command(mut self, command: String) -> Self {
+        self.command = Some(command);
+        self
     }
 
     /// Start, recording `command` — for runs started from the app, which has no command line
@@ -145,7 +179,7 @@ impl RunLog {
 
     fn rotate_if_large(&self) {
         if let Some(path) = &self.path {
-            if fs::metadata(path).is_ok_and(|m| m.len() >= ROTATE_AT_BYTES) {
+            if fs::metadata(path).is_ok_and(|m| m.len() >= rotate_at()) {
                 let _ = fs::rename(path, format!("{}.1", path.display()));
             }
         }

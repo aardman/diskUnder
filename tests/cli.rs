@@ -12,6 +12,14 @@ use std::time::{Duration, SystemTime};
 
 const BIN: &str = env!("CARGO_BIN_EXE_diskunder");
 
+/// The binary, kept away from your real settings: a per-user store that never exists (jobs
+/// and settings tests pass --config-db, which wins)
+fn bin() -> Command {
+    let mut c = Command::new(BIN);
+    c.env("DISKUNDER_CONFIG_DB", std::env::temp_dir().join(format!("diskunder-test-nostore-{}.db", std::process::id())));
+    c
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Temporary directory removed on drop. Canonicalised, because the tool stores
@@ -86,7 +94,7 @@ fn run_failing(cwd: &Path, args: &[&str]) -> Run {
 }
 
 fn run_expecting(cwd: &Path, args: &[&str], code: i32) -> Run {
-    let out = Command::new(BIN)
+    let out = bin()
         .args(args)
         .arg("--no-tui")
         .current_dir(cwd)
@@ -605,7 +613,7 @@ fn update_backfills_device_and_inode_without_rehashing() {
 fn missing_path_fails_before_touching_the_database() {
     let tmp = TempDir::new();
     let db = tmp.path().join("t.db");
-    let out = Command::new(BIN)
+    let out = bin()
         .args(["index", "does-not-exist", "--db", db.to_str().unwrap(), "--no-tui"])
         .current_dir(tmp.path())
         .output()
@@ -622,7 +630,7 @@ fn global_flags_work_before_or_after_the_subcommand() {
     distinct_files(&data, 3);
     let (db1, db2) = (tmp.path().join("before.db"), tmp.path().join("after.db"));
 
-    let out = Command::new(BIN)
+    let out = bin()
         .args(["--no-tui", "--db", db1.to_str().unwrap(), "--threads", "2", "index", "data"])
         .current_dir(tmp.path())
         .output()
@@ -646,10 +654,10 @@ fn default_database_is_fileindex_db_in_the_working_directory() {
 #[test]
 fn bad_arguments_are_rejected() {
     for args in [&["index"][..], &["frobnicate", "x"], &["index", "x", "--threads", "lots"]] {
-        let out = Command::new(BIN).args(args).output().unwrap();
+        let out = bin().args(args).output().unwrap();
         assert!(!out.status.success(), "{:?} should fail", args);
     }
-    let help = Command::new(BIN).arg("--help").output().unwrap();
+    let help = bin().arg("--help").output().unwrap();
     let text = String::from_utf8_lossy(&help.stdout);
     for word in ["index", "update", "--db", "--threads", "--no-tui"] {
         assert!(text.contains(word), "--help mentions {}:\n{}", word, text);
@@ -666,7 +674,7 @@ struct DbRun {
 
 /// Runs `diskunder db …` with stdin closed (i.e. not interactive)
 fn db_cmd(cwd: &Path, args: &[&str]) -> DbRun {
-    let out = Command::new(BIN)
+    let out = bin()
         .arg("db")
         .args(args)
         .current_dir(cwd)
@@ -1049,7 +1057,7 @@ struct Query {
 }
 
 fn query(cwd: &Path, args: &[&str]) -> Query {
-    let out = Command::new(BIN).args(args).current_dir(cwd).output().unwrap();
+    let out = bin().args(args).current_dir(cwd).output().unwrap();
     Query {
         code: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1974,7 +1982,7 @@ fn path_filters_show_in_db_info_and_queries_and_schema_2_upgrades() {
 /// Runs diskunder against a temporary jobs store (never the real ~/.config), stdin closed
 fn jobs_cmd(tmp: &TempDir, args: &[&str]) -> Query {
     let store = tmp.path().join("store/diskunder.db");
-    let out = Command::new(BIN)
+    let out = bin()
         .args(args)
         .args(["--config-db", store.to_str().unwrap(), "--no-tui"])
         .current_dir(tmp.path())
@@ -2041,7 +2049,7 @@ fn run_uses_the_job_and_records_history() {
     let elsewhere = tmp.path().join("elsewhere");
     fs::create_dir_all(&elsewhere).unwrap();
     let store_path = tmp.path().join("store/diskunder.db");
-    let out = Command::new(BIN)
+    let out = bin()
         .args(["run", "nightly", "--no-tui", "--config-db", store_path.to_str().unwrap()])
         .current_dir(&elsewhere)
         .output()
@@ -2196,4 +2204,84 @@ fn the_database_folder_is_created_if_missing() {
     let run = run_in(tmp.path(), &["index", "data", "--db", "new/folder/t.db"]);
     assert_eq!(run.summary.written, 2);
     assert!(tmp.path().join("new/folder/t.db").exists() && tmp.path().join("new/folder/t.db.log").exists());
+}
+
+// ─── Settings and backup (5.5.3) ─────────────────────────────────────────────
+
+#[test]
+fn settings_list_set_and_unset() {
+    let tmp = TempDir::new();
+    let list = ok(jobs_cmd(&tmp, &["settings"]));
+    assert!(list.stdout.contains("log.rotate_mb") && list.stdout.contains("10 (default)"), "{}", list.stdout);
+    assert!(list.stdout.contains("types.images") && list.stdout.contains("(built in)"), "{}", list.stdout);
+    assert!(!tmp.path().join("store").exists(), "listing doesn't create the store");
+
+    assert!(ok(jobs_cmd(&tmp, &["settings", "set", "defaults.threads", "8"])).stdout.contains("defaults.threads = 8"));
+    let bad = jobs_cmd(&tmp, &["settings", "set", "defaults.threads", "lots"]);
+    assert!(bad.code == 1 && bad.stderr.contains("whole number"), "{}", bad.stderr);
+    assert_eq!(jobs_cmd(&tmp, &["settings", "set", "no.such", "1"]).code, 1);
+    ok(jobs_cmd(&tmp, &["settings", "set", "types.raw", "CR2, nef"]));
+    let list = ok(jobs_cmd(&tmp, &["settings"]));
+    assert!(list.stdout.contains("types.raw") && list.stdout.contains("cr2,nef"), "{}", list.stdout);
+    ok(jobs_cmd(&tmp, &["settings", "unset", "defaults.threads"]));
+    assert!(ok(jobs_cmd(&tmp, &["settings"])).stdout.contains("defaults.threads"));
+}
+
+#[test]
+fn type_groups_work_in_every_type_filter() {
+    let tmp = TempDir::new();
+    let d = tmp.path().join("share");
+    write(&d.join("a.jpg"), "a\n");
+    write(&d.join("b.MOV"), "b\n");
+    write(&d.join("c.cr2"), "c\n");
+    write(&d.join("d.txt"), "d\n");
+    ok(jobs_cmd(&tmp, &["settings", "set", "types.raw", "cr2,nef"]));
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+
+    ok(jobs_cmd(&tmp, &["index", "share", "--include-ext", "@images,@raw,@video", "--db", db_s]));
+    let mut indexed = indexed_names(&db, &table_for(&d));
+    indexed.sort();
+    assert_eq!(indexed, ["a.jpg", "b.MOV", "c.cr2"], "groups expanded for indexing");
+    let found = ok(jobs_cmd(&tmp, &["search", "share", "--ext", "@raw", "--paths", "--db", db_s]));
+    assert_eq!(names(&found.stdout), ["c.cr2"]);
+    let unknown = jobs_cmd(&tmp, &["search", "--ext", "@nope", "--db", db_s]);
+    assert_eq!(unknown.code, 2);
+    assert!(unknown.stderr.contains("no type group @nope"), "{}", unknown.stderr);
+}
+
+#[test]
+fn log_folder_and_rotation_come_from_settings() {
+    let tmp = TempDir::new();
+    distinct_files(&tmp.path().join("data"), 2);
+    let logs = tmp.path().join("logs");
+    ok(jobs_cmd(&tmp, &["settings", "set", "log.folder", logs.to_str().unwrap()]));
+    ok(jobs_cmd(&tmp, &["settings", "set", "log.rotate_mb", "1"]));
+    let db = tmp.path().join("idx/t.db");
+    fs::create_dir_all(&logs).unwrap();
+    File::create(logs.join("t.db.log")).unwrap().set_len(1024 * 1024).unwrap();
+
+    ok(jobs_cmd(&tmp, &["index", "data", "--db", db.to_str().unwrap()]));
+    assert!(!tmp.path().join("idx/t.db.log").exists(), "not beside the database");
+    assert_eq!(fs::metadata(logs.join("t.db.log.1")).unwrap().len(), 1024 * 1024, "rotated at 1 MB");
+    assert!(fs::read_to_string(logs.join("t.db.log")).unwrap().contains(" end "));
+}
+
+#[test]
+fn db_backup_makes_a_usable_copy() {
+    let tmp = TempDir::new();
+    let d = tmp.path().join("data");
+    distinct_files(&d, 3);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "data", "--db", db_s]);
+
+    let copy = tmp.path().join("backups/copy.db");
+    let b = db_cmd(tmp.path(), &["backup", copy.to_str().unwrap(), "--db", db_s]);
+    assert_eq!(b.code, 0, "{}", b.stderr);
+    assert!(b.stdout.starts_with("backed up "), "{}", b.stdout);
+    assert_eq!(count(&copy, &format!("SELECT COUNT(*) FROM {}", table_for(&d))), 3);
+    let again = db_cmd(tmp.path(), &["backup", copy.to_str().unwrap(), "--db", db_s]);
+    assert!(again.code == 1 && again.stderr.contains("already exists"), "never overwrites: {}", again.stderr);
+    assert_eq!(log_lines(&db).len(), 2, "a backup changes nothing, so it isn't logged");
 }

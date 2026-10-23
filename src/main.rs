@@ -17,13 +17,14 @@ mod report;
 mod run;
 mod runlog;
 mod scan;
+mod settings;
 mod search;
 mod tui;
 
 use clap::{CommandFactory, Parser};
 use std::{fs, io::IsTerminal};
 
-use crate::cli::{Cli, Command, JobsAction, Mode};
+use crate::cli::{Cli, Command, JobsAction, Mode, SettingsAction};
 use crate::dryrun::run_dry_run;
 use crate::jobs::{run_jobs_command, store_path, JobSettings, JobsCommand, LogArgs};
 use crate::maintenance::run_db_command;
@@ -31,17 +32,30 @@ use crate::report::{run_report, ReportOptions};
 use crate::run::{report_log_failure, run_indexing, IndexRun};
 use crate::runlog::RunLog;
 use crate::search::{run_export, run_search, SearchOptions};
+use crate::settings::{run_settings_command, Settings, SettingsCommand};
 
 fn main() {
-    let args = Cli::parse();
+    let mut args = Cli::parse();
+    let store = store_path(args.config_db.as_deref());
+    let settings = Settings::load(&store);
+    runlog::configure(
+        Some(settings.get("log.folder")).filter(|f| !f.is_empty()).map(std::path::PathBuf::from),
+        settings.number("log.rotate_mb"),
+    );
+    if let Err(e) = expand_type_groups(&mut args, &settings) {
+        eprintln!("error: {}", e);
+        std::process::exit(2);
+    }
     let db = args.db();
     let log_args = LogArgs { log: args.log.clone(), no_log: args.no_log, no_tui: args.no_tui };
-    let store = store_path(args.config_db.as_deref());
 
     let Some(cmd) = &args.cmd else {
         // No command: the interactive app — only in a terminal; otherwise, the help
         if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-            std::process::exit(app::run_app(store, &db, args.log.clone(), args.no_log));
+            // The app opens --db if given, else the database from settings
+            let start = settings.get("start.db");
+            let app_db = args.db.clone().unwrap_or_else(|| if start.is_empty() { db.clone() } else { start.to_string() });
+            std::process::exit(app::run_app(store, &app_db, args.log.clone(), args.no_log));
         }
         let _ = Cli::command().print_help();
         std::process::exit(2);
@@ -73,6 +87,14 @@ fn main() {
                 let cmd = JobsCommand::Run { name: name.as_deref(), dry_run: *dry_run, threads: args.threads };
                 run_jobs_command(&store, cmd, &log_args)
             }
+        }
+        Command::Settings { action } => {
+            let cmd = match action {
+                None => SettingsCommand::List,
+                Some(SettingsAction::Set { key, value }) => SettingsCommand::Set { key, value },
+                Some(SettingsAction::Unset { key }) => SettingsCommand::Unset { key },
+            };
+            run_settings_command(&store, cmd)
         }
         Command::Db { action } => {
             let mut runlog = RunLog::new(&db, args.log.as_deref(), args.no_log);
@@ -122,6 +144,29 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// `@group` tokens in any type filter become the group's extensions (see `diskunder settings`)
+fn expand_type_groups(args: &mut Cli, settings: &Settings) -> Result<(), String> {
+    let mut lists: Vec<&mut query::ExtList> = Vec::new();
+    match args.cmd.as_mut() {
+        Some(Command::Index { types, .. } | Command::Update { types, .. }) => {
+            lists.extend(types.include_ext.as_mut());
+            lists.extend(types.exclude_ext.as_mut());
+        }
+        Some(Command::Jobs { action: JobsAction::Add { types, .. } | JobsAction::Edit { types, .. } }) => {
+            lists.extend(types.include_ext.as_mut());
+            lists.extend(types.exclude_ext.as_mut());
+        }
+        Some(Command::Search { filters, .. } | Command::Export { filters, .. } | Command::Report { filters, .. }) => {
+            lists.extend(filters.ext.as_mut());
+        }
+        _ => {}
+    }
+    for list in lists {
+        settings.expand_list(list)?;
+    }
+    Ok(())
 }
 
 /// Job settings from the command line: only what was given (the global --db and --threads

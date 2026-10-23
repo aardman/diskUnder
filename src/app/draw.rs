@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use super::results::{Browse, Dups, Fields, Search};
-use super::{App, Dialog, PathEntry, Selected, View, MENUS, REPORTS};
+use super::{App, Dialog, InputFor, PathEntry, Selected, View, MENUS, REPORTS};
 use crate::cli::display_version;
 use crate::fmt::{fmt_bytes, fmt_count, fmt_local, truncate_path};
 use crate::jobs::{fmt_secs, opt_count, status, JobSummary, RunRow};
@@ -67,6 +67,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         View::Search(x) => draw_search(f, x, rows[1]),
         View::Duplicates(x) => draw_dups(f, x, rows[1]),
         View::Browse(x) => draw_browse(f, x, rows[1]),
+        View::Settings(x) => x.draw(f, &app.settings, rows[1]),
     }
     if strip > 0 {
         draw_strip(f, app, rows[2]);
@@ -457,6 +458,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             View::Search(_) => "type to filter — results update as you go · Tab / ↑↓ fields · space cycles choices · ⏎ results · Esc back",
             View::Duplicates(_) => "↑↓ groups · f filters · c copy command · Esc back",
             View::Browse(_) => "↑↓ select · ⏎ / → into folder · ⌫ / ← up · c copy command · Esc back",
+            View::Settings(x) if x.editing.is_some() => "type the value · ⏎ save · Esc cancel · Ctrl-U clear",
+            View::Settings(_) => "↑↓ select · ⏎ edit (or toggle) · x back to default / remove group · c copy command · Esc back",
             _ => "↑↓ PgUp PgDn scroll · c copy command · Esc back",
         }
     };
@@ -539,6 +542,70 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             );
         }
         Dialog::DupFilters { .. } => {} // drawn with the Duplicates view, which owns the fields
+        Dialog::Vacuum => {
+            let area = centered(64, 5, area);
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from("Compact the database file? It may take a while on a big index."),
+                    Line::from(Span::styled("y vacuum · Esc cancel", DIM)),
+                ])
+                .block(Block::default().borders(Borders::ALL).title(" Vacuum ")),
+                area,
+            );
+        }
+        Dialog::DropIndex { items, selected, confirm } => {
+            let height = items.len().min(14) as u16 + 4;
+            let area = centered(90, height, area);
+            f.render_widget(Clear, area);
+            if *confirm {
+                let it = &items[*selected];
+                let mut lines = vec![Line::from(format!("Remove the index of {}? This can't be undone.", it.label))];
+                if let Some(job) = &it.job {
+                    lines.push(Line::from(Span::styled(
+                        format!("Job {} uses it — its next run will index everything again.", job),
+                        Style::new().fg(Color::Yellow),
+                    )));
+                }
+                lines.push(Line::from(Span::styled("y remove · Esc cancel", DIM)));
+                f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Drop path ")), area);
+            } else {
+                let rows: Vec<ListItem> = items
+                    .iter()
+                    .map(|it| {
+                        let job = it.job.as_ref().map_or(String::new(), |j| format!("   (job {})", j));
+                        // Long paths shortened from the left so the job note stays visible
+                        let room = (area.width as usize).saturating_sub(job.chars().count() + 5);
+                        ListItem::new(Line::from(vec![Span::raw(format!(" {}", truncate_path(&it.label, room))), Span::styled(job, DIM)]))
+                    })
+                    .collect();
+                let mut state = ListState::default();
+                state.select(Some(*selected));
+                f.render_stateful_widget(
+                    List::new(rows)
+                        .block(Block::default().borders(Borders::ALL).title(" Drop path — ⏎ choose · Esc cancel "))
+                        .highlight_style(Style::new().bg(Color::Cyan).fg(Color::Black)),
+                    area,
+                    &mut state,
+                );
+            }
+        }
+        Dialog::Input { purpose, value } => {
+            let (title, help) = match purpose {
+                InputFor::Open => (" Open database ", "an index database file — created by the first run if it doesn't exist"),
+                InputFor::Backup => (" Back up database ", "where to write the copy — a new file; safe while the database is in use"),
+            };
+            let area = centered(100, 5, area);
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(format!("{}▏", value), Style::new().fg(Color::Cyan))),
+                    Line::from(Span::styled(format!("{} · ⏎ ok · Esc cancel · Ctrl-U clear", help), DIM)),
+                ])
+                .block(Block::default().borders(Borders::ALL).title(title)),
+                area,
+            );
+        }
         Dialog::QuitWhileRunning => {
             let area = centered(64, 5, area);
             f.render_widget(Clear, area);

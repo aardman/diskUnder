@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::filters::Overrides;
+use crate::settings::Settings;
 use crate::run::IndexRun;
 
 struct Tmp(PathBuf);
@@ -199,7 +200,7 @@ fn removing_a_job_and_its_index() {
 }
 
 #[test]
-fn menus_open_views_and_say_what_comes_later() {
+fn menus_open_views() {
     let (_t, mut app) = setup();
     press(&mut app, &[KeyCode::Char('m')]);
     assert!(screen(&app).contains("Create…"), "Jobs menu open");
@@ -208,9 +209,10 @@ fn menus_open_views_and_say_what_comes_later() {
     press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
     assert!(matches!(app.view, View::Status));
     assert!(screen(&app).contains("Status — all jobs"));
-    press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Enter]);
-    assert_eq!(app.message.as_deref(), Some("the Database and Settings menus come in 5.5.3"));
-    press(&mut app, &[KeyCode::Char('?')]);
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('m'), KeyCode::Left, KeyCode::Left, KeyCode::Left, KeyCode::Enter]); // Database → Info
+    settle(&mut app);
+    assert!(screen(&app).contains("database: "), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('?')]);
     assert!(screen(&app).contains("Every screen shows its command line"));
     press(&mut app, &[KeyCode::Esc, KeyCode::Char('q')]);
     assert!(app.quit);
@@ -340,4 +342,198 @@ fn reports_menu_shows_the_report() {
     settle(&mut app);
     let s = screen(&app);
     assert!(s.contains("Overview — nightly") && s.contains("Duplicates             1 group"), "{}", s);
+}
+
+
+// ─── Database and Settings menus (5.5.3) ─────────────────────────────────────
+
+fn open_database_menu(app: &mut App, item: usize) {
+    press(app, &[KeyCode::Char('m'), KeyCode::Right, KeyCode::Right]);
+    for _ in 0..item {
+        press(app, &[KeyCode::Down]);
+    }
+    press(app, &[KeyCode::Enter]);
+}
+
+#[test]
+fn database_menu_info_check_vacuum_and_backup() {
+    let (t, mut app) = indexed();
+    open_database_menu(&mut app, 0);
+    settle(&mut app);
+    let s = screen(&app);
+    assert!(s.contains("database: ") && s.contains("/share") && s.contains("/other"), "both indexes:\n{}", s);
+    assert_eq!(app.command(), format!("diskunder db info --db {}", app.db));
+
+    press(&mut app, &[KeyCode::Esc]);
+    open_database_menu(&mut app, 1);
+    settle(&mut app);
+    assert!(screen(&app).contains("integrity: ok"), "{}", screen(&app));
+
+    press(&mut app, &[KeyCode::Esc]);
+    open_database_menu(&mut app, 2);
+    assert!(screen(&app).contains("Compact the database file?"));
+    press(&mut app, &[KeyCode::Char('y')]);
+    settle(&mut app);
+    assert!(screen(&app).contains("vacuumed "), "{}", screen(&app));
+    let log = fs::read_to_string(format!("{}.log", app.db)).unwrap();
+    assert!(log.contains(&format!("start  db vacuum --db {} [app]", app.db)), "the app names what it did:\n{}", log);
+
+    press(&mut app, &[KeyCode::Esc]);
+    open_database_menu(&mut app, 5);
+    if let Some(Dialog::Input { value, .. }) = &app.dialog {
+        assert!(value.starts_with(&format!("{}.backup-", app.db)), "{}", value);
+    } else {
+        panic!("backup asks where to");
+    }
+    press(&mut app, &[KeyCode::Char('u')]);
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    type_text(&mut app, &t.s("backups/copy.db"));
+    assert_eq!(app.command(), format!("diskunder db backup {} --db {}", t.s("backups/copy.db"), app.db));
+    press(&mut app, &[KeyCode::Enter]);
+    settle(&mut app);
+    assert!(screen(&app).contains("backed up "), "{}", screen(&app));
+    let copy = Connection::open(t.path("backups/copy.db")).unwrap();
+    let tables: i64 = copy.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'files_%' AND type='table'", [], |r| r.get(0)).unwrap();
+    assert_eq!(tables, 2, "a full copy, both indexes");
+}
+
+#[test]
+fn database_menu_drops_an_index_and_warns_about_jobs() {
+    let (t, mut app) = indexed();
+    open_database_menu(&mut app, 3);
+    let s = screen(&app);
+    assert!(s.contains("(job nightly)") && s.contains("/other"), "{}", s);
+    // The job's index first (alphabetical), then other — choose the job's to see the warning
+    let job_row = match &app.dialog {
+        Some(Dialog::DropIndex { items, .. }) => items.iter().position(|i| i.job.is_some()).unwrap(),
+        _ => panic!("drop chooser"),
+    };
+    for _ in 0..job_row {
+        press(&mut app, &[KeyCode::Down]);
+    }
+    press(&mut app, &[KeyCode::Enter]);
+    assert!(screen(&app).contains("Job nightly uses it"), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Esc]);
+
+    open_database_menu(&mut app, 3);
+    let other_row = match &app.dialog {
+        Some(Dialog::DropIndex { items, .. }) => items.iter().position(|i| i.label == t.s("other")).unwrap(),
+        _ => panic!("drop chooser"),
+    };
+    for _ in 0..other_row {
+        press(&mut app, &[KeyCode::Down]);
+    }
+    press(&mut app, &[KeyCode::Enter, KeyCode::Char('y')]);
+    assert!(app.message.as_deref().unwrap_or("").starts_with("removed the index of"), "{:?}", app.message);
+    assert!(app.paths.is_empty(), "other no longer listed");
+}
+
+#[test]
+fn database_menu_opens_another_database() {
+    let (t, mut app) = setup();
+    open_database_menu(&mut app, 4);
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    type_text(&mut app, &t.s("elsewhere.db"));
+    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(app.db, t.s("elsewhere.db"));
+    assert!(app.paths.is_empty());
+    assert!(app.message.as_deref().unwrap_or("").contains("nothing indexed there yet"));
+    assert!(screen(&app).contains("elsewhere.db"), "the menu bar shows the open database");
+}
+
+fn settings_row(app: &App, key: &str) -> usize {
+    match &app.view {
+        View::Settings(v) => v.rows.iter().position(|r| matches!(r, settings_view::RowKind::Setting(k) if *k == key)).unwrap(),
+        _ => panic!("not in settings"),
+    }
+}
+
+fn select_setting(app: &mut App, key: &str) {
+    let i = settings_row(app, key);
+    if let View::Settings(v) = &mut app.view {
+        v.selected = i;
+    }
+}
+
+#[test]
+fn settings_are_edited_in_place_and_used() {
+    let (_t, mut app) = setup();
+    app.act(Action::Settings(1));
+    assert!(screen(&app).contains("Defaults for new jobs") && screen(&app).contains("defaults.threads"));
+
+    select_setting(&mut app, "defaults.threads");
+    press(&mut app, &[KeyCode::Enter]);
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    type_text(&mut app, "8");
+    assert_eq!(app.command(), "diskunder settings set defaults.threads 8");
+    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(app.message.as_deref(), Some("defaults.threads = 8"));
+    assert_eq!(Settings::load(&app.store).get("defaults.threads"), "8");
+
+    select_setting(&mut app, "defaults.threads");
+    press(&mut app, &[KeyCode::Enter, KeyCode::Char('x'), KeyCode::Enter]);
+    assert!(app.message.as_deref().unwrap_or("").contains("whole number"), "bad values are refused: {:?}", app.message);
+    press(&mut app, &[KeyCode::Esc]);
+
+    // Turning off dry run first asks; anything but y keeps it
+    select_setting(&mut app, "deletion.dry_run_default");
+    press(&mut app, &[KeyCode::Enter]);
+    assert!(screen(&app).contains("turn off dry run first?"));
+    press(&mut app, &[KeyCode::Char('n')]);
+    assert!(app.settings.yes("deletion.dry_run_default"));
+    press(&mut app, &[KeyCode::Enter, KeyCode::Char('y')]);
+    assert!(!app.settings.yes("deletion.dry_run_default"));
+    press(&mut app, &[KeyCode::Char('x')]);
+    assert!(app.settings.yes("deletion.dry_run_default"), "x puts it back to the default");
+
+    // A new type group, then the defaults in the New job form
+    let add = match &app.view {
+        View::Settings(v) => v.rows.iter().position(|r| *r == settings_view::RowKind::AddGroup).unwrap(),
+        _ => unreachable!(),
+    };
+    if let View::Settings(v) = &mut app.view {
+        v.selected = add;
+    }
+    press(&mut app, &[KeyCode::Enter]);
+    type_text(&mut app, "stills: jpg,png");
+    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(app.settings.expand_types("@stills").unwrap(), "jpg,png");
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('n')]);
+    let Some(Dialog::Form(form)) = &app.dialog else { panic!("form") };
+    assert_eq!(form.fields[4].value, "8", "threads default prefilled");
+}
+
+#[test]
+fn type_groups_work_in_search_and_the_job_form() {
+    let (t, mut app) = indexed();
+    press(&mut app, &[KeyCode::Char('/'), KeyCode::Tab]);
+    type_text(&mut app, "@video");
+    std::thread::sleep(Duration::from_millis(350));
+    app.tick();
+    assert!(screen(&app).contains("1 matches") && screen(&app).contains("big.mov"), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('n')]);
+    type_text(&mut app, "clips");
+    press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+    type_text(&mut app, &t.s("share"));
+    for _ in 0..3 {
+        press(&mut app, &[KeyCode::Tab]);
+    }
+    type_text(&mut app, "@video");
+    press(&mut app, &[KeyCode::Enter]);
+    let job = app.jobs.iter().find(|s| s.job.name == "clips").expect("created");
+    assert!(job.job.filter.types.include.as_ref().unwrap().contains(&"mov".to_string()), "the group was expanded");
+}
+
+#[test]
+fn the_app_selects_the_last_run_job() {
+    let (t, mut app) = setup();
+    let settings = JobSettings { upsert: Some(false), path: Some(&t.s("other")), db: Some(&t.s("idx/second.db")), threads: None, overrides: Overrides::default() };
+    create_job(&app.store, "a-first", &settings).unwrap();
+    app.refresh();
+    let i = app.jobs.iter().position(|s| s.job.name == "nightly").unwrap();
+    app.selected = i;
+    press(&mut app, &[KeyCode::Enter]);
+    settle(&mut app);
+    let reopened = App::new(app.store.clone(), &app.db, None, true);
+    assert!(matches!(reopened.selected(), Selected::Job(s) if s.job.name == "nightly"), "a-first sorts first, but nightly ran last");
 }

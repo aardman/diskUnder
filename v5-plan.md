@@ -415,7 +415,10 @@ same store holds the 5.5 settings.
 ## 5.5 — Interactive app (TUI)
 
 **5.5.1 done:** main window, Jobs menu, and Results' run views (Latest, History, Errors, Logs).
-**5.5.2 done:** Search, Duplicates, Reports, Browse. Next: 5.5.3 (Database and Settings).
+**5.5.2 done:** Search, Duplicates, Reports, Browse.
+**5.5.3 done:** Database and Settings menus, the `settings` table and command, `@type` groups
+in every type filter, configurable run-log folder and rotation, and `db backup`. **5.5 is
+complete.**
 
 `diskunder` with no subcommand, in a terminal, opens a full-screen app. With a subcommand,
 piped or from cron, nothing changes. It's a front end to 5.0–5.4: every screen runs the same
@@ -557,7 +560,7 @@ Before the new commands:
 | 5.2 ✅ | Include / exclude file types; `index` / `update --dry-run` | M |
 | 5.3 ✅ | Path patterns (Ignore) | S–M |
 | 5.4 ✅ | Jobs: saved runs, `run NAME`, test (`--dry-run`), run history | M |
-| 5.5 | Interactive app: main window, Jobs / Results / Database / Settings menus — can ship as 5.5.x steps | L |
+| 5.5 ✅ | Interactive app: main window, Jobs / Results / Database / Settings menus — shipped as 5.5.1–5.5.3 | L |
 
 S is under a day of focused work, M is one to three, L is a week or more. These are rough. Each release ships
 with integration tests in the style of `tests/cli.rs`, header checks for the CSV and JSON

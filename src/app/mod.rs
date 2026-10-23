@@ -4,6 +4,7 @@
 mod draw;
 mod form;
 mod results;
+mod settings_view;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
@@ -33,6 +34,10 @@ use crate::run::{finish_run, start_run, Started};
 use crate::runlog::RunLog;
 use form::{Form, FormKey};
 use results::{Browse, Dups, Outcome, Search, Target};
+use settings_view::{SettingsOutcome, SettingsView};
+
+use crate::maintenance::{backup, check_text, drop_table, info_text, vacuum};
+use crate::settings::Settings;
 
 const TICK: Duration = Duration::from_millis(100);
 const RECENT_RUNS: usize = 4; // for the details pane
@@ -63,6 +68,20 @@ pub(crate) enum View {
     Search(Box<Search>),
     Duplicates(Box<Dups>),
     Browse(Box<Browse>),
+    Settings(Box<SettingsView>),
+}
+
+/// An index the Database menu can drop: (label, table, the job that uses it)
+pub(crate) struct DropItem {
+    pub(crate) label: String,
+    pub(crate) table: String,
+    pub(crate) job: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum InputFor {
+    Open,
+    Backup,
 }
 
 /// The report sections the Reports menu offers: (label, `report` options)
@@ -82,6 +101,9 @@ pub(crate) enum Dialog {
     Help,
     Reports { selected: usize },
     DupFilters { saved: Vec<String> }, // values to restore if the edit is cancelled
+    Vacuum,
+    DropIndex { items: Vec<DropItem>, selected: usize, confirm: bool },
+    Input { purpose: InputFor, value: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -100,7 +122,13 @@ pub(crate) enum Action {
     Duplicates,
     Reports,
     Browse,
-    Later, // Database and Settings menus: 5.5.3
+    DbInfo,
+    DbCheck,
+    DbVacuum,
+    DbDrop,
+    DbOpen,
+    DbBackup,
+    Settings(usize), // opens at this section
     Help,
     Quit,
 }
@@ -131,8 +159,27 @@ pub(crate) const MENUS: [(&str, &[(&str, &str, Action)]); 5] = [
             ("Browse", "b", Action::Browse),
         ],
     ),
-    ("Database", &[("Coming in 5.5.3 — use `diskunder db` for now", "", Action::Later)]),
-    ("Settings", &[("Coming in 5.5.3", "", Action::Later)]),
+    (
+        "Database",
+        &[
+            ("Info", "", Action::DbInfo),
+            ("Check", "", Action::DbCheck),
+            ("Vacuum…", "", Action::DbVacuum),
+            ("Drop path…", "", Action::DbDrop),
+            ("Open…", "", Action::DbOpen),
+            ("Backup…", "", Action::DbBackup),
+        ],
+    ),
+    (
+        "Settings",
+        &[
+            ("Start", "", Action::Settings(0)),
+            ("Defaults", "", Action::Settings(1)),
+            ("File types", "", Action::Settings(2)),
+            ("Deletion", "", Action::Settings(3)),
+            ("Logging", "", Action::Settings(4)),
+        ],
+    ),
     ("Help", &[("Keys", "?", Action::Help), ("Quit", "q", Action::Quit)]),
 ];
 
@@ -165,6 +212,7 @@ pub(crate) struct App {
     pub(crate) finished: Option<String>, // the strip's last line once a run ends
     pending: Option<Pending>, // a test or report working in the background
     pub(crate) message: Option<String>, // one-line feedback in the footer
+    pub(crate) settings: Settings,
     pub(crate) quit: bool,
 }
 
@@ -199,9 +247,17 @@ impl App {
             finished: None,
             pending: None,
             message: None,
+            settings: Settings::default(),
             quit: false,
         };
+        app.settings = Settings::load(&app.store);
         app.refresh();
+        if app.settings.yes("start.select_last_job") {
+            let latest = app.jobs.iter().enumerate().filter_map(|(i, s)| s.last.as_ref().map(|r| (r.started.clone(), i))).max();
+            if let Some((_, i)) = latest {
+                app.selected = i;
+            }
+        }
         app
     }
 
@@ -285,8 +341,23 @@ impl App {
 
     /// The command line equivalent to what's on screen
     pub(crate) fn command(&self) -> String {
-        if let Some(Dialog::Form(f)) = &self.dialog {
-            return f.command();
+        match &self.dialog {
+            Some(Dialog::Form(f)) => return f.command(),
+            Some(Dialog::Vacuum) => return format!("diskunder db vacuum --db {}", self.db),
+            Some(Dialog::DropIndex { items, selected, .. }) => {
+                if let Some(it) = items.get(*selected) {
+                    return if it.label.starts_with("files_") {
+                        format!("diskunder db drop --table {} --db {}", it.table, self.db)
+                    } else {
+                        format!("diskunder db drop {} --db {}", it.label, self.db)
+                    };
+                }
+            }
+            Some(Dialog::Input { purpose: InputFor::Open, value }) => return format!("diskunder --db {}", value),
+            Some(Dialog::Input { purpose: InputFor::Backup, value }) => {
+                return format!("diskunder db backup {} --db {}", value, self.db)
+            }
+            _ => {}
         }
         match &self.view {
             View::Status => "diskunder jobs list".into(),
@@ -296,6 +367,7 @@ impl App {
             View::Search(x) => x.command(),
             View::Duplicates(x) => x.command(),
             View::Browse(x) => x.command(),
+            View::Settings(x) => x.command(&self.settings),
             View::Main => match self.selected() {
                 Selected::Job(s) => format!("diskunder run {}", s.job.name),
                 Selected::Path(p) => match &p.root {
@@ -550,7 +622,7 @@ impl App {
         self.menu = None;
         self.view = View::Main;
         match action {
-            Action::NewJob => self.dialog = Some(Dialog::Form(Form::new_job(&self.db))),
+            Action::NewJob => self.dialog = Some(Dialog::Form(Form::new_job(&self.db, &self.settings))),
             Action::Run => self.run_job(),
             Action::Test => self.test_job(),
             Action::Edit => match self.selected_job() {
@@ -576,12 +648,12 @@ impl App {
             Action::Logs => self.show_logs(),
             Action::Search => {
                 if let Some(t) = self.target() {
-                    self.view = View::Search(Box::new(Search::new(t)));
+                    self.view = View::Search(Box::new(Search::new(t, self.settings.clone())));
                 }
             }
             Action::Duplicates => {
                 if let Some(t) = self.target() {
-                    self.view = View::Duplicates(Box::new(Dups::new(t)));
+                    self.view = View::Duplicates(Box::new(Dups::new(t, self.settings.clone())));
                 }
             }
             Action::Browse => {
@@ -594,7 +666,28 @@ impl App {
                     self.dialog = Some(Dialog::Reports { selected: 0 });
                 }
             }
-            Action::Later => self.message = Some("the Database and Settings menus come in 5.5.3".into()),
+            Action::DbInfo => {
+                let db = self.db.clone();
+                self.spawn_text(format!("Database — {}", db), format!("diskunder db info --db {}", db), move || {
+                    info_text(&db).map(|t| (t, Vec::new()))
+                });
+            }
+            Action::DbCheck => {
+                let db = self.db.clone();
+                self.spawn_text(format!("Check — {}", db), format!("diskunder db check --db {}", db), move || {
+                    check_text(&db).map(|(t, _)| (t, Vec::new()))
+                });
+            }
+            Action::DbVacuum => self.dialog = Some(Dialog::Vacuum),
+            Action::DbDrop => self.choose_drop(),
+            Action::DbOpen => self.dialog = Some(Dialog::Input { purpose: InputFor::Open, value: self.db.clone() }),
+            Action::DbBackup => {
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+                self.dialog = Some(Dialog::Input { purpose: InputFor::Backup, value: format!("{}.backup-{}", self.db, stamp) });
+            }
+            Action::Settings(section) => {
+                self.view = View::Settings(Box::new(SettingsView::new(&self.store, &self.settings, section)));
+            }
             Action::Help => self.dialog = Some(Dialog::Help),
             Action::Quit => self.request_quit(),
         }
@@ -684,6 +777,21 @@ impl App {
     }
 
     fn view_key(&mut self, key: KeyEvent) {
+        if let View::Settings(v) = &mut self.view {
+            if v.editing.is_none() && key.code == KeyCode::Char('c') {
+                return self.copy_command();
+            }
+            match v.key(key, &self.settings) {
+                SettingsOutcome::Stay => {}
+                SettingsOutcome::Back => self.view = View::Main,
+                SettingsOutcome::Changed(msg) => {
+                    self.settings = Settings::load(&self.store);
+                    self.message = Some(msg);
+                }
+                SettingsOutcome::Message(msg) => self.message = Some(msg),
+            }
+            return;
+        }
         // Views with their own keys (Search types into fields; Browse uses ← to go up)
         let outcome = match &mut self.view {
             View::Search(x) => {
@@ -745,7 +853,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(runs.len().saturating_sub(1)),
                 _ => {}
             },
-            View::Status | View::Main | View::Search(_) | View::Duplicates(_) | View::Browse(_) => {}
+            View::Status | View::Main | View::Search(_) | View::Duplicates(_) | View::Browse(_) | View::Settings(_) => {}
         }
         // Keys that open another view
         match (&self.view, key.code) {
@@ -811,6 +919,52 @@ impl App {
                     }
                 }
             }
+            Dialog::Vacuum => {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+                    let (db, log, no_log) = (self.db.clone(), self.log.clone(), self.no_log);
+                    self.spawn_text(format!("Vacuum — {}", db), format!("diskunder db vacuum --db {}", db), move || {
+                        let mut runlog =
+                            RunLog::new(&db, log.as_deref(), no_log).for_command(format!("db vacuum --db {} [app]", db));
+                        vacuum(&db, &mut runlog).map(|t| (t, Vec::new()))
+                    });
+                }
+            }
+            Dialog::DropIndex { items, selected, confirm } => match (confirm, key.code) {
+                (false, KeyCode::Up) => self.dialog = Some(Dialog::DropIndex { items, selected: selected.saturating_sub(1), confirm }),
+                (false, KeyCode::Down) => {
+                    let selected = (selected + 1).min(items.len().saturating_sub(1));
+                    self.dialog = Some(Dialog::DropIndex { items, selected, confirm });
+                }
+                (false, KeyCode::Enter) if !items.is_empty() => self.dialog = Some(Dialog::DropIndex { items, selected, confirm: true }),
+                (true, KeyCode::Char('y')) => {
+                    let item = &items[selected];
+                    let mut runlog = RunLog::new(&self.db, self.log.as_deref(), self.no_log)
+                        .for_command(format!("db drop --table {} --db {} [app]", item.table, self.db));
+                    self.message = Some(match drop_table(&self.db, &item.table, &mut runlog) {
+                        Ok(summary) => summary,
+                        Err(e) => e,
+                    });
+                    self.refresh();
+                }
+                (_, KeyCode::Esc) | (true, _) => {}
+                _ => self.dialog = Some(Dialog::DropIndex { items, selected, confirm }),
+            },
+            Dialog::Input { purpose, mut value } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.submit_input(purpose, value.trim().to_string()),
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.dialog = Some(Dialog::Input { purpose, value });
+                }
+                KeyCode::Char('u') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    self.dialog = Some(Dialog::Input { purpose, value: String::new() });
+                }
+                KeyCode::Char(c) => {
+                    value.push(c);
+                    self.dialog = Some(Dialog::Input { purpose, value });
+                }
+                _ => self.dialog = Some(Dialog::Input { purpose, value }),
+            },
             Dialog::Form(mut form) => match form.handle_key(key) {
                 FormKey::Continue => self.dialog = Some(Dialog::Form(form)),
                 FormKey::Cancel => {}
@@ -845,8 +999,56 @@ impl App {
         });
     }
 
+    /// Every index in the open database, with the job that uses it (if any)
+    fn choose_drop(&mut self) {
+        let Ok(conn) = Connection::open(&self.db) else {
+            self.message = Some(format!("can't open {}", self.db));
+            return;
+        };
+        let roots = load_roots(&conn).unwrap_or_default();
+        let items: Vec<DropItem> = file_tables(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
+                let root = roots.get(&t).map(|r| r.root.clone());
+                let job = root.as_ref().and_then(|r| {
+                    self.jobs.iter().find(|s| s.job.db == self.db && &s.job.path == r).map(|s| s.job.name.clone())
+                });
+                DropItem { label: root.unwrap_or_else(|| t.clone()), table: t, job }
+            })
+            .collect();
+        if items.is_empty() {
+            self.message = Some(format!("nothing is indexed in {}", self.db));
+            return;
+        }
+        self.dialog = Some(Dialog::DropIndex { items, selected: 0, confirm: false });
+    }
+
+    fn submit_input(&mut self, purpose: InputFor, value: String) {
+        if value.is_empty() {
+            return;
+        }
+        match purpose {
+            InputFor::Open => {
+                self.db = absolute(&value);
+                self.selected = 0;
+                self.refresh();
+                self.message = Some(format!(
+                    "opened {}{}",
+                    self.db,
+                    if Path::new(&self.db).exists() { "" } else { " — nothing indexed there yet" }
+                ));
+            }
+            InputFor::Backup => {
+                let db = self.db.clone();
+                let command = format!("diskunder db backup {} --db {}", value, db);
+                self.spawn_text(format!("Backup — {}", db), command, move || backup(&db, &value).map(|t| (t, Vec::new())));
+            }
+        }
+    }
+
     fn save_form(&mut self, mut form: Form) {
-        let values = match form.values() {
+        let values = match form.values(&self.settings) {
             Ok(v) => v,
             Err(e) => {
                 form.error = Some(e);
@@ -900,7 +1102,8 @@ impl App {
             Ok(job) => {
                 let mut msg = format!("removed job {}", name);
                 if drop {
-                    let mut runlog = RunLog::new(&job.db, self.log.as_deref(), self.no_log);
+                    let mut runlog = RunLog::new(&job.db, self.log.as_deref(), self.no_log)
+                        .for_command(format!("jobs remove {} --drop-index [app]", name));
                     match drop_index(&job.db, &job.path, &mut runlog) {
                         Ok(summary) => msg.push_str(&format!(" — {}", summary)),
                         Err(e) => msg.push_str(&format!(" — its index wasn't removed: {}", e)),
