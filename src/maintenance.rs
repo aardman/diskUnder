@@ -22,12 +22,23 @@ macro_rules! w {
     }};
 }
 
-fn db_info(conn: &Connection, db_path: &str, out: &mut Out) -> DbResult<()> {
+fn db_info(conn: &Connection, db_path: &str, out: &mut Out, sizes: bool) -> DbResult<()> {
     let tables = file_tables(conn)?;
     let roots = load_roots(conn)?;
     w!(out, "database: {} — {} on disk", db_path, fmt_bytes(db_file_bytes(db_path)));
     if tables.is_empty() {
         w!(out, "\nno indexed paths yet");
+    }
+    // With the duplicate summary (5.7+): one line for the whole database, instead of grouping
+    // each path's files — minutes on tens of millions of rows
+    let summary = crate::db::has_dup_groups(conn)?;
+    if summary {
+        let (groups, wasted): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size * (copies - 1)), 0) FROM dup_groups",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        w!(out, "duplicates: {} group{}, {} wasted, across all paths", fmt_count(groups), if groups == 1 { "" } else { "s" }, fmt_bytes(wasted as u64));
     }
 
     // Recorded paths first (alphabetical), then tables with no recorded path
@@ -40,20 +51,24 @@ fn db_info(conn: &Connection, db_path: &str, out: &mut Out) -> DbResult<()> {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let (groups, wasted) = table_duplicates(conn, t)?;
-
         w!(out, "");
         match roots.get(t) {
             Some(r) => w!(out, "{}", r.root),
             None => w!(out, "(no recorded path)"),
         }
         w!(out, "  files       {} ({})", fmt_count(files), fmt_bytes(bytes as u64));
-        w!(out, 
-            "  duplicates  {} group{}, {} wasted",
-            fmt_count(groups),
-            if groups == 1 { "" } else { "s" },
-            fmt_bytes(wasted as u64)
-        );
+        if summary {
+            let hashed: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {t} WHERE checksum IS NOT NULL"), [], |r| r.get(0))?;
+            w!(out, "  hashed      {} — the rest have no possible copy", fmt_count(hashed));
+        } else {
+            let (groups, wasted) = table_duplicates(conn, t)?;
+            w!(out,
+                "  duplicates  {} group{}, {} wasted",
+                fmt_count(groups),
+                if groups == 1 { "" } else { "s" },
+                fmt_bytes(wasted as u64)
+            );
+        }
         match roots.get(t) {
             Some(r) => {
                 let outcome = match &r.last_finished {
@@ -83,7 +98,7 @@ fn db_info(conn: &Connection, db_path: &str, out: &mut Out) -> DbResult<()> {
                 t
             ),
         }
-        match table_disk_bytes(conn, t) {
+        match if sizes { table_disk_bytes(conn, t) } else { None } {
             Some(b) => w!(out, "  table       {} ({} with indexes)", t, fmt_bytes(b as u64)),
             None => w!(out, "  table       {}", t),
         }
@@ -161,10 +176,17 @@ fn confirm_drop(target: &DropTarget, yes: bool) -> Result<(), String> {
 /// Returns the summary line, which is both printed and logged
 fn perform_drop(conn: &Connection, target: &DropTarget) -> Result<String, String> {
     let db = |e: rusqlite::Error| e.to_string();
+    // Its files leave the duplicate summary with it
+    let checksums = if crate::db::has_dup_groups(conn).map_err(db)? {
+        crate::db::table_checksums(conn, &target.table).map_err(db)?
+    } else {
+        Vec::new()
+    };
     conn.execute(&format!("DROP TABLE {}", target.table), []).map_err(db)?;
     if table_exists(conn, "roots").map_err(db)? {
         conn.execute("DELETE FROM roots WHERE table_name = ?1", [&target.table]).map_err(db)?;
     }
+    crate::db::refresh_dup_groups(conn, &checksums).map_err(db)?;
     Ok(format!("removed the index of {} ({} files)", target.label, fmt_count(target.files)))
 }
 
@@ -228,7 +250,7 @@ fn open_existing(db_path: &str) -> Result<Connection, String> {
 pub(crate) fn info_text(db_path: &str) -> Result<String, String> {
     let conn = open_existing(db_path)?;
     let mut out = Out::buffer();
-    db_info(&conn, db_path, &mut out).map_err(|e| e.to_string())?;
+    db_info(&conn, db_path, &mut out, false).map_err(|e| e.to_string())?;
     Ok(out.into_text())
 }
 
@@ -326,7 +348,7 @@ pub(crate) fn run_db_command(db_path: &str, action: &DbAction, runlog: &mut RunL
     };
     let mut out = Out::new();
     let result = match action {
-        DbAction::Info => db_info(&conn, db_path, &mut out).map_err(|e| e.to_string()),
+        DbAction::Info { sizes } => db_info(&conn, db_path, &mut out, *sizes).map_err(|e| e.to_string()),
         DbAction::Drop { path, table, yes } => lock_db(db_path, "diskunder db drop")
             .and_then(|_lock| db_drop(&conn, path.as_deref(), table.as_deref(), *yes, runlog)),
         DbAction::Vacuum => lock_db(db_path, "diskunder db vacuum").and_then(|_lock| {

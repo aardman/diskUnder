@@ -7,3 +7,6 @@
 *.db.log
 *.db.log.1
 *.db.lock
+
+# macOS folder metadata
+.DS_Store

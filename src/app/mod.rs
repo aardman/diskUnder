@@ -595,7 +595,7 @@ impl App {
         let title = format!("Dry run — {}", job.name);
         let command = format!("diskunder run {} --dry-run", job.name);
         self.spawn_text(title, command, move || {
-            let (report, warnings) = dry_run_report(&job.db, &job.path, &root, job.upsert, &job.overrides())?;
+            let (report, warnings) = dry_run_report(&job.db, &job.path, &root, job.upsert, false, &job.overrides())?;
             Ok((report, warnings.iter().map(|w| format!("warn: {}", w)).collect()))
         });
     }

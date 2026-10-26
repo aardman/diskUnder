@@ -8,12 +8,33 @@ A command-line tool for indexing file metadata and detecting duplicate files/fol
 
 ## How It Works
 
-diskUnder walks a target directory, collects file metadata (size, dates, BLAKE3 checksum), and writes it to a SQLite database. Multiple paths can be indexed into the same database — each path gets its own table named `files_<MD5(path)>`, where `path` is the canonical (absolute, symlink-resolved) root. `/nas`, `/nas/`, `./nas` and a symlink to it all share one table, and stored paths are always absolute.
+diskUnder walks a target directory, collects file metadata (size, dates), and writes it to a SQLite database — then reads only the files that might be copies, to give them a BLAKE3 checksum (see [Reading only possible copies](#reading-only-possible-copies)). Multiple paths can be indexed into the same database — each path gets its own table named `files_<MD5(path)>`, where `path` is the canonical (absolute, symlink-resolved) root. `/nas`, `/nas/`, `./nas` and a symlink to it all share one table, and stored paths are always absolute.
+
+### Reading only possible copies
+
+Reading every byte of hundreds of terabytes over the network takes days. A file can only be a
+copy of another file of the same size, so after recording each file's details (a cheap
+`stat`), a run reads only files whose size another file in the database shares — in any
+indexed path:
+
+- **Up to 1 MB:** hashed in full.
+- **Bigger:** first a quick hash of the size and the first and last 64 KB; hashed in full only
+  if that matches another file's quick hash. Big files that merely share a size are told
+  apart after reading 128 KB.
+- **A size no other file has:** never read. Its checksum stays empty until a file of the same
+  size turns up — that run reads both, including a file in another indexed path if it's
+  reachable from here and unchanged since it was indexed (otherwise it waits for that path's
+  next run).
+
+The run ends with what it read: `compared: 6 read in full, 0 quick checks; 1 not read`. Give
+`--hash-all` to checksum every file instead (e.g. to keep checksums for verifying files
+later). On Linux, files are opened without updating their access time where the system allows
+it (files you own, or as root).
 
 Two modes are supported:
 
-- **`index`** — full traversal of the target path. Files already in the database are skipped without being re-hashed, so an interrupted run can simply be restarted
-- **`update`** — full traversal that brings the table in line with disk: new files and files whose size or modified time differ from the database are hashed, unchanged files are skipped without being re-hashed, and rows for files no longer on disk are removed. Rows under a directory that could not be read are kept, and nothing is removed if the walk finds no files at all (e.g. an unmounted share)
+- **`index`** — full traversal of the target path. Files already in the database are skipped without being read again, so an interrupted run can simply be restarted
+- **`update`** — full traversal that brings the table in line with disk: new files and files whose size or modified time differ from the database are recorded again, unchanged files are skipped without being read, and rows for files no longer on disk are removed. Rows under a directory that could not be read are kept, and nothing is removed if the walk finds no files at all (e.g. an unmounted share)
 
 ---
 
@@ -43,7 +64,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 5.6.0`:
+**Check it worked** — this should print `diskunder 5.7.0`:
 
 ```bash
 diskunder --version
@@ -78,6 +99,7 @@ diskunder update <PATH> [OPTIONS]
 |---|---|---|
 | `--db <FILE>` | `fileindex.db` | SQLite database path (created if absent) |
 | `--threads <N>` | `4` | Parallel hashing threads — reduce for network shares |
+| `--hash-all` | off | Checksum every file, not just files that might be copies (also for `run NAME`) |
 | `--no-tui` | off | Disable TUI and print plain progress lines to stderr |
 
 **`--no-tui` / auto-detection:**
@@ -156,15 +178,16 @@ diskunder update /Volumes/NAS --db /data/index.db --dry-run
 ```
 
 ```text
-Dry run — update /Volumes/NAS (nothing hashed or written)
+Dry run — update /Volumes/NAS (nothing read or written)
 
   Found            772,087 files · 4.1 TB
   Unchanged        771,950 files
-  Would hash       137 files · 1.2 GB  (90 new, 47 changed)
+  Would record     137 files · 1.2 GB  (90 new, 47 changed)
+  Would read       up to 41 files · 310.2 MB  (their size matches another file's; the rest aren't read)
   Would remove     12 rows (no longer on disk)
   Couldn't read    1 folder — rows under it are kept
 
-Would hash, by type
+Would record, by type
   TYPE  FILES     SIZE  SHARE
   mov      12   1.1 GB  91.0%
   …
@@ -176,8 +199,11 @@ index /Volumes/NAS
   1000/772087 processed — 998 written, 2 errors
   2000/772087 processed — 1991 written, 9 errors
   ...
-complete: 772087 files — 0 already indexed, 749404 written, 0 removed, 22683 errors (22683 unreadable), 1408 duplicate groups
+quick checks: 61204 files whose size another file shares
+reading 18311 possible copies in full
+complete: 772087 files — 0 already indexed, 772087 written, 0 removed, 3 errors (3 unreadable), 1408 duplicate groups
 wasted: 3.2 GB
+compared: 18,311 read in full, 61,204 quick checks; 742,950 not read (no other file shares their size or first and last 64 KB)
 ```
 
 **Dependencies:** `blake3`, `chrono`, `clap`, `crossterm`, `libc`, `md5`, `rayon`, `ratatui`, `rusqlite`, `walkdir`
@@ -213,15 +239,18 @@ $BIN index "$DEMO/data" --db "$DEMO/demo.db" --no-tui
 ```
 index /private/tmp/diskunder-demo/data
   7/7 processed — 7 written, 0 errors
+reading 6 possible copies in full
 complete: 7 files — 0 already indexed, 7 written, 0 removed, 0 errors, 2 duplicate groups
 wasted: 390.6 KB
+compared: 6 read in full, 0 quick checks; 1 not read (no other file shares their size or first and last 64 KB)
 ```
 
 Two duplicate groups (`img1` and `img2` each have a copy in `backup/`), wasting 2 × 200 KB.
 The hard link `img3-link.jpg` is not counted — it's the same data on disk, so deleting it
-would free nothing. (On Linux the path shows as `/tmp/…`; macOS resolves `/tmp` to `/private/tmp`.)
+would free nothing. `notes.txt` isn't read at all — no other file has its size, so it can't
+be a copy. (On Linux the path shows as `/tmp/…`; macOS resolves `/tmp` to `/private/tmp`.)
 
-**3. Run it again** — everything is already indexed, so nothing is re-hashed:
+**3. Run it again** — everything is already indexed, so nothing is read:
 
 ```bash
 $BIN index "$DEMO/data" --db "$DEMO/demo.db" --no-tui
@@ -230,6 +259,7 @@ $BIN index "$DEMO/data" --db "$DEMO/demo.db" --no-tui
 index /private/tmp/diskunder-demo/data
 complete: 7 files — 7 already indexed, 0 written, 0 removed, 0 errors, 2 duplicate groups
 wasted: 390.6 KB
+compared: 0 read in full, 0 quick checks; 1 not read (no other file shares their size or first and last 64 KB)
 ```
 
 **4. Clean up:**
@@ -409,7 +439,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.6.0 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.7.0 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -557,7 +587,7 @@ A cron line:
 
 | Command | What it does |
 |---|---|
-| `diskunder db info` | Lists every indexed path: file count and total size, duplicate groups and wasted space, last run (mode, start, whether it finished), first run, and the table's size on disk |
+| `diskunder db info` | Duplicates across the whole database, then every indexed path: file count and total size, how many files are hashed, last run (mode, start, whether it finished), first run. `--sizes` adds each path's space in the file — it reads the whole file, so it's slow on big databases |
 | `diskunder db drop <PATH>` | Removes the index for a path — e.g. a share you no longer track. Works even if the path no longer exists. Asks for confirmation; pass `--yes` in scripts |
 | `diskunder db drop --table <NAME>` | Removes a table by name — for tables `db info` lists with no recorded path |
 | `diskunder db vacuum` | Compacts the file. SQLite reuses space freed by `update` and `drop` but doesn't shrink the file until vacuumed |
@@ -565,6 +595,14 @@ A cron line:
 | `diskunder db backup FILE` | Copies the database to FILE — consistent and compacted, safe while it's in use; never overwrites |
 
 `db info` also shows each path's volume, and any other indexed path that overlaps it.
+
+**The duplicate summary.** A `dup_groups` table holds one row per checksum with two or more
+copies, across every path. Each run, drop and job removal keeps it current (recounting only
+the checksums it touched), so `report --duplicates` and `search --duplicate` over the whole
+database don't group every file each time — on a 50-million-row test index that took minutes.
+It's built the first time a 5.7 run meets a database, which on a big one takes a few minutes
+once. Reports for one path group that path's files as before. Searches count matches up to
+100,000 (`… over 99,980 more`) — exact counts of millions took minutes.
 
 ```bash
 diskunder db info   --db /data/index.db
@@ -589,12 +627,13 @@ CREATE TABLE files_<MD5_HASH> (
     modified_date TEXT,
     access_date   TEXT,
     birth_date    TEXT,       -- creation time where the filesystem records one, else empty
-    checksum      TEXT,       -- BLAKE3
+    checksum      TEXT,       -- BLAKE3; NULL until the file might be a copy (or with --hash-all)
     extension     TEXT,
     directory     TEXT,
     created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
     device        INTEGER,    -- device + inode identify hard links to the same data
-    inode         INTEGER
+    inode         INTEGER,
+    quick         TEXT        -- BLAKE3 of the size and first and last 64 KB (big files that might be copies)
 );
 ```
 
@@ -620,7 +659,7 @@ CREATE TABLE roots (
 );
 ```
 
-The layout version is kept in SQLite's `PRAGMA user_version` (v5.6+: `4`). `index` and
+The layout version is kept in SQLite's `PRAGMA user_version` (v5.7+: `5`). `index` and
 `update` bring an older database up to date; a database written by a newer diskunder is
 refused rather than modified.
 
@@ -697,6 +736,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Host — drives and mounts split into local / network (`diskunder host`, app Host menu) | No | No | No | No | No | Yes (5.5.4) |
 | Test job — sample data to try the app on, created and removed from the Jobs menu | No | No | No | No | No | Yes (5.5.4) |
 | Duplicates across shares — volume identity, the same file via two mounts counted once, one run per database | No | No | No | No | No | Yes (5.6) |
+| Reads only possible copies — size first, then a quick hash, full hash last (`--hash-all` for every file) | No | No | No | No | No | Yes (5.7) |
 | Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
@@ -726,7 +766,7 @@ diskunder/
 ├── src/               # Rust v5 source
 │   ├── main.rs        #   entry point
 │   ├── cli.rs         #   command-line arguments
-│   ├── scan.rs        #   walking, hashing, the indexing worker
+│   ├── scan.rs        #   walking, recording, comparing and hashing — the indexing worker
 │   ├── db.rs          #   schema, migrations, roots, queries
 │   ├── progress.rs    #   run state and live duplicate tracking
 │   ├── tui.rs         #   full-screen progress display

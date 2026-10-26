@@ -31,6 +31,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) no_tui: bool,
 
+    /// Checksum every file. By default only files that might be copies are read: those whose
+    /// size another indexed file shares
+    #[arg(long, global = true)]
+    pub(crate) hash_all: bool,
+
     /// Run log file for commands that change the database (default: <db>.log)
     #[arg(long, global = true, value_name = "FILE")]
     pub(crate) log: Option<String>,
@@ -232,8 +237,12 @@ pub(crate) enum SettingsAction {
 
 #[derive(Subcommand)]
 pub(crate) enum DbAction {
-    /// List indexed paths with file counts, duplicates, size and last run
-    Info,
+    /// List indexed paths with file counts, duplicates and last run
+    Info {
+        /// Also each path's space in the database file — reads the whole file, slow on big ones
+        #[arg(long)]
+        sizes: bool,
+    },
     /// Remove the index for a path (asks for confirmation)
     Drop {
         /// Indexed path to remove, as listed by `db info`

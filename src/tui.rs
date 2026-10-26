@@ -74,7 +74,7 @@ fn draw_progress(f: &mut Frame, state: &AppState, area: Rect) {
         .map(|n| format!("{}", n))
         .unwrap_or_else(|| "scanning…".into());
 
-    let status_label = if state.done { "  complete" } else { "  running…" };
+    let status_label = if state.done { "  complete".to_string() } else { format!("  {}…", state.stage_label()) };
     let status_color = if state.done { Color::Green } else { Color::Yellow };
 
     let path_display = truncate_path(&state.current_file, area.width.saturating_sub(4) as usize);
@@ -104,13 +104,24 @@ fn draw_progress(f: &mut Frame, state: &AppState, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::raw("  Hashed  "),
+            Span::raw("  Recorded"),
             Span::styled(
-                format!("{:>9}", state.files_hashed),
+                format!("{:>9}", state.files_recorded),
                 Style::default().fg(Color::White),
             ),
             Span::styled(
                 format!(" / {}", total_str),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Read    "),
+            Span::styled(
+                format!("{:>9}", state.full_hashed),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("  in full · {} quick checks", state.quick_checked),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),

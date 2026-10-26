@@ -12,6 +12,7 @@ use crate::fmt::{fmt_bytes, fmt_count, fmt_local, truncate_path};
 use crate::output::{
     write_cells, write_header, write_record, write_table, write_text_table, Align, Cell, FileRow, Format, Out,
 };
+use crate::db::has_dup_groups;
 use crate::query::{absolute, build_parts, build_query, parse_age, resolve_scope, FilterArgs, Scope, SortKey};
 
 #[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -358,16 +359,22 @@ impl Report<'_> {
             conds.push("size * (copies - 1) >= ?".into());
             params.push(Value::Integer(n as i64));
         }
+        // Across every path, the duplicate summary has the groups; otherwise group the files
+        let groups = if self.scope.everything && has_dup_groups(&self.conn).map_err(Self::db)? {
+            "SELECT checksum, size, path AS first_path, copies FROM dup_groups"
+        } else {
+            "SELECT checksum, MAX(size) AS size, MIN(path) AS first_path,
+                    COUNT(DISTINCT copy_id) AS copies
+             FROM files
+             WHERE size > 0 AND checksum IS NOT NULL AND checksum != ''
+             GROUP BY checksum"
+        };
         let sql = format!(
-            "{}, groups AS (
-                 SELECT checksum, MAX(size) AS size, MIN(path) AS first_path,
-                        COUNT(DISTINCT copy_id) AS copies
-                 FROM files
-                 WHERE size > 0 AND checksum IS NOT NULL AND checksum != ''
-                 GROUP BY checksum)
+            "{}, groups AS ({})
              SELECT checksum, size, copies, size * (copies - 1) AS wasted, first_path
              FROM groups WHERE {} ORDER BY wasted DESC, checksum",
             p.with,
+            groups,
             conds.join(" AND ")
         );
         let mut stmt = self.conn.prepare(&sql).map_err(Self::db)?;

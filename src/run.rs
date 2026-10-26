@@ -24,6 +24,7 @@ pub(crate) struct IndexRun {
     pub(crate) threads: usize,
     pub(crate) overrides: Overrides,
     pub(crate) no_tui: bool,
+    pub(crate) hash_all: bool, // checksum every file, not just possible copies
 }
 
 /// The counts a run ends with, as shown in its summary
@@ -110,10 +111,10 @@ pub(crate) fn start_run(r: &IndexRun, runlog: &mut RunLog, command: Option<Strin
     let (tx, rx) = mpsc::channel::<WorkerMsg>();
     {
         let (path, typed, db) = (path.clone(), r.typed.clone(), r.db.clone());
-        let (threads, upsert, overrides) = (r.threads, r.upsert, r.overrides.clone());
+        let (threads, upsert, hash_all, overrides) = (r.threads, r.upsert, r.hash_all, r.overrides.clone());
         std::thread::spawn(move || {
             let _lock = lock;
-            run_worker(path, typed, db, threads, upsert, overrides, tx)
+            run_worker(path, typed, db, threads, upsert, hash_all, overrides, tx)
         });
     }
     Ok(Started { rx, state: AppState::new(mode, &path, &r.db) })

@@ -97,7 +97,7 @@ fn setup() -> (Tmp, App) {
 
     // Index "other" directly, so it appears as a path with no job
     let mut runlog = RunLog::new(&db, None, true);
-    let run = IndexRun { upsert: false, typed: t.s("other"), db: db.clone(), threads: 1, overrides: Overrides::default(), no_tui: true };
+    let run = IndexRun { upsert: false, typed: t.s("other"), db: db.clone(), threads: 1, overrides: Overrides::default(), no_tui: true, hash_all: false };
     let Started { rx, mut state } = start_run(&run, &mut runlog, None).ok().unwrap();
     for msg in rx {
         state.apply(msg);
@@ -150,7 +150,7 @@ fn dry_run_of_a_job() {
     press(&mut app, &[KeyCode::Char('y')]);
     settle(&mut app);
     let s = screen(&app);
-    assert!(s.contains("Dry run — nightly") && s.contains("Would hash       3 files"), "{}", s);
+    assert!(s.contains("Dry run — nightly") && s.contains("Would record     3 files"), "{}", s);
     assert!(s.contains("$ diskunder run nightly --dry-run"), "{}", s);
     assert!(job_history(&app.store, "nightly", None).unwrap().is_empty(), "a dry run isn't a run");
 }
@@ -448,7 +448,7 @@ fn duplicates_across_every_path_in_the_database() {
     let (t, mut app) = indexed();
     t.file("other/p0-again.jpg", "photo 0\n");
     let mut runlog = RunLog::new(&app.db, None, true);
-    let run = IndexRun { upsert: true, typed: t.s("other"), db: app.db.clone(), threads: 1, overrides: Overrides::default(), no_tui: true };
+    let run = IndexRun { upsert: true, typed: t.s("other"), db: app.db.clone(), threads: 1, overrides: Overrides::default(), no_tui: true, hash_all: false };
     let Started { rx, mut state } = start_run(&run, &mut runlog, None).ok().unwrap();
     for msg in rx {
         state.apply(msg);

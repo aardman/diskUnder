@@ -16,7 +16,7 @@ use crate::output::{write_text_table, Align, Out};
 /// path → (size, modified) for rows the real run would treat as already indexed
 type Indexed = HashMap<String, (u64, String)>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Tally {
     files: i64,
     bytes: i64,
@@ -95,6 +95,7 @@ fn dry_run(
     typed: &str,
     root: &str,
     upsert: bool,
+    hash_all: bool,
     overrides: &Overrides,
     out: &mut Out,
     warnings: &mut Vec<String>,
@@ -114,6 +115,8 @@ fn dry_run(
     let mut excluded = Tally::default();
     let mut excluded_by_type: HashMap<String, Tally> = HashMap::new();
     let mut now_excluded = 0i64; // indexed rows the filters now exclude
+    let mut sizes: HashMap<u64, i64> = HashMap::new(); // files found, by size
+    let mut to_record: Vec<u64> = Vec::new(); // sizes of new and changed files
     let mut unreadable: Option<Vec<PathBuf>> = Some(Vec::new()); // None: an error had no path
     let mut errors = 0i64;
     let pruned = std::cell::Cell::new(0i64); // folders the walk wouldn't enter
@@ -141,6 +144,7 @@ fn dry_run(
                     continue;
                 }
                 found.add(size);
+                *sizes.entry(size).or_default() += 1;
                 // Same rules as the real run: index keeps any existing row; update keeps a row
                 // only if size and modified time still match
                 let stored = indexed.remove(&key);
@@ -156,6 +160,7 @@ fn dry_run(
                     None => kept += 1,
                     Some(tally) => {
                         tally.add(size);
+                        to_record.push(size);
                         by_type.entry(ext).or_default().add(size);
                     }
                 }
@@ -210,6 +215,18 @@ fn dry_run(
     }
 
     let hash = Tally { files: new.files + changed.files, bytes: new.bytes + changed.bytes };
+    let read = if hash_all {
+        hash.clone()
+    } else {
+        // Files with a size another file has — in this walk or another indexed path. An upper
+        // bound: big ones are read in full only if their quick hash matches too.
+        let other = other_paths_sizes(db_path, root, &to_record);
+        let mut t = Tally::default();
+        for s in to_record.iter().filter(|s| **s > 0 && (sizes.get(s).copied().unwrap_or(0) > 1 || other.contains(s))) {
+            t.add(*s);
+        }
+        t
+    };
     let mut summary = vec![
         ("Found".to_string(), format!("{} · {}", plural(found.files, "file"), fmt_bytes(found.bytes as u64))),
         (
@@ -217,7 +234,7 @@ fn dry_run(
             plural(kept, "file"),
         ),
         (
-            "Would hash".to_string(),
+            "Would record".to_string(),
             if upsert {
                 format!(
                     "{} · {}  ({} new, {} changed)",
@@ -231,6 +248,18 @@ fn dry_run(
             },
         ),
     ];
+    summary.push((
+        "Would read".to_string(),
+        if hash_all {
+            format!("{} · {}  (--hash-all)", plural(read.files, "file"), fmt_bytes(read.bytes as u64))
+        } else {
+            format!(
+                "up to {} · {}  (their size matches another file's; the rest aren't read)",
+                plural(read.files, "file"),
+                fmt_bytes(read.bytes as u64)
+            )
+        },
+    ));
     if !filter.types.is_empty() || !filter.paths.is_empty() {
         let folders = if pruned > 0 { format!(", {} not entered", plural(pruned, "folder")) } else { String::new() };
         summary.push((
@@ -255,7 +284,7 @@ fn dry_run(
             format!("{} — rows under {} are kept", plural(errors, "folder"), if errors == 1 { "it" } else { "them" }),
         ));
     }
-    out.write(&format!("Dry run — {} {} (nothing hashed or written)\n", mode, root));
+    out.write(&format!("Dry run — {} {} (nothing read or written)\n", mode, root));
     for note in &notes {
         out.write(&format!("  note: {}\n", note));
     }
@@ -267,7 +296,7 @@ fn dry_run(
         out.write(&format!("  {}\n", note));
     }
 
-    write_types(out, "Would hash, by type", by_type, hash.bytes);
+    write_types(out, "Would record, by type", by_type, hash.bytes);
     write_types(out, "Excluded by filters, by type", excluded_by_type, excluded.bytes);
     Ok(())
 }
@@ -298,10 +327,10 @@ fn write_types(out: &mut Out, title: &str, by_type: HashMap<String, Tally>, tota
 }
 
 /// `typed` is the path as given; `root` its canonical form
-pub(crate) fn run_dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, filter: &Overrides) -> i32 {
+pub(crate) fn run_dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, hash_all: bool, filter: &Overrides) -> i32 {
     let mut out = Out::new();
     let mut warnings = Vec::new();
-    let result = dry_run(db_path, typed, root, upsert, filter, &mut out, &mut warnings);
+    let result = dry_run(db_path, typed, root, upsert, hash_all, filter, &mut out, &mut warnings);
     for w in &warnings {
         eprintln!("warn: {}", w);
     }
@@ -315,16 +344,37 @@ pub(crate) fn run_dry_run(db_path: &str, typed: &str, root: &str, upsert: bool, 
     }
 }
 
+/// Which of `sizes` some file in another indexed path of the database has
+fn other_paths_sizes(db_path: &str, root: &str, sizes: &[u64]) -> std::collections::HashSet<u64> {
+    let mut found = std::collections::HashSet::new();
+    if !Path::new(db_path).exists() {
+        return found;
+    }
+    let Ok(conn) = Connection::open(db_path) else { return found };
+    let me = table_name_for(root);
+    let distinct: std::collections::HashSet<u64> = sizes.iter().copied().collect();
+    for t in file_tables(&conn).unwrap_or_default().into_iter().filter(|t| *t != me) {
+        let Ok(mut stmt) = conn.prepare(&format!("SELECT 1 FROM {t} WHERE size = ?1 LIMIT 1")) else { continue };
+        for s in &distinct {
+            if !found.contains(s) && stmt.exists([*s as i64]).unwrap_or(false) {
+                found.insert(*s);
+            }
+        }
+    }
+    found
+}
+
 /// The dry-run report as text, with any traversal warnings — for the interactive app
 pub(crate) fn dry_run_report(
     db_path: &str,
     typed: &str,
     root: &str,
     upsert: bool,
+    hash_all: bool,
     filter: &Overrides,
 ) -> Result<(String, Vec<String>), String> {
     let mut out = Out::buffer();
     let mut warnings = Vec::new();
-    dry_run(db_path, typed, root, upsert, filter, &mut out, &mut warnings)?;
+    dry_run(db_path, typed, root, upsert, hash_all, filter, &mut out, &mut warnings)?;
     Ok((out.into_text(), warnings))
 }

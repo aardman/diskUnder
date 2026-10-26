@@ -36,7 +36,13 @@ pub(crate) struct AppState {
 
     pub(crate) files_found: usize,
     pub(crate) files_skipped: usize, // already indexed (index mode) or unchanged (update mode)
-    pub(crate) files_hashed: usize,
+    pub(crate) files_recorded: usize, // new or changed files whose details were written
+    pub(crate) quick_checked: usize,  // quick hashes (size, first and last 64 KB)
+    pub(crate) full_hashed: usize,    // files read in full
+    pub(crate) unread: Option<usize>, // this path's files not read, once comparing is done
+    pub(crate) stage: &'static str,   // "walk", then "record", "quick", "full"
+    pub(crate) stage_total: usize,
+    pub(crate) stage_done: usize,     // including files that couldn't be read
     pub(crate) files_written: usize,
     pub(crate) files_removed: usize, // rows dropped for deleted files (update mode)
     pub(crate) files_excluded: usize, // files skipped by the filters
@@ -70,7 +76,13 @@ impl AppState {
             db_path: db_path.to_owned(),
             files_found: 0,
             files_skipped: 0,
-            files_hashed: 0,
+            files_recorded: 0,
+            quick_checked: 0,
+            full_hashed: 0,
+            unread: None,
+            stage: "walk",
+            stage_total: 0,
+            stage_done: 0,
             files_written: 0,
             files_removed: 0,
             files_excluded: 0,
@@ -139,6 +151,17 @@ impl AppState {
         Some(line)
     }
 
+    /// "compared: 4 read in full, 12 quick checks; 3,400 not read …" — None before comparing
+    pub(crate) fn compared_line(&self) -> Option<String> {
+        let unread = self.unread?;
+        Some(format!(
+            "compared: {} read in full, {} quick checks; {} not read (no other file shares their size or first and last 64 KB)",
+            fmt_count(self.full_hashed as i64),
+            fmt_count(self.quick_checked as i64),
+            fmt_count(unread as i64)
+        ))
+    }
+
     /// e.g. "3 errors (2 unreadable, 1 not written)"; just "0 errors" when clean
     pub(crate) fn errors_summary(&self) -> String {
         let parts: Vec<String> = [
@@ -157,13 +180,19 @@ impl AppState {
         }
     }
 
+    /// How far through the current stage. Unreadable files count as done — otherwise
+    /// permission-denied files leave the bar stuck below 100% when the run is done.
     pub(crate) fn progress(&self) -> f64 {
-        match self.total_files {
-            // Count unreadable files as processed — otherwise permission-denied files on
-            // /Users/ or a network share leave the bar stuck below 100% when the run is done.
-            // Traversal errors are not counted: those entries were never queued in `n`.
-            Some(n) if n > 0 => (self.files_hashed + self.files_errored) as f64 / n as f64,
-            _ => 0.0,
+        if self.stage_total > 0 { self.stage_done as f64 / self.stage_total as f64 } else { 0.0 }
+    }
+
+    /// What the run is doing, for the displays: "recording", "quick checks", "reading copies"
+    pub(crate) fn stage_label(&self) -> &'static str {
+        match self.stage {
+            "walk" => "scanning",
+            "record" => "recording",
+            "quick" => "quick checks",
+            _ => "reading possible copies",
         }
     }
 
@@ -175,7 +204,8 @@ impl AppState {
     }
 
     pub(crate) fn record_hashed(&mut self, path: String, size: u64, checksum: String, id: Option<FileId>) {
-        self.files_hashed += 1;
+        self.full_hashed += 1;
+        self.stage_done += 1;
         self.current_file = path.clone();
         self.track_checksum(path, size, checksum, id);
     }
@@ -255,11 +285,38 @@ impl AppState {
     pub(crate) fn apply(&mut self, msg: WorkerMsg) {
         match msg {
             WorkerMsg::FileFound => self.files_found += 1,
+            WorkerMsg::FileRecorded { path } => {
+                self.files_recorded += 1;
+                self.stage_done += 1;
+                self.current_file = path;
+            }
+            WorkerMsg::QuickChecked { path } => {
+                self.quick_checked += 1;
+                self.stage_done += 1;
+                self.current_file = path;
+            }
+            WorkerMsg::Compared { unread } => {
+                self.unread = Some(unread);
+                if let Some(line) = self.compared_line() {
+                    self.push_log(line);
+                }
+            }
+            WorkerMsg::Stage { name, files } => {
+                self.stage = name;
+                self.stage_total = files;
+                self.stage_done = 0;
+                match name {
+                    "quick" => self.push_log(format!("quick checks of {} files whose size another file shares", files)),
+                    "full" => self.push_log(format!("reading {} possible copies in full", files)),
+                    _ => {}
+                }
+            }
             WorkerMsg::FileHashed { path, size, checksum, file_id } => {
                 self.record_hashed(path, size, checksum, file_id);
             }
             WorkerMsg::FileError { path, error } => {
                 self.files_errored += 1;
+                self.stage_done += 1;
                 self.push_log(format!("warn: {} — {}", path, error));
             }
             WorkerMsg::Error { context, error } => {

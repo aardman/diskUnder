@@ -16,23 +16,26 @@ the same mount at once). Comparing several databases at query time (SQLite `ATTA
 - **5.6 (done):** volume identity per indexed path, so one share reached through different
   mounts or machines — or overlapping indexed paths — isn't counted as duplicates of itself;
   one run per database (a lock with a clear message); all-paths Duplicates in the app.
-- **5.7 — read less:** `index` hashes every byte today, which at this scale is days to weeks
-  over the network. Instead, hash only files whose size another file shares (across every
-  share, which one database makes possible), first a quick hash of the start and end, and a
-  full hash only for those still matching — typically 70–95% less reading. A file's checksum
-  stays empty until another of its size appears. Then a duplicate summary table (checksum →
-  copies, size) kept up to date by each run, so duplicate reports stay instant over hundreds
-  of millions of rows — measured first on a synthetic index of about 50 million rows.
+- **5.7 (done) — read less:** only files whose size another file shares are read (across every
+  share, which one database makes possible): a quick hash of the start and end first, a full
+  hash only for those still matching. A file's checksum stays empty until another of its size
+  appears; that run also reads the matching file in another path if it's reachable.
+  `--hash-all` keeps the old behaviour. Linux opens files with `O_NOATIME` where allowed.
+- **5.7 (done) — big databases:** measured on a synthetic 50-million-row index, then fixed: a
+  duplicate summary table kept current by each run, capped search counts with a plan chosen
+  by how many files match, and a fast `db info` (numbers in changes.md). Still to watch: a
+  run checks its own unread files against every path (about a minute per 2.5 million files),
+  and `report --by-directory` over every path takes about a minute at that size.
 - **v6 — quarantine, then dedupe:** volume identity decides what's possible. Copies on the
   same filesystem can share blocks (Linux `FIDEDUPERANGE` on XFS / Btrfs, run on the server:
   the kernel checks the bytes match before sharing them, so a changed file is never touched)
   or be hard-linked; copies on different volumes can only be kept once and the rest
   quarantined. The reflink section below should say `FIDEDUPERANGE`, not `FICLONE`, for
   existing files.
-- **Access times:** on Linux (`relatime`) a full `index` sets each file's access time as it
-  reads it; `update` doesn't read unchanged files. `O_NOATIME` would prevent it for files the
-  indexing user owns (or when run as root). macOS local disks don't change; NFS / SMB depend
-  on the server — being tested.
+- **Access times:** on Linux (`relatime`) reading a file sets its access time; since 5.7 runs
+  open files with `O_NOATIME` where allowed (files the indexing user owns, or as root), and
+  read far fewer files anyway. macOS local disks don't change; NFS / SMB depend on the server
+  — being tested.
 
 ---
 

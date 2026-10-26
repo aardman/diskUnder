@@ -1,7 +1,7 @@
 //! SQLite schema, migrations and queries for index tables and the roots table
 
 use crate::volume::Volume;
-use rusqlite::{params, Connection, OptionalExtension, Result as DbResult};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result as DbResult};
 use std::{
     collections::HashMap,
     fs,
@@ -97,7 +97,8 @@ pub(crate) fn migrate_legacy_table(conn: &mut Connection, typed: &str, root: &st
 ///   2 — v5.2: file-type filter columns on `roots`
 ///   3 — v5.3: path filter columns on `roots`
 ///   4 — v5.6: volume identity columns on `roots`
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+///   5 — v5.7: a `quick` hash column on every file table
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 pub(crate) fn schema_version(conn: &Connection) -> DbResult<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -189,6 +190,22 @@ pub(crate) fn migrate_schema(conn: &mut Connection) -> Result<Vec<String>, Strin
         }
     }
 
+    if version < 5 {
+        let tx = conn.transaction().map_err(db)?;
+        let mut added = 0;
+        for t in file_tables(&tx).map_err(db)? {
+            if !has_column(&tx, &t, "quick").map_err(db)? {
+                tx.execute(&format!("ALTER TABLE {t} ADD COLUMN quick TEXT"), []).map_err(db)?;
+                added += 1;
+            }
+        }
+        tx.pragma_update(None, "user_version", 5).map_err(db)?;
+        tx.commit().map_err(db)?;
+        if added > 0 {
+            applied.push(format!("schema 5: added a quick-hash column to {} file tables", added));
+        }
+    }
+
     Ok(applied)
 }
 
@@ -217,7 +234,8 @@ pub(crate) fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
                 directory     TEXT,
                 created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
                 device        INTEGER,    -- with inode, identifies hard links
-                inode         INTEGER
+                inode         INTEGER,
+                quick         TEXT        -- hash of the size, first and last 64 KB (5.7+)
             )",
             t = table_name
         ),
@@ -236,15 +254,15 @@ pub(crate) fn create_table(conn: &Connection, path: &str) -> DbResult<String> {
             [],
         )?;
     }
-    // Added in v4; existing rows stay NULL until re-hashed or backfilled by `update`
-    for col in ["device", "inode"] {
+    // Added in v4 (device, inode) and 5.7 (quick); existing rows stay NULL until re-read
+    for (col, kind) in [("device", "INTEGER"), ("inode", "INTEGER"), ("quick", "TEXT")] {
         let exists: bool = conn.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = '{col}')", t = table_name),
             [],
             |row| row.get(0),
         )?;
         if !exists {
-            conn.execute(&format!("ALTER TABLE {t} ADD COLUMN {col} INTEGER", t = table_name), [])?;
+            conn.execute(&format!("ALTER TABLE {t} ADD COLUMN {col} {kind}", t = table_name), [])?;
         }
     }
     conn.execute(
@@ -435,7 +453,8 @@ pub(crate) fn commit_batch(conn: &mut Connection, t: &str, batch: &[FileEntry], 
                size=excluded.size, modified_date=excluded.modified_date,
                access_date=excluded.access_date, birth_date=excluded.birth_date,
                checksum=excluded.checksum, extension=excluded.extension,
-               directory=excluded.directory, device=excluded.device, inode=excluded.inode",
+               directory=excluded.directory, device=excluded.device, inode=excluded.inode,
+               quick=NULL",
             t = t
         )
     } else {
@@ -451,11 +470,27 @@ pub(crate) fn commit_batch(conn: &mut Connection, t: &str, batch: &[FileEntry], 
     let mut count = 0usize;
     for e in batch {
         let (device, inode) = id_to_db(e.file_id);
+        // Not hashed yet: NULL, so it's told apart from a checksum
+        let checksum = (!e.checksum.is_empty()).then_some(&e.checksum);
         count += tx.execute(
             &sql,
             params![e.path, e.filename, e.size, e.modified_date, e.access_date,
-                    e.birth_date, e.checksum, e.extension, e.directory, device, inode],
+                    e.birth_date, checksum, e.extension, e.directory, device, inode],
         )?;
+    }
+    tx.commit()?;
+    Ok(count)
+}
+
+/// Store hashes computed after the rows were written: `column` is `quick` or `checksum`
+pub(crate) fn set_hashes(conn: &mut Connection, t: &str, column: &str, rows: &[(String, String)]) -> DbResult<usize> {
+    let tx = conn.transaction()?;
+    let mut count = 0usize;
+    {
+        let mut stmt = tx.prepare(&format!("UPDATE {t} SET {column} = ?1 WHERE path = ?2"))?;
+        for (path, hash) in rows {
+            count += stmt.execute(params![hash, path])?;
+        }
     }
     tx.commit()?;
     Ok(count)
@@ -618,4 +653,83 @@ mod tests {
         assert!(lock_db(&db, "diskunder db vacuum").is_ok(), "free once the first is done");
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+// ─── Duplicate summary ──────────────────────────────────────────────────────
+
+/// One row per checksum with two or more copies across every indexed path — so duplicate
+/// reports over the whole database don't group tens of millions of rows each time. Kept up to
+/// date by every run, drop and job removal (5.7+); queries fall back to grouping the files when
+/// it doesn't exist yet.
+const DUP_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS dup_groups (
+    checksum TEXT PRIMARY KEY,
+    size     INTEGER NOT NULL,
+    copies   INTEGER NOT NULL,   -- distinct files: hard links and the same file via two mounts count once
+    path     TEXT NOT NULL       -- one copy's path, for the group's name
+)";
+
+pub(crate) fn has_dup_groups(conn: &Connection) -> DbResult<bool> {
+    table_exists(conn, "dup_groups")
+}
+
+/// Every file table as `SELECT checksum, size, path, <copy id> AS copy_id FROM t [WHERE …]`,
+/// joined with UNION ALL
+fn copy_rows_sql(conn: &Connection, filter: &str) -> DbResult<String> {
+    let roots = load_roots(conn)?;
+    let mut parts = Vec::new();
+    for t in file_tables(conn)? {
+        let volume = roots.get(&t).and_then(|r| r.volume.as_ref()).map(|v| v.id.clone());
+        let cid = crate::query::copy_id_expr("", volume.as_deref(), has_column(conn, &t, "inode")?);
+        parts.push(format!("SELECT checksum, size, path, {cid} AS copy_id FROM {t} WHERE {filter}"));
+    }
+    Ok(parts.join(" UNION ALL "))
+}
+
+const GROUP_SQL: &str = "SELECT checksum, MAX(size), COUNT(DISTINCT copy_id) AS copies, MIN(path)
+     FROM ({rows}) GROUP BY checksum HAVING copies > 1";
+
+/// Build the summary from scratch. Returns how many groups it holds.
+pub(crate) fn rebuild_dup_groups(conn: &Connection) -> DbResult<usize> {
+    let rows = copy_rows_sql(conn, "size > 0 AND checksum IS NOT NULL AND checksum != ''")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(DUP_SCHEMA, [])?;
+    tx.execute("DELETE FROM dup_groups", [])?;
+    let n = if rows.is_empty() {
+        0
+    } else {
+        tx.execute(&format!("INSERT INTO dup_groups (checksum, size, copies, path) {}", GROUP_SQL.replace("{rows}", &rows)), [])?
+    };
+    tx.commit()?;
+    Ok(n)
+}
+
+/// Recount the given checksums: files with them were hashed, changed, removed or dropped
+pub(crate) fn refresh_dup_groups<'a>(conn: &Connection, checksums: impl IntoIterator<Item = &'a String>) -> DbResult<()> {
+    let list: Vec<&String> = checksums.into_iter().filter(|c| !c.is_empty()).collect();
+    if list.is_empty() || !has_dup_groups(conn)? {
+        return Ok(());
+    }
+    let tables_exist = !file_tables(conn)?.is_empty();
+    let tx = conn.unchecked_transaction()?;
+    for chunk in list.chunks(400) {
+        // Numbered, so every table's part of the UNION shares the same parameters
+        let marks = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+        tx.execute(&format!("DELETE FROM dup_groups WHERE checksum IN ({marks})"), params_from_iter(chunk.iter()))?;
+        if tables_exist {
+            let rows = copy_rows_sql(&tx, &format!("size > 0 AND checksum IN ({marks})"))?;
+            tx.execute(
+                &format!("INSERT INTO dup_groups (checksum, size, copies, path) {}", GROUP_SQL.replace("{rows}", &rows)),
+                params_from_iter(chunk.iter()),
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The checksums a table holds, before it's dropped
+pub(crate) fn table_checksums(conn: &Connection, t: &str) -> DbResult<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("SELECT DISTINCT checksum FROM {t} WHERE checksum IS NOT NULL AND checksum != ''"))?;
+    let rows = stmt.query_map([], |r| r.get(0))?.collect();
+    rows
 }

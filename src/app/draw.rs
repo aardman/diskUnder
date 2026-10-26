@@ -425,12 +425,13 @@ fn draw_strip(f: &mut Frame, app: &App, area: Rect) {
         let s = &run.started.state;
         let pct = (s.progress() * 100.0).min(100.0) as u16;
         let label = match s.total_files {
-            Some(n) => format!(
-                "{}  {}%  {} / {}  {}",
+            Some(_) => format!(
+                "{}  {} {}%  {} / {}  {}",
                 run.name,
+                s.stage_label(),
                 pct,
-                fmt_count((s.files_hashed + s.files_errored) as i64),
-                fmt_count(n as i64),
+                fmt_count(s.stage_done as i64),
+                fmt_count(s.stage_total as i64),
                 s.current_file
             ),
             None => format!("{}  scanning… {} files found", run.name, fmt_count(s.files_found as i64)),
@@ -744,6 +745,7 @@ fn draw_search(f: &mut Frame, s: &Search, area: Rect) {
     );
     let title = match &s.error {
         Some(e) => format!(" {} ", e),
+        None if s.total >= crate::query::COUNT_CAP => format!(" over {} matches — showing the first {} ", fmt_count(s.total as i64), s.results.len()),
         None if s.total > s.results.len() => format!(" {} matches — showing the first {} ", fmt_count(s.total as i64), s.results.len()),
         None => format!(" {} matches ", fmt_count(s.total as i64)),
     };

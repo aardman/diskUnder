@@ -17,6 +17,8 @@ pub(crate) fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>, runlog: &
             WorkerMsg::Info(line) => eprintln!("{}", line),
             WorkerMsg::Error { context, error } => eprintln!("warn: {} — {}", context, error),
             WorkerMsg::Fatal { context, error } => eprintln!("error: {} — {}", context, error),
+            WorkerMsg::Stage { name: "quick", files } => eprintln!("quick checks: {} files whose size another file shares", files),
+            WorkerMsg::Stage { name: "full", files } => eprintln!("reading {} possible copies in full", files),
             _ => {}
         }
         runlog.observe(&msg);
@@ -26,7 +28,7 @@ pub(crate) fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>, runlog: &
         state.apply(msg);
 
         if print_progress {
-            let processed = state.files_hashed + state.files_errored;
+            let processed = state.stage_done;
             let total_str = state
                 .total_files
                 .map(|n| n.to_string())
@@ -55,8 +57,11 @@ pub(crate) fn run_plain(state: &mut AppState, rx: Receiver<WorkerMsg>, runlog: &
     if !state.dup_keys.is_empty() {
         eprintln!("wasted: {}", fmt_bytes(state.dup_wasted));
     }
-    // A line of its own, so the format of the `complete:` line above never changes
+    // Lines of their own, so the format of the `complete:` line above never changes
     if let Some(excluded) = state.excluded_line() {
         eprintln!("{}", excluded);
+    }
+    if let Some(compared) = state.compared_line() {
+        eprintln!("{}", compared);
     }
 }

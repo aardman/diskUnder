@@ -510,12 +510,17 @@ fn errors_are_counted_by_kind() {
     assert_eq!(s.found, 1502, "1500 + boom + unreadable; locked contents are never seen");
 
     // Walk order isn't guaranteed, so work out which batch held the trigger file
-    let not_written = 1502 - 1 - s.written;
+    let not_written = 1502 - s.written;
     assert!(not_written >= 1 && not_written <= 1000, "one batch lost: {}", not_written);
-    assert_eq!(
-        s.errors,
+    // The unreadable file is only read — and fails — if its row was written: it shares its
+    // size with the f* files, so it might be a copy
+    let unreadable_recorded = count(&db, &format!("SELECT COUNT(*) FROM {} WHERE path LIKE '%/unreadable'", t)) == 1;
+    let expected = if unreadable_recorded {
         format!("{} errors (1 unreadable, {} not written, 1 traversal/db)", not_written + 2, not_written)
-    );
+    } else {
+        format!("{} errors ({} not written, 1 traversal/db)", not_written + 1, not_written)
+    };
+    assert_eq!(s.errors, expected);
 
     // Progress never passes the queued total
     for line in run.stderr.lines().filter(|l| l.contains(" processed — ")) {
@@ -869,7 +874,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     let db = tmp.path().join("t.db");
     let db_s = db.to_str().unwrap();
     run_in(tmp.path(), &["index", "data", "--db", db_s]);
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     let t = table_for(&data);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension IN ('jpg', 'mov')", t)), 2);
 
@@ -882,7 +887,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     write(&data.join("c.PNG"), "c\n");
     let run = run_in(tmp.path(), &["update", "data", "--db", db_s]);
     assert!(run.stderr.contains("schema 1: stored 1 file extensions in lowercase"), "{}", run.stderr);
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension != lower(extension)", t)), 0);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension = 'png'", t)), 1);
 
@@ -1502,8 +1507,9 @@ fn dry_run_index_creates_and_logs_nothing() {
     assert!(q.stdout.starts_with("Dry run — index "), "{}", q.stdout);
     assert!(q.stdout.contains("no database at t.db yet"), "{}", q.stdout);
     assert_eq!(dry_value(&q.stdout, "Found"), 6);
-    assert_eq!(dry_value(&q.stdout, "Would hash"), 6);
-    assert!(q.stdout.contains("Would hash, by type") && q.stdout.contains("  mov "), "{}", q.stdout);
+    assert_eq!(dry_value(&q.stdout, "Would record"), 6);
+    assert!(q.stdout.contains("Would read       up to 5 files"), "the five same-size files, not the clip: {}", q.stdout);
+    assert!(q.stdout.contains("Would record, by type") && q.stdout.contains("  mov "), "{}", q.stdout);
     assert!(!tmp.path().join("t.db").exists(), "no database created");
     assert!(!tmp.path().join("t.db.log").exists(), "not logged");
 }
@@ -1521,7 +1527,7 @@ fn dry_run_index_predicts_a_resume() {
     let q = dry(&tmp, &["index", "data", "--db", db_s]);
     let real = run_in(tmp.path(), &["index", "data", "--db", db_s]).summary;
     assert_eq!(dry_value(&q.stdout, "Already indexed") as usize, real.skipped);
-    assert_eq!(dry_value(&q.stdout, "Would hash") as usize, real.written);
+    assert_eq!(dry_value(&q.stdout, "Would record") as usize, real.written);
 }
 
 #[test]
@@ -1557,7 +1563,7 @@ fn dry_run_update_predicts_the_real_update_and_changes_nothing() {
 
     let real = run_in(tmp.path(), &["update", "data", "--db", db_s]).summary;
     assert_eq!(dry_value(&q.stdout, "Unchanged") as usize, real.skipped);
-    assert_eq!(dry_value(&q.stdout, "Would hash") as usize, real.written);
+    assert_eq!(dry_value(&q.stdout, "Would record") as usize, real.written);
     assert_eq!(dry_value(&q.stdout, "Would remove") as usize, real.removed);
     assert_eq!(dry_value(&q.stdout, "Found") as usize, real.found);
 }
@@ -1599,10 +1605,10 @@ fn dry_run_reports_what_the_run_would_do_first() {
     create_v3_table(&db, "data/", &[("data/a", "sum-a")]);
 
     let q = dry(&tmp, &["index", "data/", "--db", db.to_str().unwrap()]);
-    assert!(q.stdout.contains("would first update the database schema to version 4"), "{}", q.stdout);
+    assert!(q.stdout.contains("would first update the database schema to version 5"), "{}", q.stdout);
     assert!(q.stdout.contains("would first migrate 1 rows from the table for \"data/\""), "{}", q.stdout);
     assert_eq!(dry_value(&q.stdout, "Already indexed"), 1, "migrated rows aren't re-hashed");
-    assert_eq!(dry_value(&q.stdout, "Would hash"), 1);
+    assert_eq!(dry_value(&q.stdout, "Would record"), 1);
     assert_eq!(user_version(&db), 0, "nothing migrated by the dry run");
 
     Connection::open(&db).unwrap().pragma_update(None, "user_version", 99).unwrap();
@@ -1788,7 +1794,7 @@ fn schema_1_databases_are_read_and_upgraded() {
     assert_eq!(query(tmp.path(), &["search", "share", "--db", db_s]).code, 0);
     let upd = run_in(tmp.path(), &["update", "share", "--exclude-ext", "tmp", "--db", db_s]);
     assert!(upd.stderr.contains("schema 2: added file-type filter columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     assert_eq!(stored_filters(&db), (None, Some("tmp".to_string())));
 }
 
@@ -1974,7 +1980,7 @@ fn path_filters_show_in_db_info_and_queries_and_schema_2_upgrades() {
     assert_eq!(db_cmd(tmp.path(), &["info", "--db", db_s]).code, 0, "read-only commands cope");
     let upd = run_in(tmp.path(), &index_args("update", db_s, &["--exclude-path", "@eaDir"]));
     assert!(upd.stderr.contains("schema 3: added path filter columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
 }
 
 // ─── Jobs (5.4) ──────────────────────────────────────────────────────────────
@@ -2108,7 +2114,7 @@ fn run_dry_run_changes_nothing() {
     job_share(&tmp);
     let q = ok(jobs_cmd(&tmp, &["run", "nightly", "--dry-run"]));
     assert!(q.stdout.starts_with("Dry run — update "), "{}", q.stdout);
-    assert_eq!(dry_value(&q.stdout, "Would hash"), 3, "the job's filters apply to the test");
+    assert_eq!(dry_value(&q.stdout, "Would record"), 3, "the job's filters apply to the test");
     assert!(!tmp.path().join("idx/index.db").exists());
     let runs: i64 = store(&tmp).query_row("SELECT COUNT(*) FROM job_runs", [], |r| r.get(0)).unwrap();
     assert_eq!(runs, 0, "a dry run isn't a run");
@@ -2350,6 +2356,8 @@ fn the_same_file_through_another_mount_is_one_copy() {
     let linux = table_for(&tmp.path().join("linux"));
     let ino: i64 = conn.query_row(&format!("SELECT inode FROM {} WHERE filename = 'x.bin' AND directory NOT LIKE '%/old'", mac), [], |r| r.get(0)).unwrap();
     conn.execute(&format!("UPDATE {} SET inode = ?1, device = device + 1", linux), [ino]).unwrap();
+    // Runs keep the duplicate summary current; this edit bypasses them, so group the files
+    conn.execute("DROP TABLE dup_groups", []).unwrap();
     drop(conn);
     let r = ok(report(&tmp, &db, &["--duplicates"]));
     assert!(r.stdout.contains("× 2 copies"), "linux/x.bin is mac/x.bin: {}", r.stdout);
@@ -2373,7 +2381,7 @@ fn schema_4_records_volumes_on_the_next_run() {
     assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups"));
     let upd = run_in(tmp.path(), &["update", "share", "--db", db_s]);
     assert!(upd.stderr.contains("schema 4: added volume columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     assert!(roots_volume(&db, &d).0.is_some());
 }
 
@@ -2399,4 +2407,174 @@ fn one_run_at_a_time_per_database() {
 
     drop(lock);
     run_in(tmp.path(), &["update", "share", "--db", db_s]);
+}
+
+// ─── Reading less (5.7) ──────────────────────────────────────────────────────
+
+/// filename → (has a quick hash, has a checksum) for every row of `root`'s table
+fn hash_state(db: &Path, root: &Path) -> std::collections::HashMap<String, (bool, bool)> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(&format!("SELECT filename, quick IS NOT NULL, checksum IS NOT NULL FROM {}", table_for(root)))
+        .unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))).unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// `len` pseudo-random bytes from `seed`
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    (0..len)
+        .map(|_| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 33) as u8
+        })
+        .collect()
+}
+
+fn write_bytes(p: &Path, data: &[u8]) {
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(p, data).unwrap();
+}
+
+/// Rewrite a file and move its modified time on, so `update` sees the change even within
+/// the same second
+fn rewrite(p: &Path, data: &[u8]) {
+    fs::write(p, data).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    fs::File::options().write(true).open(p).unwrap().set_modified(later).unwrap();
+}
+
+#[test]
+fn only_files_that_might_be_copies_are_read() {
+    let tmp = TempDir::new();
+    let d = tmp.path().join("d");
+    write(&d.join("unique.txt"), "only one of this size\n");
+    write(&d.join("a.txt"), "same\n");
+    write(&d.join("b.txt"), "same\n");
+    write(&d.join("c.txt"), "diff\n"); // same size as a and b, different bytes
+    let big = noise(1, 1_500_000);
+    write_bytes(&d.join("big.bin"), &big);
+    write_bytes(&d.join("big-copy.bin"), &big);
+    let mut other_start = big.clone();
+    other_start[0] ^= 0xff;
+    write_bytes(&d.join("big-other.bin"), &other_start);
+    write_bytes(&d.join("big-unique.bin"), &noise(2, 1_600_000));
+    let db = tmp.path().join("t.db");
+    let run = run_in(tmp.path(), &["index", "d", "--db", db.to_str().unwrap()]);
+    assert!(run.stderr.contains("compared: 5 read in full, 3 quick checks; 3 not read"), "{}", run.stderr);
+
+    let h = hash_state(&db, &d);
+    assert_eq!(h["unique.txt"], (false, false), "a size no other file has: not read");
+    assert_eq!(h["big-unique.bin"], (false, false));
+    assert_eq!(h["a.txt"], (false, true), "small files that might be copies: hashed in full");
+    assert_eq!(h["c.txt"], (false, true));
+    assert_eq!(h["big.bin"], (true, true), "big: quick hash, then full as the quick hashes match");
+    assert_eq!(h["big-copy.bin"], (true, true));
+    assert_eq!(h["big-other.bin"], (true, false), "the first 64 KB differ: never read in full");
+
+    let r = ok(report(&tmp, &db, &["--duplicates"]));
+    assert!(r.stdout.contains("Duplicate groups       : 2"), "{}", r.stdout);
+
+    // A change makes a file a candidate again
+    rewrite(&d.join("big-other.bin"), &big);
+    run_in(tmp.path(), &["update", "d", "--db", db.to_str().unwrap()]);
+    assert_eq!(hash_state(&db, &d)["big-other.bin"], (true, true));
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("× 3 copies"));
+}
+
+#[test]
+fn a_copy_in_another_path_is_read_when_reachable() {
+    let tmp = TempDir::new();
+    write(&tmp.path().join("nas1/report.pdf"), "quarterly numbers\n");
+    write(&tmp.path().join("nas1/notes.txt"), "something else\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "nas1", "--db", db_s]);
+    assert_eq!(hash_state(&db, &tmp.path().join("nas1"))["report.pdf"], (false, false), "alone: not read");
+
+    // nas2's run reads its own copy and nas1's file, so the group shows straight away
+    write(&tmp.path().join("nas2/report-copy.pdf"), "quarterly numbers\n");
+    run_in(tmp.path(), &["index", "nas2", "--db", db_s]);
+    assert_eq!(hash_state(&db, &tmp.path().join("nas1"))["report.pdf"], (false, true));
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("× 2 copies"));
+
+    // A file changed since its path was indexed isn't read from another path's run
+    write(&tmp.path().join("nas1/plan.txt"), "plan A\n");
+    run_in(tmp.path(), &["update", "nas1", "--db", db_s]);
+    rewrite(&tmp.path().join("nas1/plan.txt"), b"plan B\n");
+    write(&tmp.path().join("nas2/plan-copy.txt"), "plan B\n");
+    run_in(tmp.path(), &["update", "nas2", "--db", db_s]);
+    assert_eq!(hash_state(&db, &tmp.path().join("nas1"))["plan.txt"], (false, false), "stale row left for its own run");
+    run_in(tmp.path(), &["update", "nas1", "--db", db_s]);
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups       : 2"));
+}
+
+#[test]
+fn hash_all_and_files_hashed_before_5_7() {
+    let tmp = TempDir::new();
+    let d = tmp.path().join("d");
+    write(&d.join("unique.txt"), "only one of this size\n");
+    let big = noise(3, 1_200_000);
+    write_bytes(&d.join("old.bin"), &big);
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "d", "--db", db_s, "--hash-all"]);
+    let h = hash_state(&db, &d);
+    assert_eq!(h["unique.txt"], (false, true), "--hash-all reads every file");
+    assert_eq!(h["old.bin"], (false, true), "full checksum, no quick hash — like a file hashed before 5.7");
+
+    // A new copy is compared with it in full, as there's no quick hash to compare
+    write_bytes(&d.join("new.bin"), &big);
+    run_in(tmp.path(), &["update", "d", "--db", db_s]);
+    assert_eq!(hash_state(&db, &d)["new.bin"], (true, true));
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("× 2 copies"));
+
+    let dry = dry(&tmp, &["update", "d", "--db", db_s, "--hash-all"]);
+    assert!(dry.stdout.contains("(--hash-all)"), "{}", dry.stdout);
+}
+
+#[test]
+fn the_duplicate_summary_matches_a_full_recount() {
+    let tmp = TempDir::new();
+    let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+    for i in 0..6 {
+        write(&a.join(format!("f{i}.txt")), &format!("content {}\n", i % 3)); // 3 groups of 2
+    }
+    write(&b.join("copy0.txt"), "content 0\n"); // a third copy, in another path
+    write(&b.join("own.txt"), "unique, and the only file this size\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "a", "--db", db_s]);
+    run_in(tmp.path(), &["index", "b", "--db", db_s]);
+
+    // Change one copy, delete another, then drop a whole path
+    rewrite(&a.join("f1.txt"), b"content 9\n");
+    fs::remove_file(a.join("f2.txt")).unwrap();
+    run_in(tmp.path(), &["update", "a", "--db", db_s]);
+    let check = |label: &str| {
+        let copy = tmp.path().join("recount.db");
+        let _ = fs::remove_file(&copy);
+        assert_eq!(db_cmd(tmp.path(), &["backup", copy.to_str().unwrap(), "--db", db_s]).code, 0);
+        Connection::open(&copy).unwrap().execute("DROP TABLE dup_groups", []).unwrap();
+        for args in [
+            &["report", "--duplicates"][..],
+            &["search", "--duplicate", "--format", "csv"][..],
+            &["search", "--duplicate", "--larger-than", "9", "--smaller-than", "11", "--format", "csv"][..],
+            &["report", "--duplicates", "--min-size", "10"][..],
+        ] {
+            let with_summary = query(tmp.path(), &[args, &["--db", db_s]].concat());
+            let recount = query(tmp.path(), &[args, &["--db", copy.to_str().unwrap()]].concat());
+            assert_eq!(with_summary.stdout, recount.stdout, "{}: {:?}", label, args);
+        }
+    };
+    check("after update");
+    let r = ok(report(&tmp, &db, &["--duplicates"]));
+    // content 0: f0, f3 and b's copy; f1 changed and f2 was deleted, leaving 1 and 2 single
+    assert!(r.stdout.contains("× 3 copies") && r.stdout.contains("Duplicate groups       : 1"), "{}", r.stdout);
+
+    let dropped = db_cmd(tmp.path(), &["drop", "b", "--yes", "--db", db_s]);
+    assert_eq!(dropped.code, 0, "{}", dropped.stderr);
+    check("after drop");
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("× 2 copies"), "b's copy went with it");
 }

@@ -5,7 +5,7 @@ use std::{io::IsTerminal, path::Path};
 
 use crate::fmt::fmt_count;
 use crate::output::{write_header, write_path, write_record, write_table, FileRow, Format, Out};
-use crate::query::{build_query, resolve_scope, FilterArgs, Query, Scope, SortKey};
+use crate::query::{build_query, resolve_scope, FilterArgs, Query, Scope, SortKey, COUNT_CAP};
 
 pub(crate) struct SearchOptions<'a> {
     pub(crate) path: Option<&'a str>,
@@ -85,7 +85,9 @@ fn search(db_path: &str, o: &SearchOptions) -> Result<(), String> {
         eprintln!("no matching files");
     }
     if let Some(n) = more {
-        eprintln!("… {} more — use --limit to show more, or --limit 0 for all", fmt_count(n as i64));
+        // The count stops at COUNT_CAP
+        let over = if n + o.limit >= COUNT_CAP { "over " } else { "" };
+        eprintln!("… {}{} more — use --limit to show more, or --limit 0 for all", over, fmt_count(n as i64));
     }
     Ok(())
 }

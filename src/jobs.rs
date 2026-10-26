@@ -485,6 +485,7 @@ pub(crate) fn begin_run(
         threads: threads.unwrap_or(job.threads),
         overrides: job.overrides(),
         no_tui,
+        hash_all: false,
     };
     Ok((ActiveRun { conn, row, _lock: lock }, run))
 }
@@ -697,6 +698,7 @@ pub(crate) struct LogArgs {
     pub(crate) log: Option<String>,
     pub(crate) no_log: bool,
     pub(crate) no_tui: bool,
+    pub(crate) hash_all: bool,
 }
 
 /// `run NAME`: run a saved job, recording it in the job's history. Returns the exit code.
@@ -708,11 +710,12 @@ fn run(store: &Path, name: Option<&str>, dry_run: bool, threads: Option<usize>, 
     let (_, job) = open_job(store, name)?;
     if dry_run {
         let root = fs::canonicalize(&job.path).map_err(|e| format!("path not found: {} ({})", job.path, e))?;
-        return Ok(run_dry_run(&job.db, &job.path, &root.to_string_lossy(), job.upsert, &job.overrides()));
+        return Ok(run_dry_run(&job.db, &job.path, &root.to_string_lossy(), job.upsert, args.hash_all, &job.overrides()));
     }
 
     let mut runlog = RunLog::new(&job.db, args.log.as_deref(), args.no_log);
-    let (active, index_run) = begin_run(store, name, threads, args.no_tui, &runlog)?;
+    let (active, mut index_run) = begin_run(store, name, threads, args.no_tui, &runlog)?;
+    index_run.hash_all = args.hash_all;
     let result = run_indexing(index_run, &mut runlog);
     report_log_failure(&runlog);
     active.finish(&result, &runlog)?;

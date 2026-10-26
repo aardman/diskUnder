@@ -3,10 +3,10 @@
 
 use chrono::{Local, NaiveDate, TimeZone, Utc};
 use clap::Args;
-use rusqlite::{types::Value, Connection};
+use rusqlite::{params_from_iter, types::Value, Connection};
 use std::{collections::HashMap, fs};
 
-use crate::db::{file_tables, has_column, load_roots, schema_version, table_exists, table_name_for, RootRow};
+use crate::db::{file_tables, has_column, load_roots, schema_version, table_exists, table_name_for, RootRow, has_dup_groups};
 use crate::fmt::fmt_local;
 
 #[derive(Args, Clone, Default)]
@@ -150,6 +150,7 @@ pub(crate) struct Scope {
     pub(crate) tables: Vec<String>,
     pub(crate) under: Option<String>,
     roots: HashMap<String, RootRow>,
+    pub(crate) everything: bool, // every indexed path in the database (no path given)
 }
 
 pub(crate) fn resolve_scope(conn: &Connection, path: Option<&str>) -> Result<Scope, String> {
@@ -160,12 +161,12 @@ pub(crate) fn resolve_scope(conn: &Connection, path: Option<&str>) -> Result<Sco
         if tables.is_empty() {
             return Err("nothing is indexed in this database yet".to_string());
         }
-        return Ok(Scope { tables, under: None, roots });
+        return Ok(Scope { tables, under: None, roots, everything: true });
     };
 
     let abs = absolute(p);
     if let Some((t, _)) = roots.iter().find(|(_, r)| r.root == abs) {
-        return Ok(Scope { tables: vec![t.clone()], under: None, roots });
+        return Ok(Scope { tables: vec![t.clone()], under: None, roots, everything: false });
     }
     // A folder inside an indexed path: search that index, limited to the folder
     let containing = roots
@@ -173,11 +174,11 @@ pub(crate) fn resolve_scope(conn: &Connection, path: Option<&str>) -> Result<Sco
         .filter(|(_, r)| r.root == "/" || abs.starts_with(&format!("{}/", r.root)))
         .max_by_key(|(_, r)| r.root.len());
     if let Some((t, _)) = containing {
-        return Ok(Scope { tables: vec![t.clone()], under: Some(abs), roots });
+        return Ok(Scope { tables: vec![t.clone()], under: Some(abs), roots, everything: false });
     }
     let t = table_name_for(&abs);
     if table_exists(conn, &t).map_err(db)? {
-        return Ok(Scope { tables: vec![t], under: None, roots });
+        return Ok(Scope { tables: vec![t], under: None, roots, everything: false });
     }
     Err(format!("no index covers {} — see `diskunder db info`", abs))
 }
@@ -245,22 +246,37 @@ pub(crate) const COLUMNS: [&str; 12] = [
 
 pub(crate) struct Query {
     pub(crate) sql: String,
-    pub(crate) count_sql: String,
+    pub(crate) count_sql: String, // matches, counted up to COUNT_CAP
     pub(crate) params: Vec<Value>,
 }
+
+/// Duplicate groups listed in a query rather than looked up by a subquery (see `parts_for`)
+const LISTED_GROUPS: usize = 2_000;
+
+/// Counting stops here: "… more than 100,000 more" is as useful as an exact count, and
+/// counting millions of matches takes minutes on a big index
+pub(crate) const COUNT_CAP: usize = 100_000;
 
 /// What makes two rows the same file, so it counts as one copy. With a known volume: the volume
 /// and inode — the same however the volume is mounted, and hard links share it. Without one: the
 /// device and inode, as on the machine that indexed it. Without an inode: the path, which also
 /// counts a file once when overlapping indexed paths both hold it.
 fn copy_id_sql(volume: Option<&str>, has_inode: bool) -> String {
-    match (volume, has_inode) {
-        (_, false) => "'p:' || path".to_string(),
-        (Some(v), true) => format!("CASE WHEN inode IS NOT NULL THEN {} || inode ELSE 'p:' || path END", sql_literal(&format!("{}#", v))),
-        (None, true) => "CASE WHEN inode IS NOT NULL THEN device || ':' || inode ELSE 'p:' || path END".to_string(),
-    }
+    copy_id_expr("", volume, has_inode)
 }
 
+/// `copy_id_sql` for a table aliased `alias` (e.g. "x."; "" for none)
+pub(crate) fn copy_id_expr(alias: &str, volume: Option<&str>, has_inode: bool) -> String {
+    let a = alias;
+    match (volume, has_inode) {
+        (_, false) => format!("'p:' || {a}path"),
+        (Some(v), true) => format!(
+            "CASE WHEN {a}inode IS NOT NULL THEN {} || {a}inode ELSE 'p:' || {a}path END",
+            sql_literal(&format!("{}#", v))
+        ),
+        (None, true) => format!("CASE WHEN {a}inode IS NOT NULL THEN {a}device || ':' || {a}inode ELSE 'p:' || {a}path END"),
+    }
+}
 
 fn sql_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -311,12 +327,43 @@ pub(crate) fn build_query(
     limit: Option<usize>,
 ) -> rusqlite::Result<Query> {
     let Parts { with, conds, params } = build_parts(conn, scope, filters)?;
-    let where_sql = conds.map_or(String::new(), |c| format!(" WHERE {}", c));
-    let order = match sort {
-        SortKey::Path => "path",
-        SortKey::Size => "size DESC, path",
-        SortKey::Modified => "modified_date DESC, path",
-        SortKey::Name => "filename, path",
+    let mut where_sql = conds.map_or(String::new(), |c| format!(" WHERE {}", c));
+    let (order, column) = match sort {
+        SortKey::Path => ("path", "path"),
+        SortKey::Size => ("size DESC, path", "size"),
+        SortKey::Modified => ("modified_date DESC, path", "modified_date"),
+        SortKey::Name => ("filename, path", "filename"),
+    };
+    // Left to itself, SQLite reads every path's rows in sort order through that column's index,
+    // filtering as it goes: quick when matches are plentiful, but a scan of every row when they
+    // are few (minutes on tens of millions of rows). Then it's faster to find the matches
+    // through the filter's own index and sort just them ("+" stops the sort index) — so count
+    // the matches (up to the cap) and choose.
+    let filtered_by: Vec<&str> = [
+        (filters.larger_than.is_some() || filters.smaller_than.is_some(), "size"),
+        (filters.older_than.is_some() || filters.newer_than.is_some(), "modified_date"),
+        (filters.not_accessed.is_some(), "access_date"),
+        (filters.ext.is_some(), "extension"),
+        (filters.duplicate, "checksum"),
+    ]
+    .into_iter()
+    .filter_map(|(on, col)| on.then_some(col))
+    .collect();
+    let count_sql = format!("{with} SELECT COUNT(*) FROM (SELECT 1 FROM files{where_sql} LIMIT {COUNT_CAP})");
+    let few = || -> rusqlite::Result<bool> {
+        let n: i64 = conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
+        Ok((n as usize) < COUNT_CAP)
+    };
+    let order = if filtered_by.is_empty() || filtered_by.contains(&column) {
+        order.to_string()
+    } else if few()? {
+        format!("+{}", order) // find the few matches through the filter's index, then sort them
+    } else {
+        // Plenty of matches: read in sort order and stop at the limit
+        if let Some(c) = parts_for(conn, scope, filters, true)?.conds {
+            where_sql = format!(" WHERE {}", c);
+        }
+        order.to_string()
     };
     let limit_sql = limit.map_or(String::new(), |n| format!(" LIMIT {}", n));
     Ok(Query {
@@ -324,12 +371,22 @@ pub(crate) fn build_query(
             "{with} SELECT root, path, filename, directory, extension, size, modified_date, access_date, \
              birth_date, checksum, device, inode FROM files{where_sql} ORDER BY {order}{limit_sql}"
         ),
-        count_sql: format!("{with} SELECT COUNT(*) FROM files{where_sql}"),
+        count_sql,
         params,
     })
 }
 
 pub(crate) fn build_parts(conn: &Connection, scope: &Scope, filters: &FilterArgs) -> rusqlite::Result<Parts> {
+    parts_for(conn, scope, filters, false)
+}
+
+/// `walk_order`: keep the filters off their indexes ("+column"), so SQLite reads in the sort
+/// order and stops at the limit — the fast way when matches are plentiful
+fn parts_for(conn: &Connection, scope: &Scope, filters: &FilterArgs, walk_order: bool) -> rusqlite::Result<Parts> {
+    let col = |c: &str| if walk_order { format!("+{c}") } else { c.to_string() };
+    // Duplicates across every path come from the summary, which holds each group's size — so a
+    // size filter goes there, and the files are found from the (few) matching groups
+    let dup_summary = filters.duplicate && scope.everything && has_dup_groups(conn)?;
     let lowercase_ext = schema_version(conn)? < 1;
     let sources: Vec<String> = scope
         .tables
@@ -350,28 +407,28 @@ pub(crate) fn build_parts(conn: &Connection, scope: &Scope, filters: &FilterArgs
         params.push(Value::Text(name.clone()));
     }
     if let Some(ExtList(exts)) = &filters.ext {
-        conds.push(format!("extension IN ({})", vec!["?"; exts.len()].join(", ")));
+        conds.push(format!("{} IN ({})", col("extension"), vec!["?"; exts.len()].join(", ")));
         params.extend(exts.iter().map(|e| Value::Text(e.clone())));
     }
-    if let Some(n) = filters.larger_than {
-        conds.push("size > ?".into());
+    if let Some(n) = filters.larger_than.filter(|_| !dup_summary) {
+        conds.push(format!("{} > ?", col("size")));
         params.push(Value::Integer(n as i64));
     }
-    if let Some(n) = filters.smaller_than {
-        conds.push("size < ?".into());
+    if let Some(n) = filters.smaller_than.filter(|_| !dup_summary) {
+        conds.push(format!("{} < ?", col("size")));
         params.push(Value::Integer(n as i64));
     }
     // Unknown dates are stored as '' — never treat them as "old"
     if let Some(cutoff) = &filters.older_than {
-        conds.push("modified_date != '' AND modified_date < ?".into());
+        conds.push(format!("modified_date != '' AND {} < ?", col("modified_date")));
         params.push(Value::Text(cutoff.clone()));
     }
     if let Some(cutoff) = &filters.newer_than {
-        conds.push("modified_date >= ?".into());
+        conds.push(format!("{} >= ?", col("modified_date")));
         params.push(Value::Text(cutoff.clone()));
     }
     if let Some(cutoff) = &filters.not_accessed {
-        conds.push("access_date != '' AND access_date < ?".into());
+        conds.push(format!("access_date != '' AND {} < ?", col("access_date")));
         params.push(Value::Text(cutoff.clone()));
     }
     for under in [filters.under.as_deref().map(absolute), scope.under.clone()].into_iter().flatten() {
@@ -381,7 +438,36 @@ pub(crate) fn build_parts(conn: &Connection, scope: &Scope, filters: &FilterArgs
         params.push(Value::Integer(prefix.chars().count() as i64));
         params.push(Value::Text(prefix));
     }
-    if filters.duplicate {
+    if dup_summary {
+        // Across every path: the duplicate summary already knows. Copies share a size, so a
+        // size filter narrows the groups before any file is looked at.
+        let mut within = Vec::new();
+        if let Some(n) = filters.larger_than {
+            within.push("size > ?");
+            params.push(Value::Integer(n as i64));
+        }
+        if let Some(n) = filters.smaller_than {
+            within.push("size < ?");
+            params.push(Value::Integer(n as i64));
+        }
+        let where_groups = if within.is_empty() { String::new() } else { format!(" WHERE {}", within.join(" AND ")) };
+        // SQLite can't tell how many groups match, and may check every file against them. When
+        // they're few, list them: then each path's checksum index finds their files directly.
+        let group_params: Vec<Value> = params.split_off(params.len() - within.len());
+        let mut stmt = conn.prepare(&format!("SELECT checksum FROM dup_groups{} LIMIT {}", where_groups, LISTED_GROUPS + 1))?;
+        let few: Vec<String> = stmt.query_map(params_from_iter(group_params.iter()), |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        if few.len() <= LISTED_GROUPS {
+            if few.is_empty() {
+                conds.push("0".into()); // no group matches
+            } else {
+                conds.push(format!("{} IN ({})", col("checksum"), vec!["?"; few.len()].join(", ")));
+                params.extend(few.into_iter().map(Value::Text));
+            }
+        } else {
+            conds.push(format!("{} IN (SELECT checksum FROM dup_groups{})", col("checksum"), where_groups));
+            params.extend(group_params);
+        }
+    } else if filters.duplicate {
         // Same rule as everywhere else: hard links (same device + inode) are one copy
         conds.push(
             "checksum IN (SELECT checksum FROM files \

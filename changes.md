@@ -1,5 +1,69 @@
 # diskUnder — Change Log
 
+## v5.7.0 — read only possible copies
+
+### Size first, then a quick hash, then a full hash
+
+`index` and `update` used to read every new or changed file in full. Now a run records each
+file's details (a `stat`), then reads only files that might be copies — those whose size
+another file in the database shares, in any indexed path:
+
+- up to 1 MB: hashed in full;
+- bigger: a quick hash of the size and first and last 64 KB (schema 5: a `quick` column on
+  every file table), and a full hash only if that matches another file's quick hash — or a
+  file hashed before 5.7, which has no quick hash to compare;
+- a size no other file has: not read; its checksum stays empty (NULL) until a file of that
+  size appears.
+
+A run also reads the matching files of other indexed paths, if they're reachable and
+unchanged since indexed — so a copy on another share is found by the run that finds the
+second copy, not one round later. Files indexed before 5.7 keep their checksums; nothing is
+re-read.
+
+Runs say what they read: `compared: 6 read in full, 4 quick checks; 3 not read`. The TUI shows
+Recorded and Read counts and the current stage; the app's run strip shows the stage too.
+`--hash-all` (index, update, `run NAME`) checksums every file as before.
+
+### Duplicate summary, and big databases
+
+Measured on a synthetic index of 50 million rows in 20 paths (23 GB), 30% of them hashed
+duplicates (an extreme share), on a Mac with 24 GB of memory:
+
+| | before | 5.7 |
+|---|---|---|
+| `report --duplicates` (all paths) | 4m 21s | 1.0 s |
+| `search --duplicate` (all paths) | over 10 min (stopped) | 0.1 s |
+| `search --duplicate --larger-than …` | over 10 min (stopped) | 1.2–2.2 s |
+| `search --larger-than …` (few or no matches) | 2m 33s | 0.6–1.0 s |
+| `db info` | about 18 min | 3.0 s |
+| a small run into that database | — | 1.0 s |
+| building the duplicate summary (once, on upgrade) | — | 3m 14s |
+
+- **`dup_groups`:** one row per checksum with two or more copies across every path, kept
+  current by each run, drop and job removal (only the checksums they touch are recounted),
+  and built once when a 5.7 run first meets a database. Whole-database duplicate reports and
+  searches read it instead of grouping every file; a size filter on a duplicate search goes
+  to the summary, so the files are found from the matching groups.
+- **Search** counts matches only up to 100,000 (`… over 99,980 more`) — counting millions took
+  minutes — and uses that count to choose its plan: few matches are found through the
+  filter's index and sorted; plentiful ones are read in sort order until the limit.
+- **`db info`** shows duplicates once for the whole database (from the summary) and how many
+  files each path has hashed; each path's space in the file — SQLite's `dbstat`, which reads
+  the whole file (45 s per path on the test index) — only with `db info --sizes`.
+- **Comparing** looks this path's sizes up in other paths' size indexes. A run still checks
+  its own unread files against every path: about a minute for a 2.5-million-file path, small
+  next to walking it over the network.
+
+### Dry runs
+
+`Would hash` is now `Would record` (new and changed files) plus `Would read`: an upper bound —
+the files whose size matches another file found in the walk or in another indexed path.
+
+### Access times
+
+On Linux, files are opened with `O_NOATIME` where allowed (files you own, or as root), so
+reading them doesn't change their access time.
+
 ## v5.6.0 — duplicates across shares and servers
 
 ### Volume identity

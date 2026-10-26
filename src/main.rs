@@ -49,7 +49,7 @@ fn main() {
         std::process::exit(2);
     }
     let db = args.db();
-    let log_args = LogArgs { log: args.log.clone(), no_log: args.no_log, no_tui: args.no_tui };
+    let log_args = LogArgs { log: args.log.clone(), no_log: args.no_log, no_tui: args.no_tui, hash_all: args.hash_all };
 
     let Some(cmd) = &args.cmd else {
         // No command: the interactive app — only in a terminal; otherwise, the help
@@ -189,7 +189,7 @@ fn index(args: &Cli, db: &str, upsert: bool, typed: &str, dry_run: bool, overrid
     if dry_run {
         // Changes nothing, so it isn't logged
         return match fs::canonicalize(typed) {
-            Ok(root) => run_dry_run(db, typed, &root.to_string_lossy(), upsert, &overrides),
+            Ok(root) => run_dry_run(db, typed, &root.to_string_lossy(), upsert, args.hash_all, &overrides),
             Err(e) => {
                 eprintln!("error: path not found: {} ({})", typed, e);
                 1
@@ -204,6 +204,7 @@ fn index(args: &Cli, db: &str, upsert: bool, typed: &str, dry_run: bool, overrid
         threads: args.threads(),
         overrides,
         no_tui: args.no_tui,
+        hash_all: args.hash_all,
     };
     let outcome = run_indexing(run, &mut runlog);
     report_log_failure(&runlog);
