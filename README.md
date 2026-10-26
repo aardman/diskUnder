@@ -325,6 +325,9 @@ diskunder export /Volumes/NAS --ext mov,mp4 --format json > video.ndjson
 
 Columns: `root, path, filename, directory, extension, size, modified, accessed, created,
 checksum, device, inode`. Dates are ISO 8601 in UTC (`2024-11-01T10:22:05Z`); sizes are bytes.
+`checksum` is empty for files that have never been read — no other file shares their size
+(see [Reading only possible copies](#reading-only-possible-copies)); `--hash-all` fills it in
+for every file.
 
 ---
 
@@ -363,6 +366,7 @@ Or ask for specific sections (they can be combined):
 diskunder report /Volumes/NAS --by-type --by-directory --depth 2
 diskunder report /Volumes/NAS/projects --stale 1y
 diskunder report /Volumes/NAS --duplicates --min-size 1GB --min-copies 3
+diskunder report /Volumes/NAS --duplicates --min-wasted 500MB
 diskunder report --duplicates --ext iso,dmg,vhd
 ```
 

@@ -39,139 +39,17 @@ the same mount at once). Comparing several databases at query time (SQLite `ATTA
 
 ---
 
-## High value, low effort
+## Done — now in the README
 
-These build directly on the existing SQLite schema and require no new dependencies.
+The original "high value, low effort" ideas have all shipped; the README has the details and
+examples, and [changes.md](changes.md) has each release:
 
-### `search` subcommand
-Query the existing index without re-indexing. The DB already has indexes on name, size, extension, directory, and dates — it just needs a CLI query builder in front of it.
-
-```
-diskunder search /nas --name "*.log"
-diskunder search /nas --older-than 90d --larger-than 500MB
-diskunder search /nas --duplicate --larger-than 1GB
-diskunder search /nas --extension iso,dmg,vhd
-```
-
-### `report` subcommand
-A proper replacement for the basic `diskReport.sh` scripts. All data is already in the DB.
-
-```
-diskunder report /nas --top-files 20        # largest files
-diskunder report /nas --by-type             # space consumed per extension
-diskunder report /nas --stale 180d          # files not modified in N days (access-based is opt-in)
-diskunder report /nas --duplicates          # duplicate groups by wasted space
-diskunder report /nas --by-directory        # top directories by total size
-```
-
-#### Duplicate filtering and savings summary
-
-The `--duplicates` report should support filters so large shares don't drown output
-in thousands of trivial matches:
-
-```
-diskunder report /nas --duplicates --min-size 100MB
-diskunder report /nas --duplicates --min-size 1GB --min-copies 3
-diskunder report /nas --duplicates --ext iso,dmg,vhd
-diskunder report /nas --duplicates --min-wasted 500MB   # filter by total wasted per group
-```
-
-Every duplicate report should close with a summary (space only — no cost figures):
-
-```
-Duplicate groups       : 47
-Files that are copies  : 183
-Total wasted space     : 142.3 GB
-Largest group          : render.mov — 1.6 GB × 4 copies (4.8 GB wasted)
-```
-
-### `export` subcommand
-Makes the index consumable by BI tools (Tableau, Power BI, Excel) and AI pipelines.
-
-```
-diskunder export /nas --format csv  > report.csv
-diskunder export /nas --format json > report.json
-```
-
-### Include / exclude file types
-Index only the file types you care about, or skip ones you don't — e.g. only media on a
-photo share, or no `tmp`/`log` files anywhere. Excluded files are never read or hashed, so
-runs get faster too.
-
-```
-diskunder index /nas --include-ext jpg,jpeg,png,heic,mov,mp4
-diskunder index /nas --exclude-ext tmp,log,ds_store
-diskunder update /nas                       # reuses the filters stored for /nas
-diskunder index /nas --dry-run --exclude-ext tmp   # preview counts by type, no hashing
-```
-
-**Assessment** (done in release 5.2): the
-filter itself is a one-line check during the walk. The real work is consistency:
-
-- filters are stored per path (in `roots`) so `update` reuses them
-- changing filters must not be confused with files being deleted: rows for newly excluded
-  types are removed deliberately and reported separately
-- matching rules are case-insensitive, use the last extension (`.tar.gz` → `gz`), and use
-  `none` for files without one
-- `db info` and reports show when an index is filtered
-
-Schema: two columns on `roots`. Size: medium — roughly 250–350 lines and 10 tests, including
-the `--dry-run` preview. Skipping folders by path pattern (**Ignore**) follows in 5.3 on the
-same mechanism: `.gitignore`-style patterns such as `.snapshot`, `@eaDir` or
-`projects/*/render-cache`, with excluded folders never walked.
-
-### Jobs — named, saved runs
-**Done in 5.4** — see the README's Jobs section and [changes.md](changes.md); the menu comes
-with the 5.5 app. This section is the original idea.
-
-Save a run's settings under a name so it can be repeated without retyping paths and flags,
-and keep a history of every run so it's easy to see when each job last ran and how it went.
-
-```
-diskunder jobs add nas-nightly update /Volumes/NAS --db /data/index.db --threads 4
-diskunder jobs list                     # every job with its last run, status and duration
-diskunder jobs show nas-nightly         # settings plus recent run history
-diskunder jobs remove nas-nightly
-
-diskunder run nas-nightly               # run a saved job by name (cron-friendly)
-diskunder run                           # no name: pick a job from a menu
-```
-
-`jobs list` output:
-
-```
-NAME          MODE    PATH           LAST RUN           STATUS     DURATION  FILES    ERRORS
-nas-nightly   update  /Volumes/NAS   2026-10-22 02:00   completed  14m 32s   772,087  22,683
-projects      index   /Volumes/Proj  2026-10-19 18:45   failed     3m 10s    41,200   1
-scratch       index   /tmp/scratch   never              —          —         —        —
-```
-
-**Menu:** `diskunder run` with no name opens a TUI list of saved jobs showing the same
-columns. Arrow keys to choose, Enter to run, `q` to quit. In plain mode (no terminal), a
-missing name is an error that lists the available jobs instead.
-
-**Run history:** (the 5.0 run log already records every run per database; job history adds
-the per-job view.) Each run records start and end time, how it ended (completed, failed, or
-interrupted), and the summary counts the tool already prints: found, skipped, written,
-removed, errors, duplicate groups and wasted bytes. `jobs show` lists recent runs, and
-`jobs list` shows the latest.
-
-**Builds on:** the `roots` table (v4.1) already records each path's first and last run and
-whether the last run finished — job history extends that with per-run rows and counts.
-
-**Where jobs live:** a job names its own index database (`--db`), so job definitions and
-history can't sit inside an index database. They belong in a small per-user database —
-planned as `~/.config/diskunder/diskunder.db`, shared with the 5.5 app's settings, and
-overridable with `--config-db` or an environment variable for shared or service-account
-setups.
-
-**Details worth deciding up front:**
-- Running a job twice at once should be refused (a lock per job), since two runs against
-  the same table would fight.
-- Run-time flags such as `--no-tui` should still work on `run`; any setting given on the
-  command line overrides the saved one for that run only.
-- Job names are case-sensitive and limited to letters, digits, `-` and `_`, so they're safe
-  in cron lines and shell scripts.
+- **`search`** and **`export`** (5.0) — [Searching and exporting](README.md#searching-and-exporting)
+- **`report`** (5.1), with duplicate filtering (`--min-size`, `--min-copies`, `--min-wasted`,
+  `--ext`) and the closing summary — [Reports](README.md#reports)
+- **Include / exclude file types** (5.2) and **path patterns** (Ignore, 5.3), with
+  `--dry-run` — [Usage](README.md#usage)
+- **Jobs** — named, saved runs with history (5.4) — [Jobs](README.md#jobs)
 
 ---
 
