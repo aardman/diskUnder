@@ -280,6 +280,9 @@ fn add(
     let _lock = lock_db(db_path, &format!("diskunder quarantine add ({})", batch))?;
     let result = crate::maintenance::logged(runlog, || {
         let done = move_planned(&conn, db_path, &batch, reason, &planned.iter().collect::<Vec<_>>())?;
+        for f in &done.failed {
+            eprintln!("not moved: {}", f);
+        }
         Ok(done.message(&batch, skipped.len()))
     })?;
     println!("{}", result);
@@ -290,14 +293,14 @@ fn add(
 pub(crate) struct Moved {
     pub(crate) files: usize,
     pub(crate) bytes: u64,
-    pub(crate) failed: usize,
+    pub(crate) failed: Vec<String>, // "path — why", for files left where they were
 }
 
 impl Moved {
     pub(crate) fn message(&self, batch: &str, skipped: usize) -> String {
         let mut msg = format!("quarantined {} ({}) as {}", plural(self.files, "file"), fmt_bytes(self.bytes), batch);
-        if self.failed > 0 {
-            msg.push_str(&format!("; {} couldn't be moved", plural(self.failed, "file")));
+        if !self.failed.is_empty() {
+            msg.push_str(&format!("; {} couldn't be moved", plural(self.failed.len(), "file")));
         }
         if skipped > 0 {
             msg.push_str(&format!("; {} skipped", plural(skipped, "file")));
@@ -317,7 +320,7 @@ pub(crate) fn move_planned(conn: &Connection, db_path: &str, batch: &str, reason
         params![batch, reason, std::env::args().skip(1).collect::<Vec<_>>().join(" ")],
     )
     .map_err(db_err)?;
-    let mut done = Moved { files: 0, bytes: 0, failed: 0 };
+    let mut done = Moved { files: 0, bytes: 0, failed: Vec::new() };
     let mut affected = Vec::new();
     for (root, files) in &by_root {
         // The manifest goes first, so even an interrupted batch can be put back by hand
@@ -328,8 +331,7 @@ pub(crate) fn move_planned(conn: &Connection, db_path: &str, batch: &str, reason
             if let Err(e) = moved_ok {
                 // Never copy-and-delete: a rename that fails (e.g. another filesystem
                 // mounted inside the root) leaves the file where it is
-                eprintln!("not moved: {} — {}", p.original.display(), e);
-                done.failed += 1;
+                done.failed.push(format!("{} — {}", p.original.display(), e));
                 continue;
             }
             record_quarantined(conn, batch, p).map_err(|e| {
@@ -390,14 +392,41 @@ pub(crate) fn relinked(conn: &Connection, copy: &Planned, keep: &Planned) -> rus
 }
 
 pub(crate) fn plural(n: usize, word: &str) -> String {
-    format!("{} {}{}", fmt_count(n as i64), word, if n == 1 { "" } else { "s" })
+    let ending = if n == 1 { "" } else if word.ends_with("ch") { "es" } else { "s" };
+    format!("{} {}{}", fmt_count(n as i64), word, ending)
 }
 
-fn list(db_path: &str) -> Result<(), String> {
+/// A batch, for listing: (batch, created, files still quarantined, their bytes, restored and
+/// purged counts, reason)
+pub(crate) struct BatchRow {
+    pub(crate) batch: String,
+    pub(crate) created: String,
+    pub(crate) files: i64,
+    pub(crate) bytes: i64,
+    pub(crate) restored: i64,
+    pub(crate) purged: i64,
+    pub(crate) reason: String,
+}
+
+impl BatchRow {
+    /// "2 restored, 1 purged"
+    pub(crate) fn also(&self) -> String {
+        let mut other = Vec::new();
+        if self.restored > 0 {
+            other.push(format!("{} restored", fmt_count(self.restored)));
+        }
+        if self.purged > 0 {
+            other.push(format!("{} purged", fmt_count(self.purged)));
+        }
+        other.join(", ")
+    }
+}
+
+/// Every quarantine batch, oldest first
+pub(crate) fn batch_rows(db_path: &str) -> Result<Vec<BatchRow>, String> {
     let conn = open(db_path, false)?;
     if !has_tables(&conn)? {
-        println!("nothing has been quarantined in {}", db_path);
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut stmt = conn
         .prepare(
@@ -408,29 +437,29 @@ fn list(db_path: &str) -> Result<(), String> {
              GROUP BY b.batch ORDER BY b.batch",
         )
         .map_err(db_err)?;
-    let rows: Vec<Vec<String>> = stmt
+    let rows = stmt
         .query_map([], |r| {
-            let (q, bytes, restored, purged): (i64, i64, i64, i64) =
-                (r.get::<_, Option<i64>>(3)?.unwrap_or(0), r.get(4)?, r.get::<_, Option<i64>>(5)?.unwrap_or(0), r.get::<_, Option<i64>>(6)?.unwrap_or(0));
-            let mut other = Vec::new();
-            if restored > 0 {
-                other.push(format!("{} restored", fmt_count(restored)));
-            }
-            if purged > 0 {
-                other.push(format!("{} purged", fmt_count(purged)));
-            }
-            Ok(vec![
-                r.get::<_, String>(0)?,
-                fmt_local(&r.get::<_, String>(1)?),
-                fmt_count(q),
-                fmt_bytes(bytes as u64),
-                other.join(", "),
-                r.get::<_, String>(2)?,
-            ])
+            Ok(BatchRow {
+                batch: r.get(0)?,
+                created: r.get(1)?,
+                reason: r.get(2)?,
+                files: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                bytes: r.get(4)?,
+                restored: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                purged: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+            })
         })
         .map_err(db_err)?
         .collect::<rusqlite::Result<_>>()
-        .map_err(db_err)?;
+        .map_err(db_err);
+    rows
+}
+
+fn list(db_path: &str) -> Result<(), String> {
+    let rows: Vec<Vec<String>> = batch_rows(db_path)?
+        .iter()
+        .map(|b| vec![b.batch.clone(), fmt_local(&b.created), fmt_count(b.files), fmt_bytes(b.bytes as u64), b.also(), b.reason.clone()])
+        .collect();
     if rows.is_empty() {
         println!("nothing has been quarantined in {}", db_path);
         return Ok(());
@@ -446,19 +475,26 @@ fn list(db_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn show(db_path: &str, batch: &str) -> Result<(), String> {
+/// A batch's files: (state, size, original path), by path
+pub(crate) fn batch_files(db_path: &str, batch: &str) -> Result<Vec<(String, i64, String)>, String> {
     let conn = open(db_path, false)?;
     if !has_tables(&conn)? {
-        return Err(format!("no batch {}", batch));
+        return Ok(Vec::new());
     }
     let mut stmt = conn
-        .prepare("SELECT state, size, original FROM quarantined WHERE batch = ?1 ORDER BY original")
+        .prepare("SELECT state, COALESCE(size, 0), original FROM quarantined WHERE batch = ?1 ORDER BY original")
         .map_err(db_err)?;
-    let rows: Vec<Vec<String>> = stmt
-        .query_map([batch], |r| Ok(vec![r.get(0)?, fmt_bytes(r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64), r.get(2)?]))
+    let rows = stmt
+        .query_map([batch], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(db_err)?
         .collect::<rusqlite::Result<_>>()
-        .map_err(db_err)?;
+        .map_err(db_err);
+    rows
+}
+
+fn show(db_path: &str, batch: &str) -> Result<(), String> {
+    let rows: Vec<Vec<String>> =
+        batch_files(db_path, batch)?.into_iter().map(|(state, size, original)| vec![state, fmt_bytes(size as u64), original]).collect();
     if rows.is_empty() {
         return Err(format!("no batch {} — see `diskunder quarantine list`", batch));
     }
@@ -529,11 +565,29 @@ fn tidy(batch_dir: &Path) {
 }
 
 fn restore(db_path: &str, batch: &str, paths: &[String], dry_run: bool, runlog: &mut RunLog) -> Result<(), String> {
-    let conn = open(db_path, !dry_run)?;
-    if !has_tables(&conn)? {
+    if dry_run {
+        let conn = open(db_path, false)?;
+        let files = restorable(&conn, batch, paths)?;
+        for f in &files {
+            println!("  {}", f.original);
+        }
+        println!("\nWould restore {} (dry run — nothing was moved)", plural(files.len(), "file"));
+        return Ok(());
+    }
+    let (msg, problems) = restore_batch(db_path, batch, paths, runlog)?;
+    for p in &problems {
+        eprintln!("not restored: {}", p);
+    }
+    println!("{}", msg);
+    Ok(())
+}
+
+/// The batch's files still in quarantine — all of them, or those whose original path is given
+fn restorable(conn: &Connection, batch: &str, paths: &[String]) -> Result<Vec<Held>, String> {
+    if !has_tables(conn)? {
         return Err(format!("no batch {}", batch));
     }
-    let mut files = held(&conn, "q.batch = ?1", &[&batch])?;
+    let mut files = held(conn, "q.batch = ?1", &[&batch])?;
     if !paths.is_empty() {
         let wanted: HashSet<String> =
             paths.iter().map(|p| absolute_file(p).map(|f| f.display().to_string()).unwrap_or_else(|_| p.clone())).collect();
@@ -542,16 +596,18 @@ fn restore(db_path: &str, batch: &str, paths: &[String], dry_run: bool, runlog: 
     if files.is_empty() {
         return Err(format!("nothing in batch {} to restore — see `diskunder quarantine show {}`", batch, batch));
     }
-    if dry_run {
-        for f in &files {
-            println!("  {}", f.original);
-        }
-        println!("\nWould restore {} (dry run — nothing was moved)", plural(files.len(), "file"));
-        return Ok(());
-    }
+    Ok(files)
+}
+
+/// Put a batch's files back (all, or the original paths given), never over something new:
+/// a summary, and the files that stayed and why
+pub(crate) fn restore_batch(db_path: &str, batch: &str, paths: &[String], runlog: &mut RunLog) -> Result<(String, Vec<String>), String> {
+    let conn = open(db_path, true)?;
+    let files = restorable(&conn, batch, paths)?;
     let _lock = lock_db(db_path, &format!("diskunder quarantine restore {}", batch))?;
-    let result = crate::maintenance::logged(runlog, || {
-        let (mut done, mut problems, mut affected, mut dirs) = (0usize, Vec::new(), Vec::new(), HashSet::new());
+    let mut problems = Vec::new();
+    let msg = crate::maintenance::logged(runlog, || {
+        let (mut done, mut affected, mut dirs) = (0usize, Vec::new(), HashSet::new());
         for f in &files {
             let (original, stored) = (Path::new(&f.original), Path::new(&f.stored));
             if original.exists() || fs::symlink_metadata(original).is_ok() {
@@ -575,17 +631,13 @@ fn restore(db_path: &str, batch: &str, paths: &[String], dry_run: bool, runlog: 
         for d in &dirs {
             tidy(d);
         }
-        for p in &problems {
-            eprintln!("not restored: {}", p);
-        }
         let mut msg = format!("restored {} from {}", plural(done, "file"), batch);
         if !problems.is_empty() {
             msg.push_str(&format!("; {} not restored", plural(problems.len(), "file")));
         }
         Ok(msg)
     })?;
-    println!("{}", result);
-    Ok(())
+    Ok((msg, problems))
 }
 
 /// The file's row back in its table (if the index still exists), and its state recorded
@@ -646,10 +698,31 @@ fn purge(
         return Ok(());
     }
     ask(&format!("Permanently delete {} quarantined longer than {}? This can't be undone.", summary, age), yes)?;
+    let (msg, problems) = purge_files(&conn, db_path, &files, runlog)?;
+    for p in &problems {
+        eprintln!("not deleted: {}", p);
+    }
+    println!("{}", msg);
+    Ok(())
+}
+
+/// Permanently delete every file still quarantined in a batch, however recently — for the app,
+/// which has asked first. A summary, and the files that couldn't be deleted.
+pub(crate) fn purge_batch(db_path: &str, batch: &str, runlog: &mut RunLog) -> Result<(String, Vec<String>), String> {
+    let conn = open(db_path, true)?;
+    let files = held(&conn, "q.batch = ?1", &[&batch])?;
+    if files.is_empty() {
+        return Err(format!("nothing in batch {} to purge", batch));
+    }
+    purge_files(&conn, db_path, &files, runlog)
+}
+
+fn purge_files(conn: &Connection, db_path: &str, files: &[Held], runlog: &mut RunLog) -> Result<(String, Vec<String>), String> {
     let _lock = lock_db(db_path, "diskunder quarantine purge")?;
-    let result = crate::maintenance::logged(runlog, || {
-        let (mut done, mut freed, mut problems, mut dirs) = (0usize, 0i64, Vec::new(), HashSet::new());
-        for f in &files {
+    let mut problems = Vec::new();
+    let msg = crate::maintenance::logged(runlog, || {
+        let (mut done, mut freed, mut dirs) = (0usize, 0i64, HashSet::new());
+        for f in files {
             match fs::remove_file(&f.stored) {
                 Ok(()) => {}
                 // Already gone: nothing to delete, so it counts as purged
@@ -673,17 +746,13 @@ fn purge(
         for d in &dirs {
             tidy(d);
         }
-        for p in &problems {
-            eprintln!("not deleted: {}", p);
-        }
         let mut msg = format!("purged {}, freeing {}", plural(done, "file"), fmt_bytes(freed as u64));
         if !problems.is_empty() {
             msg.push_str(&format!("; {} couldn't be deleted", plural(problems.len(), "file")));
         }
         Ok(msg)
     })?;
-    println!("{}", result);
-    Ok(())
+    Ok((msg, problems))
 }
 
 pub(crate) fn run_quarantine_command(db_path: &str, cmd: QuarantineCommand, settings: &Settings, runlog: &mut RunLog) -> i32 {

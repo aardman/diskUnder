@@ -689,13 +689,6 @@ impl SameFile {
     }
 }
 
-/// One copy in a duplicate group; `note` marks a path that is an earlier copy's file
-pub(crate) struct Member {
-    pub(crate) path: String,
-    pub(crate) modified: String,
-    pub(crate) note: String, // "(hard link)", "(same file, another mount)" or empty
-}
-
 /// Every duplicate group matching the options (with their duplicate filters), most wasted
 /// space first — the same groups `report --duplicates` lists
 pub(crate) fn duplicate_groups_for(db_path: &str, o: &ReportOptions) -> Result<Vec<GroupInfo>, String> {
@@ -703,22 +696,6 @@ pub(crate) fn duplicate_groups_for(db_path: &str, o: &ReportOptions) -> Result<V
     Ok(r.duplicate_groups()?
         .into_iter()
         .map(|(checksum, size, copies, wasted, first)| GroupInfo { name: Report::name_of(&first), checksum, size, copies, wasted })
-        .collect())
-}
-
-/// The copies in one duplicate group, by path
-pub(crate) fn group_members_for(db_path: &str, o: &ReportOptions, checksum: &str) -> Result<Vec<Member>, String> {
-    let r = open(db_path, o, Out::buffer(), None)?;
-    let mut members = r.group_members(&[checksum])?;
-    let mut seen = SameFile::default();
-    Ok(members
-        .remove(checksum)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(path, modified, device, inode, copy_id)| {
-            let note = seen.note(device, inode, &copy_id).trim().to_string();
-            Member { path, modified, note }
-        })
         .collect())
 }
 

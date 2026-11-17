@@ -3,14 +3,15 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rusqlite::{params_from_iter, types::Value, Connection};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     time::{Duration, Instant},
 };
 
 use crate::output::FileRow;
 use crate::query::{build_parts, build_query, parse_age, parse_ext_list, parse_size, resolve_scope, ExtList, FilterArgs, SortKey};
-use crate::report::{duplicate_groups_for, group_members_for, plain_options, GroupInfo, Member};
+use crate::dedupe::{plan_for, Group, PlanGroup, Role};
+use crate::report::{duplicate_groups_for, plain_options, GroupInfo};
 use crate::settings::Settings;
 
 const SEARCH_ROWS: usize = 200;
@@ -24,7 +25,7 @@ pub(crate) struct Target {
     pub(crate) path: String,
 }
 
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c)) {
         s.to_string()
     } else {
@@ -104,6 +105,8 @@ impl Fields {
 pub(crate) enum Outcome {
     Stay,
     Back,
+    /// Dedupe: just the selected group, or every group shown
+    Dedupe { all: bool },
 }
 
 // ─── Search ──────────────────────────────────────────────────────────────────
@@ -283,9 +286,14 @@ pub(crate) struct Dups {
     pub(crate) filters: Fields,
     pub(crate) groups: Vec<GroupInfo>,
     pub(crate) selected: usize,
-    pub(crate) members: Vec<Member>,
+    pub(crate) plan: Option<Group>, // the selected group's copies, each with its role
     pub(crate) error: Option<String>,
     pub(crate) all: bool, // every path in the database, not just the target's
+    pub(crate) in_copies: bool, // the keys move through the copies, not the groups
+    pub(crate) copy: usize,
+    /// Choices made here: checksum → the path to keep, and copies to leave alone
+    pub(crate) chosen: HashMap<String, String>,
+    pub(crate) left: HashSet<String>,
 }
 
 impl Dups {
@@ -300,13 +308,26 @@ impl Dups {
             ],
             focus: 0,
         };
-        let mut d = Dups { target, settings, filters, groups: Vec::new(), selected: 0, members: Vec::new(), error: None, all: false };
+        let mut d = Dups {
+            target,
+            settings,
+            filters,
+            groups: Vec::new(),
+            selected: 0,
+            plan: None,
+            error: None,
+            all: false,
+            in_copies: false,
+            copy: 0,
+            chosen: HashMap::new(),
+            left: HashSet::new(),
+        };
         d.reload();
         d
     }
 
     /// The path the view covers; None for every path in the database
-    fn scope(&self) -> Option<&str> {
+    pub(crate) fn scope(&self) -> Option<&str> {
         (!self.all).then_some(self.target.path.as_str())
     }
 
@@ -358,14 +379,71 @@ impl Dups {
     }
 
     fn load_members(&mut self) {
-        self.members = match self.groups.get(self.selected) {
-            Some(g) => {
-                let filters = FilterArgs::default();
-                let o = plain_options(self.scope(), &filters);
-                group_members_for(&self.target.db, &o, &g.checksum).unwrap_or_default()
-            }
-            None => Vec::new(),
+        self.plan = self.groups.get(self.selected).and_then(|g| {
+            let mut plan = plan_for(&self.target.db, self.scope(), &[(g.checksum.clone(), g.size)], &self.chosen).ok()?.pop()?;
+            leave(&mut plan, &self.left);
+            Some(plan)
+        });
+        let n = self.plan.as_ref().map_or(0, |p| p.members.len());
+        self.copy = self.copy.min(n.saturating_sub(1));
+    }
+
+    /// The dedupe plan for the selected group, or every group shown: with the choices made
+    /// here, and only groups with something to remove
+    pub(crate) fn work(&self, all: bool) -> impl FnOnce() -> Result<Vec<PlanGroup>, String> + Send + 'static {
+        let found: Vec<(String, i64)> = if all {
+            self.groups.iter().map(|g| (g.checksum.clone(), g.size)).collect()
+        } else {
+            self.groups.get(self.selected).map(|g| (g.checksum.clone(), g.size)).into_iter().collect()
         };
+        let (db, path, chosen, left) = (self.target.db.clone(), self.scope().map(str::to_string), self.chosen.clone(), self.left.clone());
+        move || {
+            let mut groups = plan_for(&db, path.as_deref(), &found, &chosen)?;
+            for g in &mut groups {
+                leave(g, &left);
+            }
+            Ok(groups.iter().map(PlanGroup::from).filter(|g| !g.remove.is_empty()).collect())
+        }
+    }
+
+    /// What dedupe would remove from the selected group: (files, bytes)
+    pub(crate) fn removing(&self) -> (usize, i64) {
+        self.plan.as_ref().map_or((0, 0), |p| {
+            let (files, paths) = p.removing();
+            (paths, files as i64 * p.size)
+        })
+    }
+
+    /// Keys in the copies pane: ⏎ keeps the selected copy, space leaves it alone (or not)
+    fn copy_key(&mut self, key: KeyEvent) {
+        let Some(plan) = &self.plan else { return };
+        let last = plan.members.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.copy = self.copy.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.copy = (self.copy + 1).min(last),
+            KeyCode::Enter => {
+                let m = &plan.members[self.copy];
+                for other in plan.members.iter().filter(|o| o.same_file(m)) {
+                    self.left.remove(&other.path);
+                }
+                self.chosen.insert(plan.checksum.clone(), m.path.clone());
+                self.load_members();
+                self.copy = 0; // the kept copy is listed first
+            }
+            KeyCode::Char(' ') => {
+                let m = &plan.members[self.copy];
+                let names: Vec<String> = plan.members.iter().filter(|o| o.same_file(m)).map(|o| o.path.clone()).collect();
+                match m.role {
+                    Role::Remove => self.left.extend(names),
+                    Role::Leave if m.can_go => names.iter().for_each(|n| {
+                        self.left.remove(n);
+                    }),
+                    _ => return,
+                }
+                self.load_members();
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn wasted(&self) -> i64 {
@@ -394,6 +472,23 @@ impl Dups {
     }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.in_copies = !self.in_copies && self.plan.is_some();
+                return Outcome::Stay;
+            }
+            KeyCode::Esc if self.in_copies => {
+                self.in_copies = false;
+                return Outcome::Stay;
+            }
+            KeyCode::Char('x') if self.removing().0 > 0 => return Outcome::Dedupe { all: false },
+            KeyCode::Char('X') if !self.groups.is_empty() => return Outcome::Dedupe { all: true },
+            _ => {}
+        }
+        if self.in_copies {
+            self.copy_key(key);
+            return Outcome::Stay;
+        }
         let before = self.selected;
         match key.code {
             KeyCode::Esc => return Outcome::Back,
@@ -409,9 +504,20 @@ impl Dups {
             _ => {}
         }
         if self.selected != before {
+            self.copy = 0;
             self.load_members();
         }
         Outcome::Stay
+    }
+}
+
+/// Copies chosen to stay are left alone — with every other name of the same file
+fn leave(plan: &mut Group, left: &HashSet<String>) {
+    let chosen: Vec<_> = plan.members.iter().filter(|m| m.role == Role::Remove && left.contains(&m.path)).cloned().collect();
+    for m in &mut plan.members {
+        if m.role == Role::Remove && chosen.iter().any(|c| c.same_file(m)) {
+            m.role = Role::Leave;
+        }
     }
 }
 

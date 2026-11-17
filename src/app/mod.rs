@@ -4,6 +4,7 @@
 mod draw;
 mod drives;
 mod form;
+mod quarantine_view;
 mod results;
 mod settings_view;
 mod testjob;
@@ -37,10 +38,12 @@ use crate::query::absolute;
 use crate::run::{finish_run, start_run, Started};
 use crate::runlog::RunLog;
 use form::{Form, FormKey};
+use quarantine_view::{QuarantineOutcome, QuarantineView};
 use results::{Browse, Dups, Outcome, Search, Target};
 use settings_view::{SettingsOutcome, SettingsView};
 
 use crate::maintenance::{backup, check_text, drop_table, info_text, vacuum};
+use crate::quarantine::plural;
 use crate::settings::Settings;
 
 const TICK: Duration = Duration::from_millis(100);
@@ -75,6 +78,8 @@ pub(crate) enum View {
     Settings(Box<SettingsView>),
     /// Drives & mounts, and the folders in them
     Drives(Box<DrivesView>),
+    /// Quarantine batches: restore or purge
+    Quarantine(Box<QuarantineView>),
 }
 
 /// An index the Database menu can drop: (label, table, the job that uses it)
@@ -112,6 +117,8 @@ pub(crate) enum Dialog {
     Input { purpose: InputFor, value: String },
     /// The test job's steps; `made`/`ran`/`seen` tick them off, `clash` is a job of yours called test
     TestJob { selected: usize, made: bool, ran: bool, seen: bool, clash: bool },
+    /// Dedupe from the Duplicates view: the selected group, or every group shown
+    Dedupe { all: bool, action: crate::dedupe::Action },
 }
 
 /// The test job's steps: (label, what it does)
@@ -147,6 +154,7 @@ pub(crate) enum Action {
     DbDrop,
     DbOpen,
     DbBackup,
+    Quarantine,
     Drives,
     HostInfo,
     Settings(usize), // opens at this section
@@ -190,6 +198,7 @@ pub(crate) const MENUS: [(&str, &[(&str, &str, Action)]); 6] = [
             ("Drop path…", "", Action::DbDrop),
             ("Open…", "", Action::DbOpen),
             ("Backup…", "", Action::DbBackup),
+            ("Quarantine", "", Action::Quarantine),
         ],
     ),
     ("Host", &[("Drives & mounts", "", Action::Drives), ("Host info", "", Action::HostInfo)]),
@@ -268,11 +277,12 @@ fn short_counts(c: &crate::run::RunCounts) -> String {
     s
 }
 
-/// Background work whose result becomes a text view
+/// Background work whose result becomes a text view, or a message over the view it came from
 pub(crate) struct Pending {
     title: String,
     command: String,
     rx: Receiver<Result<(String, Vec<String>), String>>,
+    in_place: bool,
 }
 
 pub(crate) enum Selected<'a> {
@@ -424,6 +434,13 @@ impl App {
                     _ => "diskunder jobs remove test --drop-index".into(),
                 }
             }
+            Some(Dialog::Dedupe { all, action }) => {
+                if let View::Duplicates(d) = &self.view {
+                    let scope = d.scope().map(|p| format!("{} ", results::quote(p))).unwrap_or_default();
+                    let picked = if *all { "" } else { " (this group: --plan, edit, --from-plan)" };
+                    return format!("diskunder dedupe {}--action {} --apply --db {}{}", scope, action.name(), results::quote(&d.target.db), picked);
+                }
+            }
             _ => {}
         }
         match &self.view {
@@ -436,6 +453,7 @@ impl App {
             View::Browse(x) => x.command(),
             View::Settings(x) => x.command(&self.settings),
             View::Drives(x) => x.command(),
+            View::Quarantine(x) => x.command(),
             View::Main => match self.selected() {
                 Selected::Job(s) => format!("diskunder run {}", s.job.name),
                 Selected::Path(p) => match &p.root {
@@ -476,6 +494,20 @@ impl App {
             if let Ok(result) = p.rx.try_recv() {
                 let p = self.pending.take().unwrap();
                 self.message = None; // "working…" is done
+                if p.in_place {
+                    self.message = Some(match result {
+                        Ok((text, notes)) if notes.is_empty() => text,
+                        Ok((text, notes)) => format!("{} — {} in the run log (Results ▸ Logs)", text, plural(notes.len(), "note")),
+                        Err(e) => format!("{}: {}", p.title, e.lines().next().unwrap_or_default()),
+                    });
+                    match &mut self.view {
+                        View::Duplicates(d) => d.reload(),
+                        View::Quarantine(q) => q.reload(),
+                        _ => {}
+                    }
+                    self.refresh();
+                    return;
+                }
                 match result {
                     Ok((text, notes)) => {
                         let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -505,12 +537,74 @@ impl App {
             self.message = Some("still working on the last request".into());
             return;
         }
+        self.spawn(title, command, false, work);
+    }
+
+    /// Run `work` in the background, staying in this view; its result is a message
+    fn spawn_in_place(
+        &mut self,
+        title: String,
+        command: String,
+        work: impl FnOnce() -> Result<(String, Vec<String>), String> + Send + 'static,
+    ) {
+        if self.pending.is_some() {
+            self.message = Some("still working on the last request".into());
+            return;
+        }
+        self.spawn(title, command, true, work);
+    }
+
+    fn spawn(&mut self, title: String, command: String, in_place: bool, work: impl FnOnce() -> Result<(String, Vec<String>), String> + Send + 'static) {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(work());
         });
         self.message = Some(format!("{} — working…", title));
-        self.pending = Some(Pending { title, command, rx });
+        self.pending = Some(Pending { title, command, rx, in_place });
+    }
+
+    /// Dedupe from the Duplicates view, in the background
+    fn dedupe(&mut self, all: bool, action: crate::dedupe::Action) {
+        let View::Duplicates(d) = &self.view else { return };
+        let plan = d.work(all);
+        let db = d.target.db.clone();
+        let command = format!(
+            "diskunder dedupe {}--action {} --apply --db {}",
+            d.scope().map(|p| format!("{} ", results::quote(p))).unwrap_or_default(),
+            action.name(),
+            results::quote(&db)
+        );
+        let (log, no_log, logged_as) = (self.log.clone(), self.no_log, format!("{} [app]", command));
+        self.spawn_in_place("Dedupe".into(), command, move || {
+            let groups = plan()?;
+            if groups.is_empty() {
+                return Err("nothing to remove".into());
+            }
+            let mut runlog = RunLog::new(&db, log.as_deref(), no_log).for_command(logged_as);
+            let acted = crate::dedupe::act(&db, &groups, action, &mut runlog)?;
+            let mut text = acted.summary;
+            if let Some(b) = acted.batch {
+                text.push_str(&format!(" — undo it in Database ▸ Quarantine ({})", b));
+            }
+            Ok((text, acted.notes))
+        });
+    }
+
+    /// Restore or purge a quarantine batch, in the background
+    fn quarantine_batch(&mut self, batch: String, purge: bool) {
+        let View::Quarantine(q) = &self.view else { return };
+        let db = q.db.clone();
+        let command = q.command();
+        let (log, no_log, logged_as) = (self.log.clone(), self.no_log, format!("{} [app]", command));
+        let title = if purge { "Purge" } else { "Restore" };
+        self.spawn_in_place(title.into(), command, move || {
+            let mut runlog = RunLog::new(&db, log.as_deref(), no_log).for_command(logged_as);
+            if purge {
+                crate::quarantine::purge_batch(&db, &batch, &mut runlog)
+            } else {
+                crate::quarantine::restore_batch(&db, &batch, &[], &mut runlog)
+            }
+        });
     }
 
     /// The index the selection points at, for the Results views
@@ -857,6 +951,7 @@ impl App {
                 });
             }
             Action::DbVacuum => self.dialog = Some(Dialog::Vacuum),
+            Action::Quarantine => self.view = View::Quarantine(Box::new(QuarantineView::new(&self.db))),
             Action::DbDrop => self.choose_drop(),
             Action::DbOpen => self.dialog = Some(Dialog::Input { purpose: InputFor::Open, value: self.db.clone() }),
             Action::DbBackup => {
@@ -1027,6 +1122,18 @@ impl App {
             }
             return;
         }
+        if let View::Quarantine(x) = &mut self.view {
+            if x.confirm.is_none() && key.code == KeyCode::Char('c') {
+                return self.copy_command();
+            }
+            match x.key(key) {
+                QuarantineOutcome::Stay => {}
+                QuarantineOutcome::Back => self.view = View::Main,
+                QuarantineOutcome::Restore(b) => self.quarantine_batch(b, false),
+                QuarantineOutcome::Purge(b) => self.quarantine_batch(b, true),
+            }
+            return;
+        }
         // Views with their own keys (Search types into fields; Browse uses ← to go up)
         let outcome = match &mut self.view {
             View::Search(x) => {
@@ -1060,6 +1167,10 @@ impl App {
                 return;
             }
             Some(Outcome::Stay) => return,
+            Some(Outcome::Dedupe { all }) => {
+                self.dialog = Some(Dialog::Dedupe { all, action: crate::dedupe::Action::Quarantine });
+                return;
+            }
             None => {}
         }
         let back = matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left);
@@ -1097,7 +1208,8 @@ impl App {
             | View::Duplicates(_)
             | View::Browse(_)
             | View::Settings(_)
-            | View::Drives(_) => {}
+            | View::Drives(_)
+            | View::Quarantine(_) => {}
         }
         // Keys that open another view
         match (&self.view, key.code) {
@@ -1163,6 +1275,13 @@ impl App {
                     }
                 }
             }
+            Dialog::Dedupe { all, action } => match key.code {
+                KeyCode::Char(' ') | KeyCode::Right | KeyCode::Tab => self.dialog = Some(Dialog::Dedupe { all, action: action.next() }),
+                KeyCode::Left | KeyCode::BackTab => self.dialog = Some(Dialog::Dedupe { all, action: action.next().next() }),
+                KeyCode::Char('y') => self.dedupe(all, action),
+                KeyCode::Esc => {}
+                _ => self.dialog = Some(Dialog::Dedupe { all, action }),
+            },
             Dialog::Vacuum => {
                 if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
                     let (db, log, no_log) = (self.db.clone(), self.log.clone(), self.no_log);

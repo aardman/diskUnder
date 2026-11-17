@@ -693,3 +693,73 @@ fn the_app_selects_the_last_run_job() {
     let reopened = App::new(app.store.clone(), &app.db, None, true);
     assert!(matches!(reopened.selected(), Selected::Job(s) if s.job.name == "nightly"), "a-first sorts first, but nightly ran last");
 }
+
+#[test]
+fn dedupe_from_the_duplicates_view() {
+    let (t, mut app) = indexed();
+    press(&mut app, &[KeyCode::Char('d')]);
+    let s = screen(&app);
+    assert!(s.contains("KEEP") && s.contains("REMOVE") && s.contains("dedupe would remove 1, freeing 8 B"), "{}", s);
+    let View::Duplicates(d) = &app.view else { panic!("not in Duplicates") };
+    let (kept, other) = (d.plan.as_ref().unwrap().members[0].path.clone(), d.plan.as_ref().unwrap().members[1].path.clone());
+
+    // Keep the other copy instead; then leave the first alone, and change that back
+    press(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
+    let View::Duplicates(d) = &app.view else { panic!() };
+    assert_eq!(d.plan.as_ref().unwrap().members[0].path, other, "⏎ keeps the selected copy");
+    press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
+    assert!(screen(&app).contains("nothing to remove"), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert!(screen(&app).contains("dedupe would remove 1"), "{}", screen(&app));
+
+    press(&mut app, &[KeyCode::Char('x')]);
+    let s = screen(&app);
+    assert!(s.contains("Dedupe") && s.contains("Quarantine 1 file (8 B) from the group"), "{}", s);
+    assert!(app.command().contains("dedupe ") && app.command().contains("--action quarantine --apply"), "{}", app.command());
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert!(screen(&app).contains("Share blocks for 1 file"), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Char(' '), KeyCode::Char(' '), KeyCode::Char('y')]);
+    settle(&mut app);
+    let message = app.message.clone().unwrap_or_default();
+    assert!(message.contains("dedupe: quarantined 1 file") && message.contains("Database ▸ Quarantine"), "{}", message);
+    assert!(!Path::new(&kept).exists() && Path::new(&other).exists(), "the copy chosen by hand stayed");
+    assert!(screen(&app).contains("0 groups"), "reloaded: {}", screen(&app));
+    let log = fs::read_to_string(format!("{}.log", app.jobs[0].job.db)).unwrap();
+    assert!(log.contains("dedupe") && log.contains("[app]"), "{}", log);
+
+    // Undo it from the Quarantine view
+    press(&mut app, &[KeyCode::Esc]);
+    app.act(Action::Quarantine);
+    let s = screen(&app);
+    assert!(s.contains("1 batch ") && s.contains("dedupe") && s.contains(&kept[t.0.to_string_lossy().len()..]), "{}", s);
+    press(&mut app, &[KeyCode::Char('r')]);
+    assert!(screen(&app).contains("put its 1 file back"), "{}", screen(&app));
+    assert!(app.command().starts_with("diskunder quarantine restore "), "{}", app.command());
+    press(&mut app, &[KeyCode::Char('y')]);
+    settle(&mut app);
+    assert!(app.message.clone().unwrap_or_default().contains("restored 1 file"), "{:?}", app.message);
+    assert!(Path::new(&kept).exists());
+    assert!(screen(&app).contains("1 restored"), "{}", screen(&app));
+}
+
+#[test]
+fn purging_a_quarantine_batch_from_the_app() {
+    let (_t, mut app) = indexed();
+    press(&mut app, &[KeyCode::Char('d'), KeyCode::Char('X')]);
+    assert!(screen(&app).contains("the 1 groups shown"), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Char('y')]);
+    settle(&mut app);
+    assert!(app.message.clone().unwrap_or_default().contains("quarantined 1 file"), "{:?}", app.message);
+    press(&mut app, &[KeyCode::Esc]);
+    app.act(Action::Quarantine);
+    // Anything but y cancels
+    press(&mut app, &[KeyCode::Char('p'), KeyCode::Char('n')]);
+    let View::Quarantine(q) = &app.view else { panic!("not in Quarantine") };
+    assert!(q.confirm.is_none() && q.batches[0].files == 1);
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert!(screen(&app).contains("for good? This can't be undone"), "{}", screen(&app));
+    press(&mut app, &[KeyCode::Char('y')]);
+    settle(&mut app);
+    assert!(app.message.clone().unwrap_or_default().contains("purged 1 file, freeing 8 B"), "{:?}", app.message);
+    assert!(screen(&app).contains("1 purged"), "{}", screen(&app));
+}

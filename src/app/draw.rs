@@ -9,7 +9,10 @@ use ratatui::{
     Frame,
 };
 
+use super::quarantine_view::{Confirm, QuarantineView};
 use super::results::{Browse, Dups, Fields, Search};
+use crate::dedupe::{confirm_text, Action as DedupeAction, Role};
+use crate::quarantine::plural;
 use super::{App, Dialog, InputFor, PathEntry, Selected, View, MENUS, REPORTS, TEST_STEPS};
 use crate::cli::display_version;
 use crate::fmt::{fmt_bytes, fmt_count, fmt_local, truncate_path};
@@ -69,6 +72,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         View::Browse(x) => draw_browse(f, x, rows[1]),
         View::Settings(x) => x.draw(f, &app.settings, rows[1]),
         View::Drives(x) => x.draw(f, rows[1]),
+        View::Quarantine(x) => draw_quarantine(f, x, rows[1]),
     }
     if strip > 0 {
         draw_strip(f, app, rows[2]);
@@ -80,6 +84,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     if let Some(dialog) = &app.dialog {
         match (dialog, &app.view) {
             (Dialog::DupFilters { .. }, View::Duplicates(d)) => draw_dup_filters(f, d, f.area()),
+            (Dialog::Dedupe { all, action }, View::Duplicates(d)) => draw_dedupe(f, d, *all, *action, f.area()),
             _ => draw_dialog(f, dialog, f.area()),
         }
     }
@@ -479,8 +484,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             View::Logs { .. } => "↑↓ PgUp PgDn scroll · a all runs · c copy command · Esc back",
             View::Search(x) if x.in_results => "↑↓ results · Tab back to the filters · c copy command · Esc back",
             View::Search(_) => "type to filter — results update as you go · Tab / ↑↓ fields · space cycles choices · ⏎ results · Esc back",
-            View::Duplicates(x) if x.all => "↑↓ groups · f filters · a just this job / path · c copy command · Esc back",
-            View::Duplicates(_) => "↑↓ groups · f filters · a all paths in the database · c copy command · Esc back",
+            View::Duplicates(x) if x.in_copies => "↑↓ copies · ⏎ keep this one · space leave it / remove it · x dedupe this group · Tab groups · Esc back",
+            View::Duplicates(x) if x.all => "↑↓ groups · Tab copies · x dedupe group · X all shown · f filters · a just this job / path · c copy command · Esc back",
+            View::Duplicates(_) => "↑↓ groups · Tab copies · x dedupe group · X all shown · f filters · a all paths · c copy command · Esc back",
+            View::Quarantine(x) => x.keys(),
             View::Browse(_) => "↑↓ select · ⏎ / → into folder · ⌫ / ← up · c copy command · Esc back",
             View::Settings(x) if x.editing.is_some() => "type the value · ⏎ save · Esc cancel · Ctrl-U clear",
             View::Settings(_) => "↑↓ select · ⏎ edit (or toggle) · x back to default / remove group · c copy command · Esc back",
@@ -539,6 +546,12 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 "  c          copy the command shown in the footer",
                 "  q          quit (asks if a run is in progress)",
                 "",
+                "Duplicates (d)",
+                "  Tab        move between the groups and a group's copies",
+                "  ⏎ / space  keep this copy / leave it alone (or remove it after all)",
+                "  x / X      dedupe this group / every group shown — asks first",
+                "  Database ▸ Quarantine: restore (r) or purge (p) a batch",
+                "",
                 "Views and menus",
                 "  Esc        back / close",
                 "  m          back to the menu you came from",
@@ -567,7 +580,8 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 &mut state,
             );
         }
-        Dialog::DupFilters { .. } => {} // drawn with the Duplicates view, which owns the fields
+        // Drawn with the Duplicates view, which has what they show
+        Dialog::DupFilters { .. } | Dialog::Dedupe { .. } => {}
         Dialog::Vacuum => {
             let area = centered(64, 5, area);
             f.render_widget(Clear, area);
@@ -813,20 +827,132 @@ fn draw_dups(f: &mut Frame, d: &Dups, area: Rect) {
             .block(Block::default().borders(Borders::ALL).title(title)),
         parts[0],
     );
-    let width = parts[1].width.saturating_sub(34) as usize;
-    let lines: Vec<Line> = d
-        .members
+    let width = parts[1].width.saturating_sub(42) as usize;
+    let members = d.plan.as_ref().map_or(&[][..], |p| p.members.as_slice());
+    let lines: Vec<Line> = members
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(i, m)| {
             let when = if m.modified.is_empty() { "-".to_string() } else { fmt_local(&m.modified) };
-            let mut spans = vec![Span::styled(format!("{:<17} ", when), DIM), Span::raw(truncate_path(&m.path, width))];
-            if !m.note.is_empty() {
-                spans.push(Span::styled(format!("  {}", m.note), DIM));
+            let role = match m.role {
+                Role::Keep => Style::new().fg(Color::Green),
+                Role::Remove => Style::new().fg(Color::Red),
+                _ => DIM,
+            };
+            let line = Line::from(vec![
+                Span::styled(format!("{:<7} ", m.role.label()), role),
+                Span::styled(format!("{:<17} ", when), DIM),
+                Span::raw(truncate_path(&m.path, width)),
+            ]);
+            if d.in_copies && i == d.copy {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
             }
-            Line::from(spans)
         })
         .collect();
-    let name = d.groups.get(d.selected).map_or(String::new(), |g| format!(" {} — copies ", g.name));
+    let name = match (d.groups.get(d.selected), d.removing()) {
+        (Some(g), (0, _)) => format!(" {} — copies — nothing to remove (Tab, then ⏎ / space to choose) ", g.name),
+        (Some(g), (n, bytes)) => format!(" {} — copies — dedupe would remove {}, freeing {} (x) ", g.name, n, fmt_bytes(bytes as u64)),
+        (None, _) => String::new(),
+    };
+    let border = if d.in_copies { Style::new().fg(Color::Cyan) } else { Style::new() };
+    f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).border_style(border).title(name)), parts[1]);
+}
+
+/// Confirming a dedupe, over the Duplicates view
+fn draw_dedupe(f: &mut Frame, d: &Dups, all: bool, action: DedupeAction, area: Rect) {
+    let what = if all {
+        format!("the {} groups shown, each as its copies pane shows it", fmt_count(d.groups.len() as i64))
+    } else {
+        d.groups.get(d.selected).map_or(String::new(), |g| format!("the group {}", g.name))
+    };
+    let files = if all {
+        "the copies marked REMOVE".to_string()
+    } else {
+        let (n, bytes) = d.removing();
+        format!("{} ({})", plural(n, "file"), fmt_bytes(bytes as u64))
+    };
+    let (question, _) = confirm_text(action, &files, &what);
+    let choices: Vec<Span> = [DedupeAction::Quarantine, DedupeAction::Share, DedupeAction::Hardlink]
+        .iter()
+        .flat_map(|a| {
+            let style = if *a == action { Style::new().bg(Color::Cyan).fg(Color::Black) } else { Style::new() };
+            [Span::styled(format!(" {} ", a.name()), style), Span::raw(" ")]
+        })
+        .collect();
+    let mut lines = vec![Line::from([vec![Span::raw("Action: ")], choices].concat()), Line::from("")];
+    let width = 86usize;
+    let mut line = String::new();
+    for word in question.split(' ') {
+        if line.chars().count() + word.chars().count() + 1 > width {
+            lines.push(Line::from(std::mem::take(&mut line)));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    lines.push(Line::from(line));
+    if action == DedupeAction::Share {
+        lines.push(Line::from(Span::styled("Sharing blocks needs Linux and XFS or Btrfs, run on the server itself.", DIM)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("space change action · y go · Esc cancel", DIM)));
+    let area = centered(92, lines.len() as u16 + 2, area);
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Dedupe ")), area);
+}
+
+fn draw_quarantine(f: &mut Frame, q: &QuarantineView, area: Rect) {
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let title = match (&q.error, q.confirm, q.batch()) {
+        (Some(e), _, _) => format!(" Quarantine — {} ", e),
+        (_, Some(Confirm::Restore), Some(b)) => {
+            format!(" Restore {} — put its {} back where they were? y restores ", b.batch, plural(b.files as usize, "file"))
+        }
+        (_, Some(Confirm::Purge), Some(b)) => format!(
+            " Purge {} — delete its {} ({}) for good? This can't be undone. y deletes ",
+            b.batch,
+            plural(b.files as usize, "file"),
+            fmt_bytes(b.bytes as u64)
+        ),
+        _ => format!(" Quarantine — {} — {} ", q.db, plural(q.batches.len(), "batch")),
+    };
+    let alert = if q.confirm.is_some() { Style::new().fg(Color::Yellow) } else { Style::new() };
+    let header = Row::new(["BATCH", "CREATED", "FILES", "SIZE", "ALSO", "REASON"]).style(BOLD);
+    let rows: Vec<Row> = q
+        .batches
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let style = if i == q.selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            Row::new(vec![b.batch.clone(), fmt_local(&b.created), fmt_count(b.files), fmt_bytes(b.bytes as u64), b.also(), b.reason.clone()])
+                .style(style)
+        })
+        .collect();
+    let empty = q.batches.is_empty().then(|| Row::new(["(nothing has been quarantined)"]));
+    f.render_widget(
+        Table::new(
+            rows.into_iter().chain(empty),
+            [Constraint::Length(20), Constraint::Length(17), Constraint::Length(8), Constraint::Length(10), Constraint::Length(22), Constraint::Min(8)],
+        )
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).border_style(alert).title(title)),
+        parts[0],
+    );
+    let width = parts[1].width.saturating_sub(26) as usize;
+    let lines: Vec<Line> = q
+        .files
+        .iter()
+        .map(|(state, size, path)| {
+            Line::from(vec![Span::styled(format!("{:<12} {:>9}  ", state, fmt_bytes(*size as u64)), DIM), Span::raw(truncate_path(path, width))])
+        })
+        .collect();
+    let name = q.batch().map_or(String::new(), |b| format!(" {} — files ", b.batch));
     f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(name)), parts[1]);
 }
 

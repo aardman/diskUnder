@@ -45,6 +45,26 @@ pub(crate) enum Action {
     Hardlink,
 }
 
+impl Action {
+    /// As typed after --action
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Action::Quarantine => "quarantine",
+            Action::Share => "share",
+            Action::Hardlink => "hardlink",
+        }
+    }
+
+    /// The next action, for choosing one in the app
+    pub(crate) fn next(self) -> Action {
+        match self {
+            Action::Quarantine => Action::Share,
+            Action::Share => Action::Hardlink,
+            Action::Hardlink => Action::Quarantine,
+        }
+    }
+}
+
 pub(crate) struct DedupeOptions<'a> {
     pub(crate) path: Option<&'a str>,
     pub(crate) keep: Keep,
@@ -63,8 +83,8 @@ pub(crate) struct DedupeOptions<'a> {
     pub(crate) yes: bool,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Role {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Role {
     Keep,   // the copy that stays
     Remove, // a copy to quarantine
     Linked, // the kept copy under another name (a hard link, or another mount): removing it frees nothing
@@ -72,7 +92,7 @@ enum Role {
 }
 
 impl Role {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Role::Keep => "KEEP",
             Role::Remove => "REMOVE",
@@ -83,24 +103,33 @@ impl Role {
 }
 
 /// One path of a group
-struct Member {
-    path: String,
-    modified: String,
-    device: Option<i64>,
-    inode: Option<i64>,
-    role: Role,
+#[derive(Clone)]
+pub(crate) struct Member {
+    pub(crate) path: String,
+    pub(crate) modified: String,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
+    pub(crate) role: Role,
+    pub(crate) can_go: bool, // the options allow removing it (its role may still be Keep)
 }
 
-struct Group {
-    checksum: String,
-    size: i64,
-    copies: usize, // distinct files: names of one file count once
-    members: Vec<Member>,
+impl Member {
+    /// Whether two paths are names of one file
+    pub(crate) fn same_file(&self, other: &Member) -> bool {
+        self.path == other.path || self.inode.is_some() && self.device == other.device && self.inode == other.inode
+    }
+}
+
+pub(crate) struct Group {
+    pub(crate) checksum: String,
+    pub(crate) size: i64,
+    pub(crate) copies: usize, // distinct files: names of one file count once
+    pub(crate) members: Vec<Member>, // the kept path first, then its other names, then the rest by path
 }
 
 impl Group {
     /// Copies to remove (hard links to one file count once) and the paths they have
-    fn removing(&self) -> (usize, usize) {
+    pub(crate) fn removing(&self) -> (usize, usize) {
         let paths: Vec<&Member> = self.members.iter().filter(|m| m.role == Role::Remove).collect();
         let files: HashSet<(Option<i64>, Option<i64>, &str)> = paths
             .iter()
@@ -123,6 +152,22 @@ fn is_under(path: &str, dir: &str) -> bool {
 
 /// (path, modified, device, inode, copy id, extension)
 type Row = (String, String, Option<i64>, Option<i64>, String, String);
+
+/// How a group's roles are chosen
+pub(crate) struct Rules<'a> {
+    pub(crate) keep: Keep,
+    pub(crate) keep_under: Vec<String>,   // absolute
+    pub(crate) remove_under: Vec<String>, // absolute
+    pub(crate) ext: Option<&'a ExtList>,
+    pub(crate) chosen: &'a HashMap<String, String>, // checksum → the path to keep, chosen by hand
+}
+
+impl Rules<'_> {
+    fn removable(&self, path: &str, ext: &str) -> bool {
+        (self.remove_under.is_empty() || self.remove_under.iter().any(|u| is_under(path, u)))
+            && self.ext.is_none_or(|ExtList(list)| list.iter().any(|e| *e == ext.to_lowercase()))
+    }
+}
 
 /// Every duplicate group in scope that has something to remove, most wasted space first
 fn plan_groups(conn: &Connection, o: &DedupeOptions) -> Result<Vec<Group>, String> {
@@ -169,6 +214,22 @@ fn plan_groups(conn: &Connection, o: &DedupeOptions) -> Result<Vec<Group>, Strin
         .collect::<rusqlite::Result<_>>()
         .map_err(db)?;
 
+    let none = HashMap::new();
+    let rules = Rules {
+        keep: o.keep,
+        keep_under: o.keep_under.iter().map(|p| absolute(p)).collect(),
+        remove_under: o.remove_under.iter().map(|p| absolute(p)).collect(),
+        ext: o.ext,
+        chosen: &none,
+    };
+    let mut groups = plan_found(conn, &parts, &found, &rules)?;
+    groups.retain(|g| g.members.iter().any(|m| m.role == Role::Remove));
+    Ok(groups)
+}
+
+/// The roles in each group found — (checksum, size) — among the copies in scope (`parts`)
+fn plan_found(conn: &Connection, parts: &crate::query::Parts, found: &[(String, i64)], rules: &Rules) -> Result<Vec<Group>, String> {
+    let and_scope = parts.conds.as_ref().map_or(String::new(), |c| format!(" AND {}", c));
     let mut rows: HashMap<String, Vec<Row>> = HashMap::new();
     // In chunks, to stay under SQLite's variable limit
     for chunk in found.chunks(500) {
@@ -202,25 +263,29 @@ fn plan_groups(conn: &Connection, o: &DedupeOptions) -> Result<Vec<Group>, Strin
             rows.entry(checksum).or_default().push(row);
         }
     }
-
-    let keep_under: Vec<String> = o.keep_under.iter().map(|p| absolute(p)).collect();
-    let remove_under: Vec<String> = o.remove_under.iter().map(|p| absolute(p)).collect();
-    let removable = |path: &str, ext: &str| {
-        (remove_under.is_empty() || remove_under.iter().any(|u| is_under(path, u)))
-            && o.ext.is_none_or(|ExtList(list)| list.iter().any(|e| *e == ext.to_lowercase()))
-    };
-    let mut groups = Vec::new();
-    for (checksum, size) in found {
-        let Some(list) = rows.remove(&checksum) else { continue };
-        if let Some(g) = choose(o.keep, &keep_under, &removable, checksum, size, list) {
-            groups.push(g);
-        }
-    }
-    Ok(groups)
+    Ok(found
+        .iter()
+        .filter_map(|(checksum, size)| {
+            let list = rows.remove(checksum)?;
+            choose(rules, checksum.clone(), *size, list)
+        })
+        .collect())
 }
 
-/// Decide each path's role in a group; None when there's nothing to remove
-fn choose(keep: Keep, keep_under: &[String], removable: &dyn Fn(&str, &str) -> bool, checksum: String, size: i64, rows: Vec<Row>) -> Option<Group> {
+/// The roles in some duplicate groups — (checksum, size) — for the app, which lets the copy
+/// to keep be chosen by hand. Groups with nothing to remove are included.
+pub(crate) fn plan_for(db_path: &str, path: Option<&str>, found: &[(String, i64)], chosen: &HashMap<String, String>) -> Result<Vec<Group>, String> {
+    let conn = Connection::open(db_path).map_err(|e| format!("{}: {}", db_path, e))?;
+    let scope = resolve_scope(&conn, path)?;
+    let parts = build_parts(&conn, &scope, &FilterArgs::default()).map_err(db)?;
+    let rules = Rules { keep: Keep::Oldest, keep_under: Vec::new(), remove_under: Vec::new(), ext: None, chosen };
+    plan_found(&conn, &parts, found, &rules)
+}
+
+/// Decide each path's role in a group; None unless it has two copies or more
+fn choose(rules: &Rules, checksum: String, size: i64, rows: Vec<Row>) -> Option<Group> {
+    let (keep, keep_under) = (rules.keep, &rules.keep_under);
+    let chosen = rules.chosen.get(&checksum).map(String::as_str);
     // The paths of each copy: one file under several names is one copy
     let mut copies: BTreeMap<String, Vec<Row>> = BTreeMap::new();
     for row in rows {
@@ -232,11 +297,12 @@ fn choose(keep: Keep, keep_under: &[String], removable: &dyn Fn(&str, &str) -> b
     // A copy can go only when every name it has may be removed, and they're hard links on one
     // device — the same file through two mounts would be moved out from under the other
     let can_go = |paths: &[Row]| {
-        paths.iter().all(|p| removable(&p.0, &p.5)) && (paths.len() == 1 || paths.iter().all(|p| p.2.is_some() && p.2 == paths[0].2))
+        paths.iter().all(|p| rules.removable(&p.0, &p.5)) && (paths.len() == 1 || paths.iter().all(|p| p.2.is_some() && p.2 == paths[0].2))
     };
-    // The copy that stays: one under --keep-under, then one the options leave alone (so as much
-    // as allowed can go), then by --keep; ties by path
+    // The copy that stays: one chosen by hand, then one under --keep-under, then one the options
+    // leave alone (so as much as allowed can go), then by --keep; ties by path
     let rank = |paths: &Vec<Row>| {
+        let picked = paths.iter().any(|p| Some(p.0.as_str()) == chosen);
         let (path, modified) = (&paths[0].0, &paths[0].1); // every name has the file's dates
         let preferred = paths.iter().any(|p| keep_under.iter().any(|u| is_under(&p.0, u)));
         let undated = matches!(keep, Keep::Oldest | Keep::Newest) && modified.is_empty();
@@ -247,25 +313,27 @@ fn choose(keep: Keep, keep_under: &[String], removable: &dyn Fn(&str, &str) -> b
             Keep::ShortestPath => (path.chars().count(), &none, Reverse(&none)),
             Keep::FirstPath => (0, &none, Reverse(&none)),
         };
-        (!preferred, can_go(paths), undated, length, older.clone(), Reverse(newer.0.clone()), path.clone())
+        (!picked, !preferred, can_go(paths), undated, length, older.clone(), Reverse(newer.0.clone()), path.clone())
     };
     let kept_id = copies.iter().min_by_key(|(_, p)| rank(p)).map(|(id, _)| id.clone())?;
     let mut members = Vec::new();
     for (id, paths) in &copies {
         let go = can_go(paths);
+        // The name kept: the one chosen by hand, else the first
+        let named = paths.iter().position(|p| Some(p.0.as_str()) == chosen).unwrap_or(0);
         for (i, (path, modified, device, inode, _, _)) in paths.iter().enumerate() {
             let role = if *id == kept_id {
-                if i == 0 { Role::Keep } else { Role::Linked }
+                if i == named { Role::Keep } else { Role::Linked }
             } else if go {
                 Role::Remove
             } else {
                 Role::Leave
             };
-            members.push(Member { path: path.clone(), modified: modified.clone(), device: *device, inode: *inode, role });
+            members.push(Member { path: path.clone(), modified: modified.clone(), device: *device, inode: *inode, role, can_go: go });
         }
     }
     members.sort_by_key(|m| (m.role != Role::Keep, m.role != Role::Linked, m.path.clone()));
-    members.iter().any(|m| m.role == Role::Remove).then_some(Group { checksum, size, copies: copies.len(), members })
+    Some(Group { checksum, size, copies: copies.len(), members })
 }
 
 // ─── Plans as CSV ────────────────────────────────────────────────────────────
@@ -330,10 +398,17 @@ fn csv_records(text: &str) -> Result<Vec<Vec<String>>, String> {
 }
 
 /// A plan to act on: per group, the paths to keep and the paths to remove
-struct PlanGroup {
-    checksum: String,
-    keep: Vec<String>,
-    remove: Vec<String>,
+pub(crate) struct PlanGroup {
+    pub(crate) checksum: String,
+    pub(crate) keep: Vec<String>,
+    pub(crate) remove: Vec<String>,
+}
+
+impl From<&Group> for PlanGroup {
+    fn from(g: &Group) -> Self {
+        let paths = |role| g.members.iter().filter(|m| m.role == role).map(|m| m.path.clone()).collect();
+        PlanGroup { checksum: g.checksum.clone(), keep: paths(Role::Keep), remove: paths(Role::Remove) }
+    }
 }
 
 fn read_plan(file: &str) -> Result<Vec<PlanGroup>, String> {
@@ -471,130 +546,172 @@ fn doing(action: Action, paths: usize, in_place: usize) -> String {
     }
 }
 
-/// Act on a plan: ask, then check and act under the database lock
+/// What acting on a plan did: a one-line summary, notes on each file skipped or not done
+/// ("skip: path — why"), and the quarantine batch if anything went there
+pub(crate) struct Acted {
+    pub(crate) summary: String,
+    pub(crate) notes: Vec<String>,
+    pub(crate) batch: Option<String>,
+}
+
+/// Check a plan and act on it, under the database lock — the caller has asked. Logged, notes
+/// included.
+pub(crate) fn act(db_path: &str, groups: &[PlanGroup], action: Action, runlog: &mut RunLog) -> Result<Acted, String> {
+    if action == Action::Share && !cfg!(target_os = "linux") {
+        return Err("sharing blocks needs Linux: run diskunder-linux on the server that has the volume".into());
+    }
+    let conn = crate::quarantine::open(db_path, true)?;
+    let _lock = lock_db(db_path, "diskunder dedupe")?;
+    let batch = new_batch(&conn)?;
+    runlog.start();
+    let result = act_on(&conn, db_path, &batch, groups, action);
+    match &result {
+        Ok(a) => {
+            for n in &a.notes {
+                runlog.error(n);
+            }
+            runlog.end("completed", &a.summary, 0);
+        }
+        Err(e) => {
+            runlog.error(e);
+            runlog.end("failed", e, 1);
+        }
+    }
+    result
+}
+
+fn act_on(conn: &Connection, db_path: &str, batch: &str, groups: &[PlanGroup], action: Action) -> Result<Acted, String> {
+    let c = check(conn, batch, groups)?;
+    let mut notes: Vec<String> = c.notes.iter().map(|n| format!("skip: {}", n)).collect();
+    let (mut skipped, mut failed) = (c.notes.len(), 0usize);
+    let mut done = Vec::new();
+    let mut aside = Vec::new();
+    let mut in_place = Vec::new();
+    for (f, k) in &c.going {
+        if action != Action::Quarantine && c.beside(f, *k) {
+            in_place.push((f, &c.keepers[*k]));
+        } else {
+            aside.push(f);
+        }
+    }
+    match action {
+        Action::Quarantine => {}
+        Action::Share => {
+            let (mut now, mut freed, mut already) = (0usize, 0u64, 0usize);
+            for (f, keep) in &in_place {
+                match crate::blocks::share(&keep.original, &f.original, f.size) {
+                    Ok(Shared::Now) => {
+                        now += 1;
+                        freed += f.size;
+                    }
+                    Ok(Shared::Already) => already += 1,
+                    Ok(Shared::Differs) => {
+                        notes.push(format!("skip: {} — the kernel found it differs from the kept copy", f.original.display()));
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        notes.push(format!("not shared: {} — {}", f.original.display(), e));
+                        failed += 1;
+                    }
+                }
+            }
+            done.push(format!("shared blocks for {}, freeing {}", plural(now, "file"), fmt_bytes(freed)));
+            if already > 0 {
+                done.push(format!("{} already shared", plural(already, "file")));
+            }
+        }
+        Action::Hardlink => {
+            let (mut linked, mut freed, mut affected) = (0usize, 0u64, Vec::new());
+            for (f, keep) in &in_place {
+                match crate::blocks::same_bytes(&keep.original, &f.original) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        notes.push(format!("skip: {} — differs from the kept copy, byte for byte", f.original.display()));
+                        skipped += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        notes.push(format!("not linked: {} — {}", f.original.display(), e));
+                        failed += 1;
+                        continue;
+                    }
+                }
+                // Its blocks shared earlier: linking frees nothing more
+                let frees = if crate::blocks::already_shared(&keep.original, &f.original) { 0 } else { f.size };
+                if let Err(e) = crate::blocks::link_over(&keep.original, &f.original) {
+                    notes.push(format!("not linked: {} — {}", f.original.display(), e));
+                    failed += 1;
+                    continue;
+                }
+                relinked(conn, f, keep)
+                    .map_err(|e| format!("{} is now a hard link but its row couldn't be updated: {} (run update)", f.original.display(), e))?;
+                linked += 1;
+                freed += frees;
+                affected.extend(f.checksum.clone());
+            }
+            refresh_dup_groups(conn, &affected).map_err(|e| e.to_string())?;
+            done.push(format!("replaced {} with hard links, freeing {}", plural(linked, "file"), fmt_bytes(freed)));
+        }
+    }
+    let mut used_batch = None;
+    if !aside.is_empty() {
+        let moved = move_planned(conn, db_path, batch, Some("dedupe"), &aside)?;
+        failed += moved.failed.len();
+        notes.extend(moved.failed.iter().map(|f| format!("not moved: {}", f)));
+        if moved.files > 0 {
+            used_batch = Some(batch.to_string());
+        }
+        done.push(Moved { failed: Vec::new(), ..moved }.message(batch, 0));
+    }
+    if failed > 0 {
+        done.push(format!("{} failed", plural(failed, "file")));
+    }
+    if skipped > 0 {
+        done.push(format!("{} skipped", plural(skipped, "file")));
+    }
+    if c.going.is_empty() {
+        let e = format!("nothing done — every file was skipped ({})", done.join("; "));
+        // The notes say why, so they go with the error
+        return Err(std::iter::once(e).chain(notes).collect::<Vec<_>>().join("\n"));
+    }
+    Ok(Acted { summary: format!("dedupe: {}", done.join("; ")), notes, batch: used_batch })
+}
+
+/// The command line's --apply: ask, act, print
 fn apply(db_path: &str, settings: &Settings, groups: &[PlanGroup], what: &str, action: Action, yes: bool, runlog: &mut RunLog) -> Result<(), String> {
     if action == Action::Share && !cfg!(target_os = "linux") {
         return Err("--action share needs Linux: run diskunder-linux on the server that has the volume".into());
     }
     let files = plural(groups.iter().map(|g| g.remove.len()).sum(), "file");
-    match action {
-        Action::Quarantine => ask(
-            &format!("Quarantine {} from {}? Each is checked first; they can be restored later.", files, what),
-            yes || !settings.yes("deletion.confirm_quarantine"),
-        )?,
-        Action::Share => ask(
-            &format!("Share blocks for {} from {} with their kept copies? Each is checked first; copies on another volume are quarantined.", files, what),
-            yes || !settings.yes("deletion.confirm_quarantine"),
-        )?,
-        // Not undoable, so always asked
-        Action::Hardlink => ask(
-            &format!(
-                "Replace {} from {} with hard links to their kept copies? Each is compared byte for byte first, but this can't be undone; copies on another volume are quarantined.",
-                files, what
-            ),
-            yes,
-        )?,
+    let (question, asked) = confirm_text(action, &files, what);
+    ask(&question, yes || (!asked && !settings.yes("deletion.confirm_quarantine")))?;
+    let acted = act(db_path, groups, action, runlog)?;
+    for n in &acted.notes {
+        eprintln!("{}", n);
     }
-    let conn = crate::quarantine::open(db_path, true)?;
-    let _lock = lock_db(db_path, "diskunder dedupe")?;
-    let batch = new_batch(&conn)?;
-    let mut quarantined = false;
-    let result = crate::maintenance::logged(runlog, || {
-        let c = check(&conn, &batch, groups)?;
-        for n in &c.notes {
-            eprintln!("skip: {}", n);
-        }
-        let (mut skipped, mut failed) = (c.notes.len(), 0usize);
-        let mut done = Vec::new();
-        let mut aside = Vec::new();
-        let mut in_place = Vec::new();
-        for (f, k) in &c.going {
-            if action != Action::Quarantine && c.beside(f, *k) {
-                in_place.push((f, &c.keepers[*k]));
-            } else {
-                aside.push(f);
-            }
-        }
-        match action {
-            Action::Quarantine => {}
-            Action::Share => {
-                let (mut now, mut freed, mut already) = (0usize, 0u64, 0usize);
-                for (f, keep) in &in_place {
-                    match crate::blocks::share(&keep.original, &f.original, f.size) {
-                        Ok(Shared::Now) => {
-                            now += 1;
-                            freed += f.size;
-                        }
-                        Ok(Shared::Already) => already += 1,
-                        Ok(Shared::Differs) => {
-                            eprintln!("skip: {} — the kernel found it differs from the kept copy", f.original.display());
-                            skipped += 1;
-                        }
-                        Err(e) => {
-                            eprintln!("not shared: {} — {}", f.original.display(), e);
-                            failed += 1;
-                        }
-                    }
-                }
-                done.push(format!("shared blocks for {}, freeing {}", plural(now, "file"), fmt_bytes(freed)));
-                if already > 0 {
-                    done.push(format!("{} already shared", plural(already, "file")));
-                }
-            }
-            Action::Hardlink => {
-                let (mut linked, mut freed, mut affected) = (0usize, 0u64, Vec::new());
-                for (f, keep) in &in_place {
-                    match crate::blocks::same_bytes(&keep.original, &f.original) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            eprintln!("skip: {} — differs from the kept copy, byte for byte", f.original.display());
-                            skipped += 1;
-                            continue;
-                        }
-                        Err(e) => {
-                            eprintln!("not linked: {} — {}", f.original.display(), e);
-                            failed += 1;
-                            continue;
-                        }
-                    }
-                    // Its blocks shared earlier: linking frees nothing more
-                    let frees = if crate::blocks::already_shared(&keep.original, &f.original) { 0 } else { f.size };
-                    if let Err(e) = crate::blocks::link_over(&keep.original, &f.original) {
-                        eprintln!("not linked: {} — {}", f.original.display(), e);
-                        failed += 1;
-                        continue;
-                    }
-                    relinked(&conn, f, keep).map_err(|e| format!("{} is now a hard link but its row couldn't be updated: {} (run update)", f.original.display(), e))?;
-                    linked += 1;
-                    freed += frees;
-                    affected.extend(f.checksum.clone());
-                }
-                refresh_dup_groups(&conn, &affected).map_err(|e| e.to_string())?;
-                done.push(format!("replaced {} with hard links, freeing {}", plural(linked, "file"), fmt_bytes(freed)));
-            }
-        }
-        if !aside.is_empty() {
-            let moved = move_planned(&conn, db_path, &batch, Some("dedupe"), &aside)?;
-            failed += moved.failed;
-            quarantined = moved.files > 0;
-            done.push(Moved { failed: 0, ..moved }.message(&batch, 0));
-        }
-        if failed > 0 {
-            done.push(format!("{} failed", plural(failed, "file")));
-        }
-        if skipped > 0 {
-            done.push(format!("{} skipped", plural(skipped, "file")));
-        }
-        if c.going.is_empty() {
-            return Err(format!("nothing done — every file was skipped ({})", done.join("; ")));
-        }
-        Ok(format!("dedupe: {}", done.join("; ")))
-    })?;
-    println!("{}", result);
-    if quarantined {
+    println!("{}", acted.summary);
+    if let Some(batch) = acted.batch {
         println!("undo the quarantine with: diskunder quarantine restore {}", batch);
     }
     Ok(())
+}
+
+/// The question before acting, and whether it's always asked (an action that can't be undone)
+pub(crate) fn confirm_text(action: Action, files: &str, what: &str) -> (String, bool) {
+    match action {
+        Action::Quarantine => (format!("Quarantine {} from {}? Each is checked first; they can be restored later.", files, what), false),
+        Action::Share => (
+            format!("Share blocks for {} from {} with their kept copies? Each is checked first; copies on another volume are quarantined.", files, what),
+            false,
+        ),
+        Action::Hardlink => (
+            format!(
+                "Replace {} from {} with hard links to their kept copies? Each is compared byte for byte first, but this can't be undone; copies on another volume are quarantined.",
+                files, what
+            ),
+            true,
+        ),
+    }
 }
 
 // ─── The command ─────────────────────────────────────────────────────────────
@@ -710,14 +827,7 @@ fn dedupe(db_path: &str, o: &DedupeOptions, settings: &Settings, runlog: &mut Ru
         if !to_stdout {
             preview(&groups, o.limit, o.action);
         }
-        let plan: Vec<PlanGroup> = groups
-            .iter()
-            .map(|g| PlanGroup {
-                checksum: g.checksum.clone(),
-                keep: g.members.iter().filter(|m| m.role == Role::Keep).map(|m| m.path.clone()).collect(),
-                remove: g.members.iter().filter(|m| m.role == Role::Remove).map(|m| m.path.clone()).collect(),
-            })
-            .collect();
+        let plan: Vec<PlanGroup> = groups.iter().map(PlanGroup::from).collect();
         drop(conn);
         return apply(db_path, settings, &plan, &plural(groups.len(), "group"), o.action, o.yes, runlog);
     }
@@ -751,6 +861,14 @@ mod tests {
         (path.into(), modified.into(), Some(1), Some(id.len() as i64), id.into(), "mov".into())
     }
 
+    /// The group's roles, or None when nothing would be removed
+    fn plan(keep: Keep, keep_under: &[&str], remove_under: &[&str], chosen: Option<&str>, rows: Vec<Row>) -> Option<Group> {
+        let chosen: HashMap<String, String> = chosen.map(|p| ("c".to_string(), p.to_string())).into_iter().collect();
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        let rules = Rules { keep, keep_under: strings(keep_under), remove_under: strings(remove_under), ext: None, chosen: &chosen };
+        choose(&rules, "c".into(), 10, rows).filter(|g| g.members.iter().any(|m| m.role == Role::Remove))
+    }
+
     fn roles(g: &Group) -> Vec<(&str, &str)> {
         g.members.iter().map(|m| (m.role.label(), m.path.as_str())).collect()
     }
@@ -758,40 +876,39 @@ mod tests {
     #[test]
     fn keeping_the_right_copy() {
         let rows = || vec![row("/n/b/x", "2024-01-01 00:00:00", "a"), row("/n/a/longer/x", "2023-01-01 00:00:00", "bb"), row("/n/c/x", "2025-01-01 00:00:00", "ccc")];
-        let any = |_: &str, _: &str| true;
-        let pick = |keep, under: &[String]| choose(keep, under, &any, "c".into(), 10, rows()).unwrap().members[0].path.clone();
+        let pick = |keep, under: &[&str]| plan(keep, under, &[], None, rows()).unwrap().members[0].path.clone();
         assert_eq!(pick(Keep::Oldest, &[]), "/n/a/longer/x");
         assert_eq!(pick(Keep::Newest, &[]), "/n/c/x");
         assert_eq!(pick(Keep::ShortestPath, &[]), "/n/b/x");
         assert_eq!(pick(Keep::FirstPath, &[]), "/n/a/longer/x");
-        assert_eq!(pick(Keep::Oldest, &["/n/c".to_string()]), "/n/c/x");
+        assert_eq!(pick(Keep::Oldest, &["/n/c"]), "/n/c/x");
+        assert_eq!(plan(Keep::Oldest, &["/n/c"], &[], Some("/n/b/x"), rows()).unwrap().members[0].path, "/n/b/x", "chosen by hand beats everything");
         // Only /n/b may go: the kept copy is one that would stay anyway
-        let only_b = |p: &str, _: &str| p.starts_with("/n/b/");
-        let g = choose(Keep::Newest, &[], &only_b, "c".into(), 10, rows()).unwrap();
+        let g = plan(Keep::Newest, &[], &["/n/b"], None, rows()).unwrap();
         assert_eq!(roles(&g), [("KEEP", "/n/c/x"), ("LEAVE", "/n/a/longer/x"), ("REMOVE", "/n/b/x")]);
-        let only_c = |p: &str, _: &str| p.starts_with("/n/c/");
-        let g = choose(Keep::Newest, &[], &only_c, "c".into(), 10, rows()).unwrap();
+        let g = plan(Keep::Newest, &[], &["/n/c"], None, rows()).unwrap();
         assert_eq!(g.members[0].path, "/n/b/x", "newest of the copies that can't go");
-        assert!(choose(Keep::Oldest, &[], &|_: &str, _: &str| false, "c".into(), 10, rows()).is_none());
+        assert!(plan(Keep::Oldest, &[], &["/nowhere"], None, rows()).is_none());
     }
 
     #[test]
     fn hard_links_go_together_or_not_at_all() {
         let mut rows = vec![row("/n/a/x", "2023-01-01 00:00:00", "a"), row("/n/b/x", "2024-01-01 00:00:00", "bb"), row("/n/c/x", "2024-01-01 00:00:00", "bb")];
-        let any = |_: &str, _: &str| true;
-        let g = choose(Keep::Oldest, &[], &any, "c".into(), 10, rows.clone()).unwrap();
+        let g = plan(Keep::Oldest, &[], &[], None, rows.clone()).unwrap();
         assert_eq!(roles(&g), [("KEEP", "/n/a/x"), ("REMOVE", "/n/b/x"), ("REMOVE", "/n/c/x")]);
         assert_eq!(g.removing(), (1, 2));
         // Only one name under --remove-under: removing it would free nothing
-        let only_b = |p: &str, _: &str| p.starts_with("/n/b/");
-        assert!(choose(Keep::Oldest, &[], &only_b, "c".into(), 10, rows.clone()).is_none());
+        assert!(plan(Keep::Oldest, &[], &["/n/b"], None, rows.clone()).is_none());
+        // Keeping a copy chosen by name keeps that name, its other names linked
+        let g = plan(Keep::Oldest, &[], &[], Some("/n/c/x"), rows.clone()).unwrap();
+        assert_eq!(roles(&g), [("KEEP", "/n/c/x"), ("LINKED", "/n/b/x"), ("REMOVE", "/n/a/x")]);
         // A link to the kept copy is never removed
         rows.push(row("/n/d/x", "2023-01-01 00:00:00", "a"));
-        let g = choose(Keep::Oldest, &[], &any, "c".into(), 10, rows.clone()).unwrap();
+        let g = plan(Keep::Oldest, &[], &[], None, rows.clone()).unwrap();
         assert_eq!(roles(&g)[1], ("LINKED", "/n/d/x"));
         // The same file through two mounts (other devices) can't go, so it's the one kept
         rows[2].2 = Some(2);
-        let g = choose(Keep::Oldest, &[], &any, "c".into(), 10, rows).unwrap();
+        let g = plan(Keep::Oldest, &[], &[], None, rows).unwrap();
         assert_eq!(roles(&g), [("KEEP", "/n/b/x"), ("LINKED", "/n/c/x"), ("REMOVE", "/n/a/x"), ("REMOVE", "/n/d/x")]);
     }
 

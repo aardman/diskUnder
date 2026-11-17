@@ -64,7 +64,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 6.2.0`:
+**Check it worked** — this should print `diskunder 6.3.0`:
 
 ```bash
 diskunder --version
@@ -567,7 +567,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Host  Settings  Help                 diskUnder v6.2.0 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v6.3.0 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -603,16 +603,25 @@ $ diskunder run nas-nightly
   - Latest (`l`), History (`h` — `⏎` on a run shows its errors), Errors (`o`), Logs (`g` —
     the job's lines from the run log; `a` shows every run)
   - Search… (`/`) — the `search` filters as a form; results update as you type
-  - Duplicates (`d`) — groups by wasted space with the selected group's copies (hard links
-    marked); `f` sets the duplicate filters; `a` switches to every path in the database —
-    duplicates across shares — and back
+  - Duplicates (`d`) — groups by wasted space with the selected group's copies, each marked
+    as `dedupe` would treat it: KEEP, REMOVE, LINKED (the kept file under another name) or
+    LEAVE. `f` sets the duplicate filters; `a` switches to every path in the database —
+    duplicates across shares — and back. To dedupe from here:
+    - `Tab` moves into the copies; `⏎` keeps the selected copy instead, and `space` leaves a
+      copy alone (or marks it for removal again). Choices stay while the view is open.
+    - `x` dedupes the selected group, `X` every group shown, each as its copies pane shows
+      it. A dialog asks first, with the action — `space` cycles quarantine, share and
+      hardlink. It runs in the background, checking each file as `dedupe --apply` does, and
+      the footer says what it did; any files skipped are listed in the run log (`g`).
   - Reports… (`p`) — overview, largest files, by type, by folder, stale, duplicates
   - Browse (`b`) — folders by size with files, share and duplicated space; `⏎` goes in, `⌫` up
 - **Runs carry on in the bottom strip** while you use the menus — one at a time. Quitting
   during a run asks first, and records it as stopped by user. Once a run ends the strip shows
   it — `Last run: NAME completed in 3s at 12:01` with its counts — until the job is removed.
 - **Database menu**, for the open database: Info, Check, Vacuum…, Drop path… (warns if a job
-  uses the index), Open… (another database), Backup… (a consistent copy — see `db backup`).
+  uses the index), Open… (another database), Backup… (a consistent copy — see `db backup`),
+  and Quarantine — the batches, with the selected one's files: `r` restores a batch, `p`
+  purges it (deletes its files for good, however recent), each after a `y`.
 - **Host menu**: Drives & mounts — local drives and network mounts in two sections, with
   filesystem, size, used, free, the jobs on each, and source. `⏎` browses down into a mount's
   folders (`⌫` / `←` back up) and `space` starts a new job for the selected mount or folder;
@@ -869,6 +878,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Quarantine — move files aside reversibly, with `restore` and `purge` | No | No | No | No | No | Yes (6.0) |
 | Dedupe — keep one copy per group, quarantine the rest; previews, plans, re-checks | No | No | No | No | No | Yes (6.1) |
 | Dedupe by sharing blocks (XFS, Btrfs) or hard links — every path stays | No | No | No | No | No | Yes (6.2) |
+| Dedupe and quarantine in the app — choose the copy to keep, restore, purge | No | No | No | No | No | Yes (6.3) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
 ### Background
@@ -912,7 +922,8 @@ diskunder/
 │   ├── run.rs         #   one index / update run (shared by jobs)
 │   ├── jobs.rs        #   jobs and run history
 │   ├── app/           #   the interactive app: state and keys, drawing, the job form,
-│   │                  #   Search / Duplicates / Browse, Settings view, test job, tests
+│   │                  #   Search / Duplicates / Browse, Quarantine and Settings views,
+│   │                  #   test job, tests
 │   ├── settings.rs    #   settings and type groups
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   ├── host.rs        #   drives and mounts, host info

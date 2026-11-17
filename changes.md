@@ -1,5 +1,16 @@
 # diskUnder — Change Log
 
+## v6.3.0 — dedupe and quarantine in the app
+
+- **Duplicates view:** each copy is marked KEEP, REMOVE, LINKED or LEAVE, as `dedupe` would
+  treat it. `Tab` moves into the copies; `⏎` keeps the selected copy instead, `space` leaves
+  one alone (or not). `x` dedupes the group, `X` every group shown; a dialog asks first, with
+  the action (quarantine, share, hardlink). It runs in the background with the same checks as
+  `dedupe --apply`; the footer says what it did, and skipped files go in the run log.
+- **Database ▸ Quarantine:** the batches and their files; `r` restores a batch, `p` purges it,
+  each after a `y`.
+- `dedupe` now also writes the files it skips or can't act on to the run log.
+
 ## v6.2.0 — dedupe by sharing blocks
 
 - **`dedupe --action share`:** copies on the kept copy's volume share its blocks (Linux
