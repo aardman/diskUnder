@@ -597,9 +597,15 @@ fn act_on(conn: &Connection, db_path: &str, batch: &str, groups: &[PlanGroup], a
     match action {
         Action::Quarantine => {}
         Action::Share => {
-            let (mut now, mut freed, mut already) = (0usize, 0u64, 0usize);
+            let (mut now, mut freed, mut already, mut affected) = (0usize, 0u64, 0usize, Vec::new());
             for (f, keep) in &in_place {
-                match crate::blocks::share(&keep.original, &f.original, f.size) {
+                let result = crate::blocks::share(&keep.original, &f.original, f.size);
+                if matches!(result, Ok(Shared::Now | Shared::Already)) {
+                    crate::quarantine::shared(conn, f, keep)
+                        .map_err(|e| format!("{} now shares blocks but that couldn't be recorded: {}", f.original.display(), e))?;
+                    affected.extend(f.checksum.clone());
+                }
+                match result {
                     Ok(Shared::Now) => {
                         now += 1;
                         freed += f.size;
@@ -615,6 +621,7 @@ fn act_on(conn: &Connection, db_path: &str, batch: &str, groups: &[PlanGroup], a
                     }
                 }
             }
+            refresh_dup_groups(conn, &affected).map_err(|e| e.to_string())?;
             done.push(format!("shared blocks for {}, freeing {}", plural(now, "file"), fmt_bytes(freed)));
             if already > 0 {
                 done.push(format!("{} already shared", plural(already, "file")));

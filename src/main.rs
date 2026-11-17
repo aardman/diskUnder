@@ -1,6 +1,21 @@
 // diskUnder — file indexer with live TUI progress, duplicate detection and database maintenance
 // See changes.md for full change history
 
+/// `print!` and `println!` for the whole crate, except that a closed stdout (`| head`) isn't a
+/// panic: the output is dropped and the work carries on, so nothing is left half-done
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = write!(std::io::stdout(), $($arg)*);
+    }};
+}
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 mod app;
 mod blocks;
 mod cli;

@@ -31,7 +31,7 @@ pub(crate) const SETTINGS: [(&str, &str, Kind, &str); 12] = [
     ("defaults.exclude_paths", "", Kind::Paths, "exclude paths for new jobs created in the app"),
     ("deletion.dry_run_default", "yes", Kind::YesNo, "dedupe only previews unless --apply"),
     ("deletion.confirm_quarantine", "yes", Kind::YesNo, "ask before moving files to quarantine"),
-    ("deletion.purge_after_days", "7", Kind::Number, "how long quarantine purge waits, in days"),
+    ("deletion.purge_after_days", "7", Kind::Number, "how long quarantine purge waits, in days (0: no wait)"),
     ("log.folder", "", Kind::Text, "folder for run logs (blank: next to each database)"),
     ("log.rotate_mb", "10", Kind::Number, "start a new run log after this many MB"),
 ];
@@ -149,6 +149,11 @@ pub(crate) fn check(settings: &Settings, key: &str, value: &str) -> Result<Strin
     match kind {
         Kind::YesNo if v == "yes" || v == "no" => Ok(v.to_string()),
         Kind::YesNo => Err(format!("{} is yes or no", key)),
+        // Purging needn't wait at all; everything else needs at least 1
+        Kind::Number if key == "deletion.purge_after_days" => match v.parse::<u64>() {
+            Ok(n) => Ok(n.to_string()),
+            _ => Err(format!("{} is a whole number of days (0: no wait)", key)),
+        },
         Kind::Number => match v.parse::<u64>() {
             Ok(n) if n > 0 => Ok(n.to_string()),
             _ => Err(format!("{} is a whole number above 0", key)),

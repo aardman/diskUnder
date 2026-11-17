@@ -681,6 +681,25 @@ pub(crate) fn has_dup_groups(conn: &Connection) -> DbResult<bool> {
     table_exists(conn, "dup_groups")
 }
 
+/// Copies whose blocks dedupe shared with a kept copy (Linux, `--action share`). Each counts as
+/// the kept copy when duplicates are counted, as a hard link does. Keyed by checksum too, so a
+/// copy that has changed since no longer counts as shared.
+pub(crate) const SHARED_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS shared_blocks (
+    copy_id  TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    keeper   TEXT NOT NULL,   -- the kept copy's copy_id
+    PRIMARY KEY (copy_id, checksum)
+)";
+
+/// A copy id (`expr`, for a row of table `t`) as duplicate counting sees it: the kept copy's
+/// for a copy sharing its blocks
+pub(crate) fn counted_copy_id(conn: &Connection, t: &str, expr: String) -> DbResult<String> {
+    if !table_exists(conn, "shared_blocks")? {
+        return Ok(expr);
+    }
+    Ok(format!("COALESCE((SELECT keeper FROM shared_blocks s WHERE s.copy_id = {expr} AND s.checksum = {t}.checksum), {expr})"))
+}
+
 /// Every file table as `SELECT checksum, size, path, <copy id> AS copy_id FROM t [WHERE …]`,
 /// joined with UNION ALL
 fn copy_rows_sql(conn: &Connection, filter: &str) -> DbResult<String> {
@@ -688,7 +707,7 @@ fn copy_rows_sql(conn: &Connection, filter: &str) -> DbResult<String> {
     let mut parts = Vec::new();
     for t in file_tables(conn)? {
         let volume = roots.get(&t).and_then(|r| r.volume.as_ref()).map(|v| v.id.clone());
-        let cid = crate::query::copy_id_expr("", volume.as_deref(), has_column(conn, &t, "inode")?);
+        let cid = counted_copy_id(conn, &t, crate::query::copy_id_expr("", volume.as_deref(), has_column(conn, &t, "inode")?))?;
         parts.push(format!("SELECT checksum, size, path, {cid} AS copy_id FROM {t} WHERE {filter}"));
     }
     Ok(parts.join(" UNION ALL "))

@@ -2976,6 +2976,47 @@ fn dedupe_share_needs_linux() {
     assert!(share.join("temp/render.mov").exists() && !qfolder(&share).exists());
 }
 
+/// What `dedupe --action share` records when a copy shares the kept copy's blocks, made by
+/// hand: the sharing itself needs Linux and XFS or Btrfs
+fn record_shared(db: &Path, share: &Path, copy: &str, keep: &str) {
+    let conn = Connection::open(db).unwrap();
+    let t = table_for(share);
+    let id = |p: &str| -> (String, String) {
+        conn.query_row(
+            &format!(
+                "SELECT COALESCE((SELECT volume || '#' FROM roots WHERE table_name = '{t}'), device || ':') || inode, checksum
+                 FROM {t} WHERE path = ?1"
+            ),
+            [share.join(p).to_string_lossy()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    let ((c, checksum), (k, _)) = (id(copy), id(keep));
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS shared_blocks (copy_id TEXT NOT NULL, checksum TEXT NOT NULL, keeper TEXT NOT NULL, PRIMARY KEY (copy_id, checksum))",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO shared_blocks VALUES (?1, ?2, ?3)", [c, checksum, k]).unwrap();
+}
+
+#[test]
+fn copies_sharing_blocks_are_not_wasted_space() {
+    let tmp = TempDir::new();
+    let (share, db) = dedupe_share(&tmp);
+    record_shared(&db, &share, "temp/render.mov", "backup/render.mov");
+    // Grouping the files themselves (a path given) sees it straight away
+    let r = ok(query(tmp.path(), &["report", "--duplicates", share.to_str().unwrap(), "--db", db.to_str().unwrap()]));
+    assert!(r.stdout.contains("9 B wasted   render.mov — 9 B × 2 copies") && r.stdout.contains("(shares blocks)"), "{}", r.stdout);
+    // The summary once a run recounts it; and dedupe leaves it alone, like a hard link
+    write(&share.join("temp/render.mov"), "a render\n");
+    run_in(tmp.path(), &["update", "share", "--db", db.to_str().unwrap()]);
+    let roles = plan_roles(&share, &ok(dd(&tmp, &db, &["--plan", "-"])).stdout);
+    assert_eq!(roles.iter().filter(|(a, _)| a == "REMOVE").count(), 1, "{:?}", roles);
+    assert!(roles.contains(&("LINKED".to_string(), "temp/render.mov".to_string())), "{:?}", roles);
+}
+
 /// Runs for real where the temporary folder is on XFS (with reflink) or Btrfs — e.g.
 /// TMPDIR on an XFS mount; elsewhere the kernel refuses and the test says so
 #[cfg(target_os = "linux")]
@@ -3002,6 +3043,9 @@ fn dedupe_shares_blocks() {
     }
     assert_ne!(inode(&share.join("a/big.bin")), inode(&share.join("b/big.bin")), "still separate files");
     assert!(!qfolder(&share).exists());
+    // Shared copies count as the kept one now, as hard links do: no space wasted, nothing to do
+    let report = ok(query(tmp.path(), &["report", "--duplicates", "--db", db.to_str().unwrap()]));
+    assert!(report.stdout.contains("(none)"), "{}", report.stdout);
     let again = ok(dd(&tmp, &db, &["--action", "share", "--apply", "--yes"]));
-    assert!(again.stdout.contains("shared blocks for 0 files") && again.stdout.contains("2 files already shared"), "{}", again.stdout);
+    assert!(!again.stdout.contains("shared blocks for"), "{}", again.stdout);
 }

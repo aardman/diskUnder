@@ -593,14 +593,14 @@ impl App {
     /// Restore or purge a quarantine batch, in the background
     fn quarantine_batch(&mut self, batch: String, purge: bool) {
         let View::Quarantine(q) = &self.view else { return };
-        let db = q.db.clone();
+        let (db, wait_days) = (q.db.clone(), q.wait_days);
         let command = q.command();
         let (log, no_log, logged_as) = (self.log.clone(), self.no_log, format!("{} [app]", command));
         let title = if purge { "Purge" } else { "Restore" };
         self.spawn_in_place(title.into(), command, move || {
             let mut runlog = RunLog::new(&db, log.as_deref(), no_log).for_command(logged_as);
             if purge {
-                crate::quarantine::purge_batch(&db, &batch, &mut runlog)
+                crate::quarantine::purge_batch(&db, &batch, wait_days, &mut runlog)
             } else {
                 crate::quarantine::restore_batch(&db, &batch, &[], &mut runlog)
             }
@@ -951,7 +951,7 @@ impl App {
                 });
             }
             Action::DbVacuum => self.dialog = Some(Dialog::Vacuum),
-            Action::Quarantine => self.view = View::Quarantine(Box::new(QuarantineView::new(&self.db))),
+            Action::Quarantine => self.view = View::Quarantine(Box::new(QuarantineView::new(&self.db, self.settings.number("deletion.purge_after_days")))),
             Action::DbDrop => self.choose_drop(),
             Action::DbOpen => self.dialog = Some(Dialog::Input { purpose: InputFor::Open, value: self.db.clone() }),
             Action::DbBackup => {

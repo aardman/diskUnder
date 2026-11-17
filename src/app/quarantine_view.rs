@@ -3,7 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::quarantine::{batch_files, batch_rows, BatchRow};
+use crate::quarantine::{batch_files, batch_rows, plural, BatchRow};
 
 /// A change waiting for y
 #[derive(Clone, Copy, PartialEq)]
@@ -26,11 +26,13 @@ pub(crate) struct QuarantineView {
     pub(crate) files: Vec<(String, i64, String)>, // the selected batch's: (state, size, original)
     pub(crate) error: Option<String>,
     pub(crate) confirm: Option<Confirm>,
+    pub(crate) wait_days: u64, // deletion.purge_after_days: batches younger than this aren't purged
 }
 
 impl QuarantineView {
-    pub(crate) fn new(db: &str) -> Self {
-        let mut v = QuarantineView { db: db.to_string(), batches: Vec::new(), selected: 0, files: Vec::new(), error: None, confirm: None };
+    pub(crate) fn new(db: &str, wait_days: u64) -> Self {
+        let mut v =
+            QuarantineView { db: db.to_string(), batches: Vec::new(), selected: 0, files: Vec::new(), error: None, confirm: None, wait_days };
         v.reload();
         // Newest first is what's usually wanted
         v.selected = v.batches.len().saturating_sub(1);
@@ -62,7 +64,7 @@ impl QuarantineView {
         let db = &self.db;
         match (self.batch(), self.confirm) {
             (Some(b), Some(Confirm::Restore)) => format!("diskunder quarantine restore {} --db {}", b.batch, db),
-            (Some(b), Some(Confirm::Purge)) => format!("diskunder quarantine purge {} --older-than 0d --db {}", b.batch, db),
+            (Some(b), Some(Confirm::Purge)) => format!("diskunder quarantine purge {} --db {}", b.batch, db),
             (Some(b), None) => format!("diskunder quarantine show {} --db {}", b.batch, db),
             (None, _) => format!("diskunder quarantine list --db {}", db),
         }
@@ -76,7 +78,22 @@ impl QuarantineView {
         }
     }
 
+    /// Whether the selected batch has waited long enough to purge; why not when it hasn't
+    fn purgeable(&self) -> Result<(), String> {
+        let Some(b) = self.batch() else { return Ok(()) };
+        let cutoff = crate::report::parse_age_arg(&format!("{}d", self.wait_days))?.cutoff;
+        if b.created <= cutoff {
+            return Ok(());
+        }
+        Err(format!(
+            "{} is kept {} before it can be purged — change deletion.purge_after_days in Settings to purge sooner",
+            b.batch,
+            plural(self.wait_days as usize, "day")
+        ))
+    }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> QuarantineOutcome {
+        self.error = None;
         if let Some(c) = self.confirm.take() {
             let Some(b) = self.batch() else { return QuarantineOutcome::Stay };
             return match (key.code, c) {
@@ -92,7 +109,10 @@ impl QuarantineView {
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => self.selected = (self.selected + 1).min(self.batches.len().saturating_sub(1)),
             KeyCode::Char('r') if held => self.confirm = Some(Confirm::Restore),
-            KeyCode::Char('p') if held => self.confirm = Some(Confirm::Purge),
+            KeyCode::Char('p') if held => match self.purgeable() {
+                Ok(()) => self.confirm = Some(Confirm::Purge),
+                Err(e) => self.error = Some(e),
+            },
             _ => {}
         }
         if self.selected != before {

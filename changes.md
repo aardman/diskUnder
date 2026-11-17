@@ -1,5 +1,16 @@
 # diskUnder — Change Log
 
+## v6.3.1 — fixes
+
+- **Copies sharing blocks aren't wasted space:** copies `dedupe --action share` shares now
+  count as the kept copy, like hard links — reports stop counting them as wasted, mark them
+  `(shares blocks)`, and dedupe leaves them alone. They're recorded in a new `shared_blocks`
+  table; a copy that changes stops counting as shared.
+- **Purging in the app waits too:** a batch is kept `deletion.purge_after_days` (7) before `p`
+  will purge it, as on the command line. The setting can now be 0 for no wait.
+- **Output piped into `head`:** `dedupe`, `quarantine` and the other commands no longer panic
+  with "Broken pipe" when the reader stops early; they finish what they're doing quietly.
+
 ## v6.3.0 — dedupe and quarantine in the app
 
 - **Duplicates view:** each copy is marked KEEP, REMOVE, LINKED or LEAVE, as `dedupe` would

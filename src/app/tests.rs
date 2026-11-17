@@ -752,6 +752,13 @@ fn purging_a_quarantine_batch_from_the_app() {
     assert!(app.message.clone().unwrap_or_default().contains("quarantined 1 file"), "{:?}", app.message);
     press(&mut app, &[KeyCode::Esc]);
     app.act(Action::Quarantine);
+    // Kept for deletion.purge_after_days (7) first
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert!(screen(&app).contains("is kept 7 days before it can be purged"), "{}", screen(&app));
+    crate::settings::set(&app.store, "deletion.purge_after_days", "0").unwrap();
+    app.settings = crate::settings::Settings::load(&app.store);
+    press(&mut app, &[KeyCode::Esc]);
+    app.act(Action::Quarantine);
     // Anything but y cancels
     press(&mut app, &[KeyCode::Char('p'), KeyCode::Char('n')]);
     let View::Quarantine(q) = &app.view else { panic!("not in Quarantine") };

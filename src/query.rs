@@ -301,7 +301,7 @@ fn source_select(conn: &Connection, scope: &Scope, t: &str, lowercase_ext: bool)
          {copy_id} AS copy_id \
          FROM {t}",
         root = sql_literal(&scope.root_label(t)),
-        copy_id = copy_id_sql(scope.roots.get(t).and_then(|r| r.volume.as_ref()).map(|v| v.id.as_str()), has_inode),
+        copy_id = crate::db::counted_copy_id(conn, t, copy_id_sql(scope.roots.get(t).and_then(|r| r.volume.as_ref()).map(|v| v.id.as_str()), has_inode))?,
     ))
 }
 

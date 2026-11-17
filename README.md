@@ -542,11 +542,12 @@ dedupe: shared blocks for 2 files, freeing 200.0 MB
 - **Where it works:** Linux, on XFS with reflink (`xfs_info` shows `reflink=1`, the default
   for recent `mkfs.xfs`) or Btrfs — and run **on the server itself**: block sharing doesn't
   work over SMB or NFS. On other filesystems each file is reported as not supported.
-- **Already shared copies are skipped** (their blocks are compared via `FIEMAP`), so running
-  it again is quick.
+- **Already shared copies are skipped** (their blocks are compared via `FIEMAP`) — copies
+  shared by another tool, say.
+- Copies it shares then **count as the kept copy**, as hard links do: reports stop counting
+  them as wasted space and mark them `(shares blocks)`, and dedupe leaves them alone. Changing
+  a copy (a new checksum when it's next indexed) makes it a copy of its own again.
 - Copies on another volume can't share blocks, so they're quarantined, as without `--action`.
-- Reports still list shared copies as duplicates — the paths are still copies, but no longer
-  take space of their own.
 
 `--action hardlink` replaces each copy on the kept copy's volume with a hard link to it.
 Each is first compared byte for byte (both files are read in full), and the swap is atomic —
@@ -621,7 +622,8 @@ $ diskunder run nas-nightly
 - **Database menu**, for the open database: Info, Check, Vacuum…, Drop path… (warns if a job
   uses the index), Open… (another database), Backup… (a consistent copy — see `db backup`),
   and Quarantine — the batches, with the selected one's files: `r` restores a batch, `p`
-  purges it (deletes its files for good, however recent), each after a `y`.
+  purges it (deletes its files for good), each after a `y`. As with `quarantine purge`, a
+  batch is kept `deletion.purge_after_days` first (7 days; 0 purges straight away).
 - **Host menu**: Drives & mounts — local drives and network mounts in two sections, with
   filesystem, size, used, free, the jobs on each, and source. `⏎` browses down into a mount's
   folders (`⌫` / `←` back up) and `space` starts a new job for the selected mount or folder;
@@ -651,7 +653,7 @@ diskunder settings unset defaults.threads
 | `start.db`, `start.select_last_job` | the database the app opens (unless `--db` is given), and whether it selects the last-run job |
 | `defaults.mode`, `.threads`, `.include_ext`, `.exclude_ext`, `.exclude_paths` | what the app's New job form starts with |
 | `types.NAME` | file-type groups — `@NAME` in any type filter, on the command line or in the app |
-| `deletion.confirm_quarantine`, `.purge_after_days` | whether `quarantine add` asks first (default yes), and how long `quarantine purge` waits (default 7 days) |
+| `deletion.confirm_quarantine`, `.purge_after_days` | whether `quarantine add` asks first (default yes), and how long purging waits, on the command line and in the app (default 7 days; 0: no wait) |
 | `deletion.dry_run_default` | `dedupe` only previews unless `--apply` (default yes) |
 | `log.folder`, `log.rotate_mb` | where run logs go (blank: next to each database) and when they rotate |
 

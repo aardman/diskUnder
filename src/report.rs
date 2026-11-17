@@ -671,20 +671,25 @@ pub(crate) struct GroupInfo {
 type MemberRow = (String, String, Option<i64>, Option<i64>, String);
 
 /// Marks paths in a group that are an earlier copy's file: a hard link (same device and inode),
-/// or the same file reached through another mount (same volume and inode)
+/// the same file reached through another mount (same volume and inode), or a copy sharing its
+/// blocks (dedupe --action share: counted as the kept copy, with an inode of its own)
 #[derive(Default)]
 struct SameFile {
-    ids: HashSet<String>,
+    ids: HashMap<String, Option<i64>>, // copy id → the first one's inode
     inodes: HashSet<(i64, i64)>,
 }
 
 impl SameFile {
     fn note(&mut self, device: Option<i64>, inode: Option<i64>, copy_id: &str) -> &'static str {
         let same_inode = matches!((device, inode), (Some(d), Some(i)) if !self.inodes.insert((d, i)));
-        match (self.ids.insert(copy_id.to_string()), same_inode) {
-            (true, _) => "",
-            (false, true) => "  (hard link)",
-            (false, false) => "  (same file, another mount)",
+        match (self.ids.get(copy_id), same_inode) {
+            (None, _) => {
+                self.ids.insert(copy_id.to_string(), inode);
+                ""
+            }
+            (Some(_), true) => "  (hard link)",
+            (Some(first), false) if *first == inode => "  (same file, another mount)",
+            (Some(_), false) => "  (shares blocks)",
         }
     }
 }

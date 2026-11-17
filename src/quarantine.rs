@@ -391,6 +391,34 @@ pub(crate) fn relinked(conn: &Connection, copy: &Planned, keep: &Planned) -> rus
     Ok(())
 }
 
+/// Record that `copy` now shares `keep`'s blocks, so duplicate counts treat it as `keep`
+pub(crate) fn shared(conn: &Connection, copy: &Planned, keep: &Planned) -> rusqlite::Result<()> {
+    let Some(checksum) = &copy.checksum else { return Ok(()) };
+    let (Some(c), Some(k)) = (copy_id_of(conn, &copy.table, &copy.original)?, copy_id_of(conn, &keep.table, &keep.original)?) else {
+        return Ok(());
+    };
+    conn.execute(crate::db::SHARED_SCHEMA, [])?;
+    // The kept copy may share another's blocks itself: point at that one, as must copies
+    // already pointing at this one
+    let keeper: String = conn
+        .query_row("SELECT keeper FROM shared_blocks WHERE copy_id = ?1 AND checksum = ?2", [&k, checksum], |r| r.get(0))
+        .optional()?
+        .unwrap_or(k);
+    if keeper == c {
+        return Ok(());
+    }
+    conn.execute("UPDATE shared_blocks SET keeper = ?1 WHERE keeper = ?2 AND checksum = ?3", [&keeper, &c, checksum])?;
+    conn.execute("INSERT OR REPLACE INTO shared_blocks (copy_id, checksum, keeper) VALUES (?1, ?2, ?3)", [&c, checksum, &keeper])?;
+    Ok(())
+}
+
+/// A file's copy id, from its row
+fn copy_id_of(conn: &Connection, table: &str, path: &Path) -> rusqlite::Result<Option<String>> {
+    let volume = load_roots(conn)?.get(table).and_then(|r| r.volume.as_ref()).map(|v| v.id.clone());
+    let expr = crate::query::copy_id_expr("", volume.as_deref(), has_column(conn, table, "inode")?);
+    conn.query_row(&format!("SELECT {expr} FROM {table} WHERE path = ?1"), [path.display().to_string()], |r| r.get(0)).optional()
+}
+
 pub(crate) fn plural(n: usize, word: &str) -> String {
     let ending = if n == 1 { "" } else if word.ends_with("ch") { "es" } else { "s" };
     format!("{} {}{}", fmt_count(n as i64), word, ending)
@@ -706,13 +734,15 @@ fn purge(
     Ok(())
 }
 
-/// Permanently delete every file still quarantined in a batch, however recently — for the app,
-/// which has asked first. A summary, and the files that couldn't be deleted.
-pub(crate) fn purge_batch(db_path: &str, batch: &str, runlog: &mut RunLog) -> Result<(String, Vec<String>), String> {
+/// Permanently delete every file still quarantined in a batch, once it has been for
+/// `wait_days` — for the app, which has asked first. A summary, and the files that couldn't be
+/// deleted.
+pub(crate) fn purge_batch(db_path: &str, batch: &str, wait_days: u64, runlog: &mut RunLog) -> Result<(String, Vec<String>), String> {
     let conn = open(db_path, true)?;
-    let files = held(&conn, "q.batch = ?1", &[&batch])?;
+    let cutoff = crate::report::parse_age_arg(&format!("{}d", wait_days))?.cutoff;
+    let files = held(&conn, "q.batch = ?1 AND b.created <= ?2", &[&batch, &cutoff])?;
     if files.is_empty() {
-        return Err(format!("nothing in batch {} to purge", batch));
+        return Err(format!("nothing in batch {} quarantined longer than {}", batch, plural(wait_days as usize, "day")));
     }
     purge_files(&conn, db_path, &files, runlog)
 }
