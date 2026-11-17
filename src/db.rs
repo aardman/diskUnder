@@ -444,12 +444,25 @@ pub(crate) fn delete_paths(conn: &mut Connection, t: &str, paths: &[String]) -> 
 }
 
 pub(crate) fn create_indexes(conn: &Connection, t: &str) -> DbResult<()> {
-    for col in &["size", "filename", "checksum", "extension", "directory", "access_date", "modified_date"] {
+    for col in &["size", "filename", "checksum", "extension", "access_date", "modified_date"] {
         conn.execute(
             &format!("CREATE INDEX IF NOT EXISTS idx_{t}_{c} ON {t}({c})", t = t, c = col),
             [],
         )?;
     }
+    newer_indexes(conn, t)
+}
+
+/// Indexes added in 6.3.1, which every run makes for any path without them (a second or so per
+/// million files, once):
+/// - the sizes of files not yet read, which each run looks up in every path: only those rows,
+///   so a lookup doesn't wade through every hashed file of that size;
+/// - folders with their files' sizes, replacing folders alone: space by folder is read from
+///   the index, without visiting a row.
+pub(crate) fn newer_indexes(conn: &Connection, t: &str) -> DbResult<()> {
+    conn.execute(&format!("CREATE INDEX IF NOT EXISTS idx_{t}_unread ON {t}(size) WHERE checksum IS NULL"), [])?;
+    conn.execute(&format!("CREATE INDEX IF NOT EXISTS idx_{t}_directory_size ON {t}(directory, size)"), [])?;
+    conn.execute(&format!("DROP INDEX IF EXISTS idx_{t}_directory"), [])?;
     Ok(())
 }
 
@@ -513,6 +526,7 @@ pub(crate) fn file_tables(conn: &Connection) -> DbResult<Vec<String>> {
     names
 }
 
+#[derive(Clone)]
 pub(crate) struct RootRow {
     pub(crate) root: String,
     pub(crate) first_run: String,
@@ -521,6 +535,14 @@ pub(crate) struct RootRow {
     pub(crate) last_mode: String,
     pub(crate) filter: IndexFilter,
     pub(crate) volume: Option<Volume>, // None until a v5.6 run records it
+    pub(crate) same_as: Option<String>, // the volume `db same-volume` says this one is part of
+}
+
+impl RootRow {
+    /// The volume identity copies are told apart by: the one `db same-volume` recorded, else its own
+    pub(crate) fn copy_volume(&self) -> Option<&str> {
+        self.same_as.as_deref().or(self.volume.as_ref().map(|v| v.id.as_str()))
+    }
 }
 
 /// table name → its roots row (empty if the roots table doesn't exist yet)
@@ -528,10 +550,14 @@ pub(crate) fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>
     if !table_exists(conn, "roots")? {
         return Ok(HashMap::new());
     }
+    let has_volume = has_column(conn, "roots", "volume")?;
+    let same = has_volume && table_exists(conn, "same_volume")?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT table_name, root, first_run, last_started, last_finished, last_mode, {}, {} FROM roots",
+        "SELECT table_name, root, first_run, last_started, last_finished, last_mode, {}, {}, {} FROM roots{}",
         filter_columns(conn)?,
-        if has_column(conn, "roots", "volume")? { "volume, volume_path" } else { "NULL, NULL" }
+        if has_volume { "roots.volume, volume_path" } else { "NULL, NULL" },
+        if same { "s.same_as" } else { "NULL" },
+        if same { " LEFT JOIN same_volume s ON s.volume = roots.volume" } else { "" }
     ))?;
     let rows = stmt
         .query_map([], |row| {
@@ -548,6 +574,7 @@ pub(crate) fn load_roots(conn: &Connection) -> DbResult<HashMap<String, RootRow>
                         (Some(id), Some(path)) => Some(Volume { id, path }),
                         _ => None,
                     },
+                    same_as: row.get(12)?,
                 },
             ))
         })?
@@ -706,7 +733,7 @@ fn copy_rows_sql(conn: &Connection, filter: &str) -> DbResult<String> {
     let roots = load_roots(conn)?;
     let mut parts = Vec::new();
     for t in file_tables(conn)? {
-        let volume = roots.get(&t).and_then(|r| r.volume.as_ref()).map(|v| v.id.clone());
+        let volume = roots.get(&t).and_then(|r| r.copy_volume()).map(str::to_string);
         let cid = counted_copy_id(conn, &t, crate::query::copy_id_expr("", volume.as_deref(), has_column(conn, &t, "inode")?))?;
         parts.push(format!("SELECT checksum, size, path, {cid} AS copy_id FROM {t} WHERE {filter}"));
     }
@@ -760,4 +787,79 @@ pub(crate) fn table_checksums(conn: &Connection, t: &str) -> DbResult<Vec<String
     let mut stmt = conn.prepare(&format!("SELECT DISTINCT checksum FROM {t} WHERE checksum IS NOT NULL AND checksum != ''"))?;
     let rows = stmt.query_map([], |r| r.get(0))?.collect();
     rows
+}
+
+// ─── One volume through two shares ──────────────────────────────────────────
+
+/// Volumes that are part of another: a share mounted on its own that is also a folder inside
+/// a share already indexed (`smb://nas/projects` inside `smb://nas/all`). Inode numbers belong
+/// to the server's filesystem, so with the same volume identity its files count once.
+const SAME_VOLUME_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS same_volume (
+    volume  TEXT PRIMARY KEY,
+    same_as TEXT NOT NULL
+)";
+
+/// Count `volume` as part of `same_as` (or, with None, as itself again)
+pub(crate) fn set_same_volume(conn: &Connection, volume: &str, same_as: Option<&str>) -> DbResult<()> {
+    conn.execute(SAME_VOLUME_SCHEMA, [])?;
+    match same_as {
+        Some(v) => {
+            // Volumes already counted as this one follow it
+            conn.execute("UPDATE same_volume SET same_as = ?1 WHERE same_as = ?2", params![v, volume])?;
+            conn.execute("INSERT OR REPLACE INTO same_volume (volume, same_as) VALUES (?1, ?2)", params![volume, v])?;
+        }
+        None => {
+            conn.execute("DELETE FROM same_volume WHERE volume = ?1", params![volume])?;
+        }
+    }
+    Ok(())
+}
+
+/// Pairs of indexed paths (path, the path it seems to be part of) on different volume
+/// identities whose files look like the same files: of a sample of one path's files, nearly
+/// all are in the other with the same name, size, modified time and inode
+pub(crate) fn same_volume_suggestions(conn: &Connection) -> DbResult<Vec<(String, String)>> {
+    const SAMPLE: i64 = 200;
+    let roots = load_roots(conn)?;
+    let mut paths: Vec<(&String, &RootRow)> = Vec::new();
+    for (t, r) in &roots {
+        if r.copy_volume().is_some() && table_exists(conn, t)? && has_column(conn, t, "inode")? {
+            paths.push((t, r));
+        }
+    }
+    paths.sort_by(|a, b| a.1.root.cmp(&b.1.root));
+    let mut found = Vec::new();
+    for (a, ra) in &paths {
+        // Spread through the table: rows by id, a stride apart
+        let last: i64 = conn.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {a}"), [], |r| r.get(0))?;
+        let ids: Vec<String> = (0..SAMPLE).map(|i| (1 + i * last.max(1) / SAMPLE).to_string()).collect();
+        let sample: Vec<(String, i64, Option<String>, i64)> = conn
+            .prepare(&format!(
+                "SELECT filename, size, modified_date, inode FROM {a} WHERE id IN ({}) AND inode IS NOT NULL AND size > 0",
+                ids.join(", ")
+            ))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<DbResult<_>>()?;
+        if sample.len() < 20 {
+            continue;
+        }
+        for (b, rb) in &paths {
+            if a == b || ra.copy_volume() == rb.copy_volume() {
+                continue;
+            }
+            let mut stmt = conn.prepare(&format!(
+                "SELECT EXISTS (SELECT 1 FROM {b} WHERE size = ?1 AND inode = ?2 AND filename = ?3 AND modified_date IS ?4)"
+            ))?;
+            let mut matched = 0;
+            for (name, size, modified, inode) in &sample {
+                if stmt.query_row(params![size, inode, name, modified], |r| r.get::<_, bool>(0))? {
+                    matched += 1;
+                }
+            }
+            if matched * 10 >= sample.len() * 9 {
+                found.push((ra.root.clone(), rb.root.clone()));
+            }
+        }
+    }
+    Ok(found)
 }

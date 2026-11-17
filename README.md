@@ -430,6 +430,19 @@ Limits: storage shared over both SMB and NFS has two different identities, and t
 check across mounts relies on the server giving stable inode numbers (NFS does; most SMB
 servers do). Paths indexed before 5.6 get their volume on their next run.
 
+**One volume through two shares.** A share that is also a folder of another share
+(`smb://nas01/reader/Reader_Software` mounted on its own as `smb://nas01/Reader_Software`) has
+an identity of its own, so with both indexed every file in it would count as a duplicate of
+itself. `db check` spots these — nearly all of a sample of one path's files are in the other,
+with the same name, size, modified time and inode — and gives the command to link them:
+
+```bash
+diskunder db same-volume /Volumes/Reader_Software /Volumes/reader --db /data/index.db
+diskunder db same-volume /Volumes/Reader_Software --undo --db /data/index.db   # its own again
+```
+
+Either recounts the duplicate summary (a few minutes on a very big database).
+
 ---
 
 ## Quarantine
@@ -731,8 +744,9 @@ A cron line:
 | `diskunder db drop <PATH>` | Removes the index for a path — e.g. a share you no longer track. Works even if the path no longer exists. Asks for confirmation; pass `--yes` in scripts |
 | `diskunder db drop --table <NAME>` | Removes a table by name — for tables `db info` lists with no recorded path |
 | `diskunder db vacuum` | Compacts the file. SQLite reuses space freed by `update` and `drop` but doesn't shrink the file until vacuumed |
-| `diskunder db check` | Runs SQLite's integrity check (exit code 2 if it finds problems) and lists tables with no recorded path |
+| `diskunder db check` | Runs SQLite's integrity check (exit code 2 if it finds problems), lists tables with no recorded path, and paths that look like one volume through two shares |
 | `diskunder db backup FILE` | Copies the database to FILE — consistent and compacted, safe while it's in use; never overwrites |
+| `diskunder db same-volume PATH SAME_AS` | Counts PATH's volume as part of SAME_AS's — one share mounted inside another — so their files count once; `--undo` reverses it. `db check` suggests these (see [Duplicates across shares and servers](#duplicates-across-shares-and-servers)) |
 
 `db info` also shows each path's volume, and any other indexed path that overlaps it.
 
@@ -777,7 +791,7 @@ CREATE TABLE files_<MD5_HASH> (
 );
 ```
 
-Indexes are created on `size`, `filename`, `checksum`, `extension`, `directory`, `access_date`, and `modified_date`.
+Indexes are created on `size`, `filename`, `checksum`, `extension`, `access_date`, and `modified_date`; on `(directory, size)`, so space by folder is read from the index; and on the `size` of files not yet read (`WHERE checksum IS NULL`), which each run looks up.
 
 Since table names are a hash, a `roots` table (v4.1+) records which path each table belongs to
 and how its last run went. It is updated at the start and end of every run:
@@ -816,7 +830,7 @@ PRAGMA cache_size = 100000;
 
 ## Run log
 
-Every command that changes a database — `index`, `update`, `db drop`, `db vacuum` — is
+Every command that changes a database — `index`, `update`, `db drop`, `db vacuum`, `db same-volume` — is
 recorded in `<database>.log` next to it (`fileindex.db.log` by default): what was run, by whom,
 how it ended, a one-line summary, and any errors with running it. Per-file read errors are
 counted in the summary, not listed. Read-only commands (`search`, `export`, `db info`,

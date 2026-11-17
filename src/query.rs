@@ -184,6 +184,12 @@ pub(crate) fn resolve_scope(conn: &Connection, path: Option<&str>) -> Result<Sco
 }
 
 impl Scope {
+    /// The same scope, for one of its tables
+    pub(crate) fn only(&self, t: &str) -> Scope {
+        let roots = self.roots.get(t).map(|r| (t.to_string(), r.clone())).into_iter().collect();
+        Scope { tables: vec![t.to_string()], under: self.under.clone(), roots, everything: self.everything }
+    }
+
     /// Notes about how current the index is — for stderr, never mixed into the data
     pub(crate) fn freshness_notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
@@ -301,7 +307,7 @@ fn source_select(conn: &Connection, scope: &Scope, t: &str, lowercase_ext: bool)
          {copy_id} AS copy_id \
          FROM {t}",
         root = sql_literal(&scope.root_label(t)),
-        copy_id = crate::db::counted_copy_id(conn, t, copy_id_sql(scope.roots.get(t).and_then(|r| r.volume.as_ref()).map(|v| v.id.as_str()), has_inode))?,
+        copy_id = crate::db::counted_copy_id(conn, t, copy_id_sql(scope.roots.get(t).and_then(|r| r.copy_volume()), has_inode))?,
     ))
 }
 

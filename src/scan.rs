@@ -629,7 +629,8 @@ fn compare(conn: &mut Connection, table: &str, hash_all: bool, tx: &Sender<Worke
     let mut ids: HashMap<String, (String, String)> = HashMap::new(); // table → copy id as x. / t.
     let tables = file_tables(conn)?;
     for t in &tables {
-        let volume = roots.get(t).and_then(|r| r.volume.as_ref()).map(|v| v.id.clone());
+        crate::db::newer_indexes(conn, t)?;
+        let volume = roots.get(t).and_then(|r| r.copy_volume()).map(str::to_string);
         let inode = has_column(conn, t, "inode")?;
         ids.insert(t.clone(), (copy_id_expr("x.", volume.as_deref(), inode), copy_id_expr("t.", volume.as_deref(), inode)));
     }
@@ -654,16 +655,25 @@ fn compare(conn: &mut Connection, table: &str, hash_all: bool, tx: &Sender<Worke
     let mut targets: Vec<Target> = if hash_all {
         candidate_rows(conn, table, &format!("{} WHERE t.checksum IS NULL", selects[table]), false)?
     } else {
-        candidate_rows(conn, table, &format!("{} WHERE t.checksum IS NULL AND t.size > 0 AND ({})", selects[table], another(table, &tables, "1")), false)?
+        shared_sizes(conn, table, &tables)?;
+        // Driven by the shared sizes: walking this path's unread rows instead reads millions
+        let sql = format!(
+            "SELECT t.path, t.size, t.quick, {}, t.modified_date
+             FROM temp.shared_sizes m CROSS JOIN {table} t ON t.size = m.s
+             WHERE t.checksum IS NULL AND ({})",
+            inode_cols(table)?,
+            another(table, &tables, "1")
+        );
+        candidate_rows(conn, table, &sql, false)?
     };
     if !hash_all {
         // Unread files in other paths with the size of one of this path's files
-        // Driven by this path's sizes, each looked up in the other path's size index — not by
-        // the other path's unread rows, which can be millions
+        // Driven by the sizes this path shares, each looked up in the other path's size index —
+        // not by the other path's unread rows, which can be millions
         for o in tables.iter().filter(|o| *o != table) {
             let sql = format!(
                 "SELECT t.path, t.size, t.quick, {}, t.modified_date
-                 FROM (SELECT DISTINCT size AS s FROM {table} WHERE size > 0) m CROSS JOIN {o} t ON t.size = m.s
+                 FROM temp.shared_sizes m CROSS JOIN {o} t ON t.size = m.s
                  WHERE t.checksum IS NULL AND ({})",
                 inode_cols(o)?,
                 another(o, &me, "1")
@@ -757,6 +767,61 @@ fn write_hashes(conn: &mut Connection, column: &str, done: Vec<(String, String, 
 /// The rows `sql` selects (path, size, quick, device, inode, modified) from `table`. With
 /// `on_disk`, only files still there unchanged — rows of other paths may be stale, or on a
 /// share this machine can't reach.
+/// Fill `temp.shared_sizes` with this path's file sizes that another file has too: two of its
+/// own, or one in another path — before checking that they're other files, not hard links or
+/// the same file seen twice. Either each size is looked up in every path's size index (quick
+/// for a small path), or every size index is read once, front to back (quick for a big one: a
+/// 2.5-million-file path's lookups took most of a minute).
+fn shared_sizes(conn: &Connection, table: &str, tables: &[String]) -> rusqlite::Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS temp.shared_sizes; CREATE TEMP TABLE shared_sizes (s INTEGER PRIMARY KEY);")?;
+    let others: Vec<&String> = tables.iter().filter(|t| *t != table).collect();
+    let mine: Vec<i64> = conn
+        .prepare(&format!("SELECT DISTINCT size FROM {table} WHERE size > 0 ORDER BY size"))?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    // About how many rows the other paths have (ids only grow, so at least this many)
+    let mut rows = 0i64;
+    for o in &others {
+        rows += conn.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {o}"), [], |r| r.get::<_, i64>(0))?;
+    }
+    let own_twice = format!("(SELECT COUNT(*) FROM (SELECT 1 FROM {table} WHERE size = m.s LIMIT 2)) = 2");
+    // A lookup costs about as much as reading 5 index entries in order
+    if (mine.len() * others.len()) as i64 * 5 < rows {
+        let elsewhere: Vec<String> = others.iter().map(|o| format!("EXISTS (SELECT 1 FROM {o} WHERE size = m.s)")).collect();
+        let sql = format!(
+            "INSERT INTO temp.shared_sizes SELECT s FROM (SELECT DISTINCT size AS s FROM {table} WHERE size > 0) m WHERE {}",
+            elsewhere.into_iter().chain([own_twice]).collect::<Vec<_>>().join(" OR ")
+        );
+        conn.execute(&sql, [])?;
+        return Ok(());
+    }
+    let mut shared = vec![false; mine.len()];
+    for o in &others {
+        let mut stmt = conn.prepare(&format!("SELECT DISTINCT size FROM {o} WHERE size > 0"))?;
+        let mut found = stmt.query([])?;
+        while let Some(r) = found.next()? {
+            if let Ok(i) = mine.binary_search(&r.get(0)?) {
+                shared[i] = true;
+            }
+        }
+    }
+    let mut stmt = conn.prepare(&format!("SELECT size FROM {table} WHERE size > 0 GROUP BY size HAVING COUNT(*) > 1"))?;
+    let mut found = stmt.query([])?;
+    while let Some(r) = found.next()? {
+        if let Ok(i) = mine.binary_search(&r.get(0)?) {
+            shared[i] = true;
+        }
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut insert = tx.prepare("INSERT INTO temp.shared_sizes (s) VALUES (?1)")?;
+        for (size, _) in mine.iter().zip(&shared).filter(|(_, s)| **s) {
+            insert.execute([size])?;
+        }
+    }
+    tx.commit()
+}
+
 fn candidate_rows(conn: &Connection, table: &str, sql: &str, on_disk: bool) -> rusqlite::Result<Vec<Target>> {
     let mut stmt = conn.prepare(sql)?;
     let rows: Vec<(Target, String)> = stmt

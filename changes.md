@@ -1,5 +1,27 @@
 # diskUnder — Change Log
 
+## v6.4.0 — faster at scale, one volume through two shares
+
+Measured on a synthetic index of 14.5 million rows in 9 paths (12 GB):
+
+| | 6.3 | 6.4 |
+|---|---|---|
+| a run of a 2.5-million-file path (nothing new to read) | 48 s | 3 s |
+| `report --by-directory` over every path | 30 s | 0.9–2.3 s |
+
+- **Comparing:** a run first finds which of its file sizes any other file has — looking each
+  up for a small path, reading every path's size index once in order for a big one — and
+  checks only those files. A new index of the sizes of files not yet read means a lookup no
+  longer wades through every hashed file of that size.
+- **Space by folder** is grouped one path at a time from a new (folder, size) index, which
+  replaces the folder index — never sorting every path's files together.
+- The first run after upgrading builds both indexes for every path in the database: a second
+  or so per million files, once (25 s on the test index).
+- **One volume through two shares:** `db check` lists paths that look like one volume reached
+  through two shares — a share that is also a folder of another, mounted on its own — whose
+  files would otherwise count as duplicates of themselves. `db same-volume PATH SAME_AS` links
+  them (`--undo` reverses it) and recounts the duplicate summary.
+
 ## v6.3.1 — fixes
 
 - **Copies sharing blocks aren't wasted space:** copies `dedupe --action share` shares now

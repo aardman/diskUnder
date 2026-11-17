@@ -348,7 +348,38 @@ fn update_on_fresh_database_creates_indexes() {
         &db,
         &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_{}_%'", t),
     );
-    assert_eq!(indexes, 8, "path index plus the seven secondary indexes");
+    assert_eq!(indexes, 9, "path index, the seven secondary indexes, and unread sizes");
+}
+
+#[test]
+fn one_volume_through_two_shares() {
+    let tmp = TempDir::new();
+    let all = tmp.path().join("all");
+    distinct_files(&all.join("sub"), 30);
+    for i in 0..30 {
+        write(&all.join(format!("other/g{i}")), &format!("other {i}\n"));
+    }
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "all", "--db", db_s]);
+    run_in(tmp.path(), &["index", "all/sub", "--db", db_s]);
+    // As if all/sub were mounted on its own: a share of its own, not the folder of `all`
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("UPDATE roots SET volume = 'smb://nas/all', volume_path = '/' WHERE root = ?1", [all.to_string_lossy()]).unwrap();
+    conn.execute("UPDATE roots SET volume = 'smb://nas/sub', volume_path = '/' WHERE root = ?1", [all.join("sub").to_string_lossy()]).unwrap();
+
+    let sub = all.join("sub").to_string_lossy().into_owned();
+    let check = ok(query(tmp.path(), &["db", "check", "--db", db_s]));
+    assert!(check.stdout.contains(&format!("{} is part of {}: diskunder db same-volume", sub, all.display())), "{}", check.stdout);
+    assert_eq!(check.stdout.matches(" is part of ").count(), 1, "not the other way round: {}", check.stdout);
+
+    // Counted as two volumes, every file in sub is a copy of itself
+    let undo = ok(query(tmp.path(), &["db", "same-volume", "all/sub", "--undo", "--db", db_s]));
+    assert!(undo.stdout.contains("duplicates recounted: 30 groups"), "{}", undo.stdout);
+    let linked = ok(query(tmp.path(), &["db", "same-volume", "all/sub", "all", "--db", db_s]));
+    assert!(linked.stdout.contains("now counts as part of smb://nas/all") && linked.stdout.contains("recounted: 0 groups"), "{}", linked.stdout);
+    assert!(!ok(query(tmp.path(), &["db", "check", "--db", db_s])).stdout.contains("is part of"));
+    assert!(ok(query(tmp.path(), &["report", "--duplicates", "--db", db_s])).stdout.contains("(none)"));
 }
 
 // ─── Path normalisation and migration ────────────────────────────────────────

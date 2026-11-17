@@ -369,6 +369,18 @@ pub(crate) enum DbAction {
         /// Where to write the copy (must not exist)
         dest: String,
     },
+    /// Count an indexed path's volume as part of another's — a share mounted on its own that is
+    /// also a folder of another indexed share — so the same files count once (`db check` suggests these)
+    SameVolume {
+        /// Indexed path on the share that is part of another
+        path: String,
+        /// Indexed path on the share it is part of
+        #[arg(required_unless_present = "undo")]
+        same_as: Option<String>,
+        /// Count PATH's volume as its own again
+        #[arg(long, conflicts_with = "same_as")]
+        undo: bool,
+    },
 }
 
 /// Filters for `index` and `update`. Type options replace the stored type filters and path

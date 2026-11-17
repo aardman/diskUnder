@@ -23,9 +23,9 @@ the same mount at once). Comparing several databases at query time (SQLite `ATTA
   `--hash-all` keeps the old behaviour. Linux opens files with `O_NOATIME` where allowed.
 - **5.7 (done) — big databases:** measured on a synthetic 50-million-row index, then fixed: a
   duplicate summary table kept current by each run, capped search counts with a plan chosen
-  by how many files match, and a fast `db info` (numbers in changes.md). Still to watch: a
-  run checks its own unread files against every path (about a minute per 2.5 million files),
-  and `report --by-directory` over every path takes about a minute at that size.
+  by how many files match, and a fast `db info` (numbers in changes.md). 6.4 made the last
+  two slow spots fast: a run checking its unread files against every path (48 s → 3 s for 2.5
+  million files) and `report --by-directory` over every path (30 s → about 2 s).
 - **v6 — done: quarantine (6.0), dedupe (6.1), sharing blocks (6.2), the app (6.3):** see [Safe deletion](#safe-deletion). Volume identity decides what's possible. Copies on the
   same filesystem can share blocks (Linux `FIDEDUPERANGE` on XFS / Btrfs, run on the server:
   the kernel checks the bytes match before sharing them, so a changed file is never touched)

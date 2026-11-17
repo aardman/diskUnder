@@ -414,7 +414,7 @@ pub(crate) fn shared(conn: &Connection, copy: &Planned, keep: &Planned) -> rusql
 
 /// A file's copy id, from its row
 fn copy_id_of(conn: &Connection, table: &str, path: &Path) -> rusqlite::Result<Option<String>> {
-    let volume = load_roots(conn)?.get(table).and_then(|r| r.volume.as_ref()).map(|v| v.id.clone());
+    let volume = load_roots(conn)?.get(table).and_then(|r| r.copy_volume()).map(str::to_string);
     let expr = crate::query::copy_id_expr("", volume.as_deref(), has_column(conn, table, "inode")?);
     conn.query_row(&format!("SELECT {expr} FROM {table} WHERE path = ?1"), [path.display().to_string()], |r| r.get(0)).optional()
 }

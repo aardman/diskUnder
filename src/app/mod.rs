@@ -39,6 +39,7 @@ use crate::run::{finish_run, start_run, Started};
 use crate::runlog::RunLog;
 use form::{Form, FormKey};
 use quarantine_view::{QuarantineOutcome, QuarantineView};
+pub(crate) use results::quote;
 use results::{Browse, Dups, Outcome, Search, Target};
 use settings_view::{SettingsOutcome, SettingsView};
 
@@ -362,15 +363,7 @@ impl App {
                 !self.jobs.iter().any(|s| s.job.db == self.db && Some(s.job.path.as_str()) == root)
             })
             .map(|t| {
-                let root = roots.get(&t).map(|r| RootRow {
-                    root: r.root.clone(),
-                    first_run: r.first_run.clone(),
-                    last_started: r.last_started.clone(),
-                    last_finished: r.last_finished.clone(),
-                    last_mode: r.last_mode.clone(),
-                    filter: r.filter.clone(),
-                    volume: r.volume.clone(),
-                });
+                let root = roots.get(&t).cloned();
                 PathEntry { table: t, root, details: None }
             })
             .collect()

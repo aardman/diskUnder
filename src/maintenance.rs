@@ -328,7 +328,50 @@ fn db_check(conn: &Connection, out: &mut Out) -> DbResult<bool> {
             w!(out, "  {} ({})", roots[t].root, t);
         }
     }
+    let same = crate::db::same_volume_suggestions(conn)?;
+    if !same.is_empty() {
+        w!(out, "paths that look like one volume through two shares — their files are counted twice:");
+        for (a, b) in &same {
+            w!(out, "  {} is part of {}: diskunder db same-volume {} {}", a, b, crate::app::quote(a), crate::app::quote(b));
+        }
+    }
     Ok(problems.is_empty())
+}
+
+/// The indexed path given, by its roots row: (table, row)
+fn indexed(roots: &std::collections::HashMap<String, crate::db::RootRow>, path: &str) -> Result<(String, crate::db::RootRow), String> {
+    let abs = crate::query::absolute(path);
+    roots
+        .iter()
+        .find(|(_, r)| r.root == abs)
+        .map(|(t, r)| (t.clone(), r.clone()))
+        .ok_or_else(|| format!("{} isn't an indexed path — see `diskunder db info`", abs))
+}
+
+/// `db same-volume`: record (or with None, forget) that `path`'s volume is part of `same_as`'s,
+/// then recount duplicates
+fn same_volume(conn: &Connection, path: &str, same_as: Option<&str>) -> Result<String, String> {
+    let db = |e: rusqlite::Error| e.to_string();
+    let roots = load_roots(conn).map_err(db)?;
+    let (_, r) = indexed(&roots, path)?;
+    let volume = r.volume.as_ref().map(|v| v.id.clone()).ok_or_else(|| format!("{} has no volume identity yet — run update on it first", r.root))?;
+    let msg = match same_as {
+        Some(other) => {
+            let (_, o) = indexed(&roots, other)?;
+            let target = o.copy_volume().map(str::to_string).ok_or_else(|| format!("{} has no volume identity yet — run update on it first", o.root))?;
+            if target == volume {
+                return Err(format!("{} and {} are already on one volume ({})", r.root, o.root, target));
+            }
+            crate::db::set_same_volume(conn, &volume, Some(&target)).map_err(db)?;
+            format!("{} ({}) now counts as part of {} — the same files count once", r.root, volume, target)
+        }
+        None => {
+            crate::db::set_same_volume(conn, &volume, None).map_err(db)?;
+            format!("{} counts as its own volume ({}) again", r.root, volume)
+        }
+    };
+    let groups = crate::db::rebuild_dup_groups(conn).map_err(db)?;
+    Ok(format!("{}; duplicates recounted: {} groups", msg, fmt_count(groups as i64)))
 }
 
 /// Runs a `db` action; returns the process exit code. Only `drop` and `vacuum` change the
@@ -363,6 +406,8 @@ pub(crate) fn run_db_command(db_path: &str, action: &DbAction, runlog: &mut RunL
             Err(e) => Err(e.to_string()),
         },
         DbAction::Backup { dest } => backup(db_path, dest).map(|summary| println!("{}", summary)),
+        DbAction::SameVolume { path, same_as, .. } => lock_db(db_path, "diskunder db same-volume")
+            .and_then(|_lock| logged(runlog, || same_volume(&conn, path, same_as.as_deref())).map(|summary| println!("{}", summary))),
     };
     out.flush();
     match result {

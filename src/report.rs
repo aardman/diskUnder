@@ -218,29 +218,31 @@ impl Report<'_> {
     }
 
     fn by_directory(&mut self, title: &str, filters: &FilterArgs, n: Option<usize>) -> Result<(), String> {
-        let p = build_parts(&self.conn, &self.scope, filters).map_err(Self::db)?;
-        let sql = format!(
-            "{} SELECT root, directory, COUNT(*), COALESCE(SUM(size), 0) FROM files{} GROUP BY root, directory",
-            p.with,
-            p.where_sql()
-        );
         let explicit_under = filters.under.as_deref().map(absolute);
         let mut folders: HashMap<String, (i64, i64)> = HashMap::new();
         let mut total = 0i64;
-        let mut stmt = self.conn.prepare(&sql).map_err(Self::db)?;
-        let mut rows = stmt.query(params_from_iter(p.params.iter())).map_err(Self::db)?;
-        while let Some(r) = rows.next().map_err(Self::db)? {
-            let root: String = r.get(0).map_err(Self::db)?;
-            let directory: String = r.get::<_, Option<String>>(1).map_err(Self::db)?.unwrap_or_default();
-            let (files, bytes): (i64, i64) = (r.get(2).map_err(Self::db)?, r.get(3).map_err(Self::db)?);
-            let base = explicit_under.clone().or_else(|| self.scope.under.clone()).unwrap_or(root);
-            let entry = folders.entry(Self::roll_up(&base, &directory, self.o.depth)).or_default();
-            entry.0 += files;
-            entry.1 += bytes;
-            total += bytes;
+        // One path at a time: each is grouped straight from its (directory, size) index, where
+        // grouping every path's files together sorted them all first (a minute at 15 million)
+        for t in &self.scope.tables {
+            let p = build_parts(&self.conn, &self.scope.only(t), filters).map_err(Self::db)?;
+            let sql = format!(
+                "{} SELECT root, directory, COUNT(*), COALESCE(SUM(size), 0) FROM files{} GROUP BY directory",
+                p.with,
+                p.where_sql()
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(Self::db)?;
+            let mut rows = stmt.query(params_from_iter(p.params.iter())).map_err(Self::db)?;
+            while let Some(r) = rows.next().map_err(Self::db)? {
+                let root: String = r.get(0).map_err(Self::db)?;
+                let directory: String = r.get::<_, Option<String>>(1).map_err(Self::db)?.unwrap_or_default();
+                let (files, bytes): (i64, i64) = (r.get(2).map_err(Self::db)?, r.get(3).map_err(Self::db)?);
+                let base = explicit_under.clone().or_else(|| self.scope.under.clone()).unwrap_or(root);
+                let entry = folders.entry(Self::roll_up(&base, &directory, self.o.depth)).or_default();
+                entry.0 += files;
+                entry.1 += bytes;
+                total += bytes;
+            }
         }
-        drop(rows);
-        drop(stmt);
 
         let mut sorted: Vec<(String, i64, i64)> = folders.into_iter().map(|(k, (f, b))| (k, f, b)).collect();
         sorted.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
