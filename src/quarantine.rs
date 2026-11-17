@@ -60,7 +60,7 @@ fn db_err(e: rusqlite::Error) -> String {
     e.to_string()
 }
 
-fn open(db_path: &str, write: bool) -> Result<Connection, String> {
+pub(crate) fn open(db_path: &str, write: bool) -> Result<Connection, String> {
     if !Path::new(db_path).exists() {
         return Err(format!("no database at {}", db_path));
     }
@@ -76,7 +76,7 @@ fn has_tables(conn: &Connection) -> Result<bool, String> {
     table_exists(conn, "quarantined").map_err(db_err)
 }
 
-fn ask(question: &str, yes: bool) -> Result<(), String> {
+pub(crate) fn ask(question: &str, yes: bool) -> Result<(), String> {
     if yes {
         return Ok(());
     }
@@ -92,7 +92,7 @@ fn ask(question: &str, yes: bool) -> Result<(), String> {
 
 /// A path as given, made absolute with its folders resolved but not the file itself — so a
 /// symlink is the link, not what it points to
-fn absolute_file(p: &str) -> Result<PathBuf, String> {
+pub(crate) fn absolute_file(p: &str) -> Result<PathBuf, String> {
     let path = Path::new(p);
     let name = path.file_name().ok_or_else(|| format!("not a file: {}", p))?;
     let parent = match path.parent() {
@@ -104,14 +104,15 @@ fn absolute_file(p: &str) -> Result<PathBuf, String> {
 }
 
 /// A file to quarantine, with its row from the index
-struct Planned {
+pub(crate) struct Planned {
     root: String,
     table: String,
-    original: PathBuf,
+    also: Vec<String>, // other tables holding it: indexed paths that overlap its own
+    pub(crate) original: PathBuf,
     stored: PathBuf,
     row: Vec<rusqlite::types::Value>, // ROW_COLUMNS, in order
-    size: u64,
-    checksum: Option<String>,
+    pub(crate) size: u64,
+    pub(crate) checksum: Option<String>,
 }
 
 /// The indexed path a file belongs to (the deepest one that contains it)
@@ -127,7 +128,7 @@ fn select_row(conn: &Connection, table: &str) -> Result<String, String> {
     Ok(format!("SELECT {} FROM {table} WHERE path = ?1", cols.join(", ")))
 }
 
-fn new_batch(conn: &Connection) -> Result<String, String> {
+pub(crate) fn new_batch(conn: &Connection) -> Result<String, String> {
     let base = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
     let mut name = base.clone();
     let mut n = 2;
@@ -158,7 +159,7 @@ fn read_paths(paths: &[String], stdin: bool, null: bool) -> Result<Vec<String>, 
 }
 
 /// Check each file against the index; the ones that can go, and why the others can't
-fn plan(conn: &Connection, batch: &str, given: &[String]) -> Result<(Vec<Planned>, Vec<String>), String> {
+pub(crate) fn plan(conn: &Connection, batch: &str, given: &[String]) -> Result<(Vec<Planned>, Vec<String>), String> {
     let roots: Vec<String> = load_roots(conn).map_err(db_err)?.into_values().map(|r| r.root).collect();
     let mut planned = Vec::new();
     let mut skipped = Vec::new();
@@ -219,7 +220,8 @@ fn plan(conn: &Connection, batch: &str, given: &[String]) -> Result<(Vec<Planned
         };
         let inside = file.strip_prefix(root).unwrap_or(&file);
         let stored = Path::new(root).join(FOLDER).join(batch).join(inside);
-        planned.push(Planned { root: root.clone(), table, original: file, stored, row, size, checksum });
+        let also = roots.iter().filter(|r| *r != root && file.starts_with(r.as_str())).map(|r| table_name_for(r)).collect();
+        planned.push(Planned { root: root.clone(), table, also, original: file, stored, row, size, checksum });
     }
     Ok((planned, skipped))
 }
@@ -277,54 +279,69 @@ fn add(
 
     let _lock = lock_db(db_path, &format!("diskunder quarantine add ({})", batch))?;
     let result = crate::maintenance::logged(runlog, || {
-        conn.execute(
-            "INSERT INTO quarantine_batches (batch, created, reason, command) VALUES (?1, datetime('now'), ?2, ?3)",
-            params![batch, reason, std::env::args().skip(1).collect::<Vec<_>>().join(" ")],
-        )
-        .map_err(db_err)?;
-        let mut moved = 0usize;
-        let mut moved_bytes = 0u64;
-        let mut failed = Vec::new();
-        let mut affected = Vec::new();
-        for (root, files) in &by_root {
-            // The manifest goes first, so even an interrupted batch can be put back by hand
-            let dir = Path::new(root).join(FOLDER).join(&batch);
-            write_manifest(&dir, &batch, db_path, files).map_err(|e| format!("can't write the manifest in {}: {}", dir.display(), e))?;
-            for p in files {
-                let moved_ok = p
-                    .stored
-                    .parent()
-                    .map_or(Ok(()), fs::create_dir_all)
-                    .and_then(|_| fs::rename(&p.original, &p.stored));
-                if let Err(e) = moved_ok {
-                    // Never copy-and-delete: a rename that fails (e.g. another filesystem
-                    // mounted inside the root) leaves the file where it is
-                    failed.push(format!("{} — {}", p.original.display(), e));
-                    continue;
-                }
-                record_quarantined(&conn, &batch, p).map_err(|e| {
-                    format!("{} was moved to {} but couldn't be recorded: {}", p.original.display(), p.stored.display(), e)
-                })?;
-                moved += 1;
-                moved_bytes += p.size;
-                affected.extend(p.checksum.clone());
-            }
-        }
-        refresh_dup_groups(&conn, &affected).map_err(db_err)?;
-        for f in &failed {
-            eprintln!("not moved: {}", f);
-        }
-        let mut msg = format!("quarantined {} ({}) as {}", plural(moved, "file"), fmt_bytes(moved_bytes), batch);
-        if !failed.is_empty() {
-            msg.push_str(&format!("; {} couldn't be moved", plural(failed.len(), "file")));
-        }
-        if !skipped.is_empty() {
-            msg.push_str(&format!("; {} skipped", plural(skipped.len(), "file")));
-        }
-        Ok(msg)
+        let done = move_planned(&conn, db_path, &batch, reason, &planned)?;
+        Ok(done.message(&batch, skipped.len()))
     })?;
     println!("{}", result);
     Ok(())
+}
+
+/// What `move_planned` did
+pub(crate) struct Moved {
+    pub(crate) files: usize,
+    pub(crate) bytes: u64,
+    pub(crate) failed: usize,
+}
+
+impl Moved {
+    pub(crate) fn message(&self, batch: &str, skipped: usize) -> String {
+        let mut msg = format!("quarantined {} ({}) as {}", plural(self.files, "file"), fmt_bytes(self.bytes), batch);
+        if self.failed > 0 {
+            msg.push_str(&format!("; {} couldn't be moved", plural(self.failed, "file")));
+        }
+        if skipped > 0 {
+            msg.push_str(&format!("; {} skipped", plural(skipped, "file")));
+        }
+        msg
+    }
+}
+
+/// Record the batch, then move each planned file into it — the caller holds the database lock
+pub(crate) fn move_planned(conn: &Connection, db_path: &str, batch: &str, reason: Option<&str>, planned: &[Planned]) -> Result<Moved, String> {
+    let mut by_root: BTreeMap<&str, Vec<&Planned>> = BTreeMap::new();
+    for p in planned {
+        by_root.entry(&p.root).or_default().push(p);
+    }
+    conn.execute(
+        "INSERT INTO quarantine_batches (batch, created, reason, command) VALUES (?1, datetime('now'), ?2, ?3)",
+        params![batch, reason, std::env::args().skip(1).collect::<Vec<_>>().join(" ")],
+    )
+    .map_err(db_err)?;
+    let mut done = Moved { files: 0, bytes: 0, failed: 0 };
+    let mut affected = Vec::new();
+    for (root, files) in &by_root {
+        // The manifest goes first, so even an interrupted batch can be put back by hand
+        let dir = Path::new(root).join(FOLDER).join(batch);
+        write_manifest(&dir, batch, db_path, files).map_err(|e| format!("can't write the manifest in {}: {}", dir.display(), e))?;
+        for p in files {
+            let moved_ok = p.stored.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::rename(&p.original, &p.stored));
+            if let Err(e) = moved_ok {
+                // Never copy-and-delete: a rename that fails (e.g. another filesystem
+                // mounted inside the root) leaves the file where it is
+                eprintln!("not moved: {} — {}", p.original.display(), e);
+                done.failed += 1;
+                continue;
+            }
+            record_quarantined(conn, batch, p).map_err(|e| {
+                format!("{} was moved to {} but couldn't be recorded: {}", p.original.display(), p.stored.display(), e)
+            })?;
+            done.files += 1;
+            done.bytes += p.size;
+            affected.extend(p.checksum.clone());
+        }
+    }
+    refresh_dup_groups(conn, &affected).map_err(db_err)?;
+    Ok(done)
 }
 
 /// Move the file's row from its table to `quarantined`
@@ -345,11 +362,15 @@ fn record_quarantined(conn: &Connection, batch: &str, p: &Planned) -> rusqlite::
         ),
         rusqlite::params_from_iter(values.iter()),
     )?;
-    tx.execute(&format!("DELETE FROM {} WHERE path = ?1", p.table), [p.original.display().to_string()])?;
+    for t in std::iter::once(&p.table).chain(&p.also) {
+        if table_exists(&tx, t)? {
+            tx.execute(&format!("DELETE FROM {t} WHERE path = ?1"), [p.original.display().to_string()])?;
+        }
+    }
     tx.commit()
 }
 
-fn plural(n: usize, word: &str) -> String {
+pub(crate) fn plural(n: usize, word: &str) -> String {
     format!("{} {}{}", fmt_count(n as i64), word, if n == 1 { "" } else { "s" })
 }
 

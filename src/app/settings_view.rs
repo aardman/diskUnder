@@ -17,7 +17,7 @@ pub(crate) const SECTIONS: [(&str, &str); 5] = [
     ("Start", "start."),
     ("Defaults for new jobs", "defaults."),
     ("File type groups — use @name in any type field", "types."),
-    ("Deletion — quarantine (dedupe arrives in 6.1)", "deletion."),
+    ("Deletion — quarantine and dedupe", "deletion."),
     ("Logging — takes effect next time diskunder starts", "log."),
 ];
 

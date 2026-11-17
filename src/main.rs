@@ -4,6 +4,7 @@
 mod app;
 mod cli;
 mod db;
+mod dedupe;
 mod dryrun;
 mod filters;
 mod fmt;
@@ -99,6 +100,31 @@ fn main() {
                 Some(SettingsAction::Unset { key }) => SettingsCommand::Unset { key },
             };
             run_settings_command(&store, cmd)
+        }
+        Command::Dedupe {
+            path, keep, keep_under, remove_under, ext, min_size, min_copies, min_wasted, action, limit, plan, from_plan, apply, dry_run, yes,
+        } => {
+            let o = dedupe::DedupeOptions {
+                path: path.as_deref(),
+                keep: *keep,
+                keep_under,
+                remove_under,
+                ext: ext.as_ref(),
+                min_size: *min_size,
+                min_copies: *min_copies,
+                min_wasted: *min_wasted,
+                action: *action,
+                limit: *limit,
+                plan: plan.as_deref(),
+                from_plan: from_plan.as_deref(),
+                apply: *apply,
+                dry_run: *dry_run,
+                yes: *yes,
+            };
+            let mut runlog = RunLog::new(&db, args.log.as_deref(), args.no_log);
+            let code = dedupe::run_dedupe(&db, &o, &settings, &mut runlog);
+            report_log_failure(&runlog);
+            code
         }
         Command::Quarantine { action } => {
             use quarantine::QuarantineCommand as Q;

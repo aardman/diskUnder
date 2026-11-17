@@ -64,7 +64,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 6.0.0`:
+**Check it worked** — this should print `diskunder 6.1.0`:
 
 ```bash
 diskunder --version
@@ -472,6 +472,55 @@ diskunder quarantine purge --dry-run --db /data/index.db
 
 ---
 
+## Dedupe
+
+Keep one copy of each duplicate and quarantine the rest. `dedupe` **previews by default** —
+from the index, without touching a file — and acts only with `--apply`.
+
+```bash
+diskunder dedupe /data/share --db /data/index.db                         # preview
+diskunder dedupe /data/share --remove-under /data/share/backup --db /data/index.db
+diskunder dedupe /data/share --min-size 500MB --plan plan.csv --db /data/index.db
+diskunder dedupe --from-plan plan.csv --apply --db /data/index.db       # act on the reviewed plan
+```
+
+```text
+render.mov — 1.6 GB × 3 copies
+  KEEP    2024-11-01 10:02  /data/share/projects/2024/final/render.mov
+  LINKED  2024-11-01 10:02  /data/share/projects/2024/latest/render.mov
+  REMOVE  2024-11-03 18:40  /data/share/backup/render.mov
+  REMOVE  2024-11-05 09:12  /data/share/temp/render.mov
+
+Would quarantine 2 files from 1 group, freeing 3.2 GB (preview — nothing was changed; add --apply to act)
+```
+
+- **Which copy stays:** `--keep oldest` (the default — earliest modified, usually the
+  original) `| newest | shortest-path | first-path`. `--keep-under PATH` prefers a copy there.
+- **Which copies go:** `--remove-under PATH` only removes copies under PATH (e.g. backup
+  folders), and `--ext iso,dmg` only those types; the copy kept is then one they leave alone
+  (`LEAVE` marks the others). `--min-size`, `--min-copies` and `--min-wasted` pick the groups,
+  as in `report --duplicates`.
+- **Only the path given:** with a path, only copies inside it count, stay or go. With none,
+  every indexed path in the database is one pool — copies on different shares or servers
+  included.
+- **Hard links:** names of one file are one copy. Another name for the kept file is `LINKED`
+  and never removed (it frees nothing); a copy with several names goes only with all of them.
+- **Checked before acting:** with `--apply`, the kept copy of each group must still be as
+  indexed (same size and modified time), or nothing in that group moves; each copy to remove
+  must be as indexed, hold the group's checksum, and not be the kept file under another name.
+  Anything that fails is skipped, with the reason.
+- **Plans:** `--plan FILE` (or `-` for stdout) writes every group as CSV — group, action
+  (KEEP, REMOVE, LINKED, LEAVE), path, size, checksum, modified, device, inode. Edit the
+  actions, then `--from-plan FILE` previews it, re-checking each file, and with `--apply`
+  acts on exactly that. A group with no `KEEP` row is skipped.
+- **Undo:** the removed copies are one quarantine batch, reason `dedupe`:
+  `quarantine restore BATCH` puts them back, and `quarantine purge` frees the space for good.
+- `--apply` asks first (`--yes` in scripts, or set `deletion.confirm_quarantine` to `no`). The
+  `deletion.dry_run_default` setting set to `no` makes `dedupe` act without `--apply` (still
+  asking); `--dry-run` then previews.
+
+---
+
 ## Interactive app
 
 Run `diskunder` with no command, in a terminal, to open the app — a front end to jobs and
@@ -483,7 +532,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Host  Settings  Help                 diskUnder v6.0.0 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v6.1.0 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -559,7 +608,7 @@ diskunder settings unset defaults.threads
 | `defaults.mode`, `.threads`, `.include_ext`, `.exclude_ext`, `.exclude_paths` | what the app's New job form starts with |
 | `types.NAME` | file-type groups — `@NAME` in any type filter, on the command line or in the app |
 | `deletion.confirm_quarantine`, `.purge_after_days` | whether `quarantine add` asks first (default yes), and how long `quarantine purge` waits (default 7 days) |
-| `deletion.dry_run_default` | dedupe (6.1) previews before it acts |
+| `deletion.dry_run_default` | `dedupe` only previews unless `--apply` (default yes) |
 | `log.folder`, `log.rotate_mb` | where run logs go (blank: next to each database) and when they rotate |
 
 **Type groups** come built in — `@images`, `@video`, `@audio`, `@documents`, `@archives`,
@@ -771,7 +820,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | `report` — overview, top files, by type, by folder, stale, duplicates | Scripts | Scripts | Scripts | Scripts | No | Yes (5.1) |
 | Duplicate filtering — `--min-size`, `--min-copies`, `--min-wasted`, `--ext`, `--under` | No | No | No | No | No | Yes (5.1) |
 | `export` — CSV / TSV / JSON for BI tools | No | No | No | No | No | Yes (5.0) |
-| Dry run — preview `index` / `update` without hashing or writing (dedupe previews come with v6) | No | No | No | No | No | Yes (5.2) |
+| Dry run — preview `index` / `update` without hashing or writing | No | No | No | No | No | Yes (5.2) |
 | Include / exclude file types — `--include-ext`, `--exclude-ext`, stored per path | No | No | No | No | No | Yes (5.2) |
 | Ignore — exclude paths by `.gitignore`-style pattern, with exceptions; excluded folders never entered | No | No | No | No | No | Yes (5.3) |
 | Jobs — named, saved runs: `jobs add/list/show/edit/remove`, `run NAME`, run history (menu in 5.5) | No | No | No | No | No | Yes (5.4) |
@@ -782,7 +831,8 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Test job — sample data to try the app on, created and removed from the Jobs menu | No | No | No | No | No | Yes (5.5.4) |
 | Duplicates across shares — volume identity, the same file via two mounts counted once, one run per database | No | No | No | No | No | Yes (5.6) |
 | Reads only possible copies — size first, then a quick hash, full hash last (`--hash-all` for every file) | No | No | No | No | No | Yes (5.7) |
-| Quarantine — move files aside reversibly, with `restore` and `purge`; dedupe builds on it (6.1) | No | No | No | No | No | Yes (6.0) |
+| Quarantine — move files aside reversibly, with `restore` and `purge` | No | No | No | No | No | Yes (6.0) |
+| Dedupe — keep one copy per group, quarantine the rest; previews, plans, re-checks | No | No | No | No | No | Yes (6.1) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
 ### Background
@@ -831,6 +881,7 @@ diskunder/
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   ├── host.rs        #   drives and mounts, host info
 │   ├── volume.rs      #   which volume a path is on
+│   ├── dedupe.rs      #   dedupe: plan, preview, re-check, quarantine
 │   ├── quarantine.rs  #   quarantine: add, list, show, restore, purge
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)

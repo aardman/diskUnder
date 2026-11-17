@@ -29,7 +29,7 @@ pub(crate) const SETTINGS: [(&str, &str, Kind, &str); 12] = [
     ("defaults.include_ext", "", Kind::Types, "include types for new jobs created in the app"),
     ("defaults.exclude_ext", "", Kind::Types, "exclude types for new jobs created in the app"),
     ("defaults.exclude_paths", "", Kind::Paths, "exclude paths for new jobs created in the app"),
-    ("deletion.dry_run_default", "yes", Kind::YesNo, "6.1: preview every dedupe before it acts"),
+    ("deletion.dry_run_default", "yes", Kind::YesNo, "dedupe only previews unless --apply"),
     ("deletion.confirm_quarantine", "yes", Kind::YesNo, "ask before moving files to quarantine"),
     ("deletion.purge_after_days", "7", Kind::Number, "how long quarantine purge waits, in days"),
     ("log.folder", "", Kind::Text, "folder for run logs (blank: next to each database)"),

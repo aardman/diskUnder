@@ -2741,3 +2741,187 @@ fn quarantine_settings_and_the_database_lock() {
     let r = jobs_cmd(&tmp, &["quarantine", "add", "share/a.txt", "--db", db_s]);
     assert!(r.code == 0 && r.stdout.contains("quarantined 1 file"), "{}", r.stderr);
 }
+
+// ─── Dedupe (v6.1) ───────────────────────────────────────────────────────────
+
+fn dd(tmp: &TempDir, db: &Path, args: &[&str]) -> Query {
+    query(tmp.path(), &[&["dedupe"][..], args, &["--db", db.to_str().unwrap()]].concat())
+}
+
+/// A share with one file in three places — the backup copy the oldest — and one unique file
+fn dedupe_share(tmp: &TempDir) -> (PathBuf, PathBuf) {
+    let share = tmp.path().join("share");
+    for p in ["projects/render.mov", "backup/render.mov", "temp/render.mov"] {
+        write(&share.join(p), "a render\n");
+    }
+    set_mtime(&share.join("backup/render.mov"), days_ago(400));
+    write(&share.join("notes.txt"), "only one\n");
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "share", "--db", db.to_str().unwrap()]);
+    (share, db)
+}
+
+/// Each path's role in a plan written to stdout: (action, path inside the share)
+fn plan_roles(share: &Path, csv: &str) -> Vec<(String, String)> {
+    let prefix = format!("{}/", share.display());
+    csv_rows(csv).into_iter().map(|r| (r[1].clone(), r[2].trim_start_matches(&prefix).to_string())).collect()
+}
+
+#[test]
+fn dedupe_previews_then_quarantines_all_but_one_copy() {
+    let tmp = TempDir::new();
+    let (share, db) = dedupe_share(&tmp);
+
+    let preview = ok(dd(&tmp, &db, &[]));
+    assert!(preview.stdout.contains("render.mov — 9 B × 3 copies"), "{}", preview.stdout);
+    assert!(preview.stdout.contains("Would quarantine 2 files from 1 group, freeing 18 B"), "{}", preview.stdout);
+    assert!(!qfolder(&share).exists(), "a preview moves nothing");
+    let roles = plan_roles(&share, &ok(dd(&tmp, &db, &["--plan", "-"])).stdout);
+    assert_eq!(roles[0], ("KEEP".to_string(), "backup/render.mov".to_string()), "the oldest stays: {:?}", roles);
+
+    let asked = dd(&tmp, &db, &["--apply"]);
+    assert!(asked.code == 1 && asked.stderr.contains("pass --yes") && !qfolder(&share).exists(), "{}", asked.stderr);
+
+    let done = ok(dd(&tmp, &db, &["--apply", "--yes"]));
+    assert!(done.stdout.contains("dedupe: quarantined 2 files (18 B)"), "{}", done.stdout);
+    assert!(share.join("backup/render.mov").exists() && !share.join("projects/render.mov").exists() && !share.join("temp/render.mov").exists());
+    assert!(share.join("notes.txt").exists());
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups       : 0"));
+    assert!(ok(dd(&tmp, &db, &[])).stderr.contains("no duplicates to remove"));
+    let list = ok(q(&tmp, &db, &["list"]));
+    assert!(list.stdout.contains("dedupe"), "the batch's reason: {}", list.stdout);
+    assert!(fs::read_to_string(tmp.path().join("t.db.log")).unwrap().contains("dedupe: quarantined 2 files"));
+
+    // Undone by restoring the batch
+    let batch = batches(&share).pop().unwrap();
+    assert!(done.stdout.contains(&format!("quarantine restore {}", batch)), "{}", done.stdout);
+    ok(q(&tmp, &db, &["restore", &batch]));
+    assert!(share.join("projects/render.mov").exists() && share.join("temp/render.mov").exists());
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups       : 1"));
+}
+
+#[test]
+fn dedupe_options_choose_what_stays_and_what_goes() {
+    let tmp = TempDir::new();
+    let (share, db) = dedupe_share(&tmp);
+    write(&share.join("projects/big.iso"), &"x".repeat(5000));
+    write(&share.join("temp/big.iso"), &"x".repeat(5000));
+    run_in(tmp.path(), &["update", "share", "--db", db.to_str().unwrap()]);
+    let roles = |args: &[&str]| plan_roles(&share, &ok(dd(&tmp, &db, &[args, &["--plan", "-"]].concat())).stdout);
+    let has = |r: &[(String, String)], action: &str, path: &str| r.contains(&(action.to_string(), path.to_string()));
+
+    let r = roles(&["--keep", "newest", "--keep-under", "share/projects"]);
+    assert!(has(&r, "KEEP", "projects/render.mov") && has(&r, "REMOVE", "backup/render.mov"), "{:?}", r);
+    let r = roles(&["--keep", "shortest-path"]);
+    assert!(has(&r, "KEEP", "temp/big.iso") && has(&r, "KEEP", "temp/render.mov"), "{:?}", r);
+    // Only copies under --remove-under go; the copy kept is one that would stay anyway
+    let r = roles(&["--remove-under", "share/temp"]);
+    assert!(has(&r, "KEEP", "backup/render.mov") && has(&r, "LEAVE", "projects/render.mov") && has(&r, "REMOVE", "temp/render.mov"), "{:?}", r);
+    assert!(has(&r, "REMOVE", "temp/big.iso"), "{:?}", r);
+    let r = roles(&["--ext", "iso"]);
+    assert!(r.iter().all(|(_, p)| p.ends_with(".iso")), "{:?}", r);
+    let r = roles(&["--min-size", "1K"]);
+    assert!(r.iter().all(|(_, p)| p.ends_with(".iso")), "{:?}", r);
+    // A folder: only its copies count
+    let r = roles(&["share/projects"]);
+    assert!(r.is_empty(), "one copy in projects, so nothing to do: {:?}", r);
+    let r = roles(&["share/backup", "--min-copies", "3"]);
+    assert!(r.is_empty(), "{:?}", r);
+}
+
+#[test]
+fn dedupe_keeps_hard_links_and_rechecks_before_acting() {
+    let tmp = TempDir::new();
+    let (share, db) = dedupe_share(&tmp);
+    fs::hard_link(share.join("backup/render.mov"), share.join("backup/render-link.mov")).unwrap();
+    run_in(tmp.path(), &["update", "share", "--db", db.to_str().unwrap()]);
+    let plan = ok(dd(&tmp, &db, &["--plan", "-"])).stdout;
+    let roles = plan_roles(&share, &plan);
+    assert_eq!(roles[0].0, "KEEP", "{:?}", roles);
+    assert_eq!(roles[1].0, "LINKED", "a link to the kept copy frees nothing, so it stays: {:?}", roles);
+    fs::write(tmp.path().join("plan.csv"), &plan).unwrap();
+
+    // Edited to remove the link anyway: refused, it's the kept file
+    fs::write(tmp.path().join("links.csv"), plan.replace(",LINKED,", ",REMOVE,")).unwrap();
+    let r = ok(dd(&tmp, &db, &["--from-plan", "links.csv"]));
+    assert!(r.stderr.contains(&format!("{} — the kept file itself", roles[1].1)), "{}", r.stderr);
+    assert!(r.stdout.contains("Would quarantine 2 files"), "{}", r.stdout);
+
+    // The kept copy changed since indexing: none of its group goes
+    rewrite(&share.join(&roles[0].1), b"a render, edited\n");
+    let r = dd(&tmp, &db, &["--from-plan", "plan.csv", "--apply", "--yes"]);
+    assert_eq!(r.code, 1, "{}", r.stdout);
+    assert!(r.stderr.contains("no kept copy is still as indexed"), "{}", r.stderr);
+    assert!(share.join("projects/render.mov").exists() && share.join("temp/render.mov").exists());
+    // Another copy, now the oldest, so there are two to remove again
+    write(&share.join("other/render.mov"), "a render\n");
+    set_mtime(&share.join("other/render.mov"), days_ago(10));
+    run_in(tmp.path(), &["update", "share", "--db", db.to_str().unwrap()]);
+
+    // A plan edited to remove every copy removes none; a changed copy is left alone
+    let plan = ok(dd(&tmp, &db, &["--plan", "-"])).stdout;
+    fs::write(tmp.path().join("all.csv"), plan.replace(",KEEP,", ",REMOVE,")).unwrap();
+    let r = dd(&tmp, &db, &["--from-plan", "all.csv", "--apply", "--yes"]);
+    assert!(r.code == 1 && r.stderr.contains("no kept copy"), "{}", r.stderr);
+    fs::write(tmp.path().join("plan.csv"), &plan).unwrap();
+    rewrite(&share.join("temp/render.mov"), b"a render\n");
+    let r = ok(dd(&tmp, &db, &["--from-plan", "plan.csv", "--apply", "--yes"]));
+    assert!(r.stderr.contains("temp/render.mov — changed since it was indexed"), "{}", r.stderr);
+    assert!(r.stdout.contains("quarantined 1 file") && share.join("temp/render.mov").exists() && !share.join("projects/render.mov").exists(), "{}", r.stdout);
+}
+
+#[test]
+fn dedupe_acts_on_an_edited_plan() {
+    let tmp = TempDir::new();
+    let (share, db) = dedupe_share(&tmp);
+    ok(dd(&tmp, &db, &["--plan", "plan.csv"]));
+    let plan = fs::read_to_string(tmp.path().join("plan.csv")).unwrap();
+    // Keep the projects copy instead, and leave temp alone
+    let edited: String = plan
+        .lines()
+        .map(|l| {
+            if l.contains("backup/render.mov") {
+                l.replacen(",KEEP,", ",REMOVE,", 1)
+            } else if l.contains("projects/render.mov") {
+                l.replacen(",REMOVE,", ",KEEP,", 1)
+            } else if l.contains("temp/render.mov") {
+                l.replacen(",REMOVE,", ",LEAVE,", 1)
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // …and a file that isn't a copy, slipped into the group
+    let checksum = &csv_rows(&plan)[0][4];
+    let edited = format!("{}\n1,REMOVE,{},9,{},,,\n", edited, share.join("notes.txt").display(), checksum);
+    fs::write(tmp.path().join("plan.csv"), edited).unwrap();
+
+    let preview = ok(dd(&tmp, &db, &["--from-plan", "plan.csv"]));
+    assert!(preview.stderr.contains("notes.txt — not a copy of its group's kept file"), "{}", preview.stderr);
+    assert!(preview.stdout.contains("backup/render.mov") && preview.stdout.contains("Would quarantine 1 file"), "{}", preview.stdout);
+    assert!(share.join("backup/render.mov").exists());
+    ok(dd(&tmp, &db, &["--from-plan", "plan.csv", "--apply", "--yes"]));
+    assert!(!share.join("backup/render.mov").exists() && share.join("projects/render.mov").exists() && share.join("temp/render.mov").exists() && share.join("notes.txt").exists());
+
+    fs::write(tmp.path().join("bad.csv"), "path,action\nx,KEEP\n").unwrap();
+    assert!(dd(&tmp, &db, &["--from-plan", "bad.csv"]).stderr.contains("no checksum column"));
+    let both = dd(&tmp, &db, &["--from-plan", "plan.csv", "--keep", "newest", "share"]);
+    assert_eq!(both.code, 2, "a plan is acted on as written: {}", both.stderr);
+}
+
+#[test]
+fn dedupe_dry_run_setting() {
+    let tmp = TempDir::new();
+    let (share, db) = dedupe_share(&tmp);
+    let db_s = db.to_str().unwrap();
+    ok(jobs_cmd(&tmp, &["settings", "set", "deletion.dry_run_default", "no"]));
+    let preview = jobs_cmd(&tmp, &["dedupe", "--dry-run", "--db", db_s]);
+    assert!(preview.code == 0 && preview.stdout.contains("Would quarantine") && !qfolder(&share).exists(), "{}", preview.stderr);
+    assert_eq!(jobs_cmd(&tmp, &["dedupe", "--dry-run", "--apply", "--db", db_s]).code, 2);
+    // Off: dedupe acts without --apply — still asking first
+    let asked = jobs_cmd(&tmp, &["dedupe", "--db", db_s]);
+    assert!(asked.code == 1 && asked.stderr.contains("pass --yes"), "{}", asked.stderr);
+    let r = jobs_cmd(&tmp, &["dedupe", "--yes", "--db", db_s]);
+    assert!(r.code == 0 && r.stdout.contains("quarantined 2 files"), "{}", r.stderr);
+}

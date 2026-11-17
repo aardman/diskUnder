@@ -6,6 +6,7 @@ use crate::output::Format;
 use crate::filters::{parse_path_pattern, Overrides, PathFilter, TypeFilter};
 use crate::query::{parse_ext_list, parse_size, ExtList, FilterArgs, SortKey};
 use crate::report::{parse_age_arg, Age, StaleBy};
+use crate::dedupe::{Action as DedupeAction, Keep};
 
 #[derive(Parser)]
 #[command(name = "diskunder", about = "File indexer: duplicates, search, reports and saved jobs. Run with no command, in a terminal, for the interactive app", version)]
@@ -176,6 +177,54 @@ pub(crate) enum Command {
     Db {
         #[command(subcommand)]
         action: DbAction,
+    },
+    /// Keep one copy of each duplicate and quarantine the others — previews unless --apply
+    Dedupe {
+        /// Indexed path, or a folder inside one (default: every indexed path); only copies
+        /// in it count, stay or go
+        path: Option<String>,
+        /// Which copy stays
+        #[arg(long, value_enum, default_value_t = Keep::Oldest)]
+        keep: Keep,
+        /// Prefer to keep a copy under PATH (repeatable)
+        #[arg(long, value_name = "PATH")]
+        keep_under: Vec<String>,
+        /// Only remove copies under PATH, e.g. backup folders (repeatable)
+        #[arg(long, value_name = "PATH")]
+        remove_under: Vec<String>,
+        /// Only remove copies with these extensions, e.g. iso,dmg ("none" for files without one)
+        #[arg(long, value_name = "LIST", value_parser = parse_ext_list)]
+        ext: Option<ExtList>,
+        /// Only groups whose files are at least SIZE
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        min_size: Option<u64>,
+        /// Only groups with at least N distinct copies
+        #[arg(long, value_name = "N", default_value_t = 2)]
+        min_copies: usize,
+        /// Only groups wasting at least SIZE in total
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        min_wasted: Option<u64>,
+        /// What happens to the copies that go
+        #[arg(long, value_enum, default_value_t = DedupeAction::Quarantine)]
+        action: DedupeAction,
+        /// Groups to show in the preview; 0 for all
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Also write the whole plan as CSV to FILE ("-" for stdout), to review or edit
+        #[arg(long, value_name = "FILE")]
+        plan: Option<String>,
+        /// Act on a plan written by --plan (edited or not), re-checking every file
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["path", "keep_under", "remove_under", "ext", "min_size", "min_wasted", "plan"])]
+        from_plan: Option<String>,
+        /// Act: quarantine the copies that go, after checking each one (asks first unless --yes)
+        #[arg(long)]
+        apply: bool,
+        /// Only preview, even when the deletion.dry_run_default setting is no
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Don't ask (required when not run from a terminal, unless deletion.confirm_quarantine is no)
+        #[arg(long)]
+        yes: bool,
     },
     /// Move files out of the way without deleting them; restore them, or purge them later
     Quarantine {

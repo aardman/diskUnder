@@ -1,5 +1,26 @@
 # diskUnder — Change Log
 
+## v6.1.0 — dedupe
+
+`diskunder dedupe [PATH]`: keep one copy of each duplicate and quarantine the rest.
+
+- **Previews by default**, from the index alone; `--apply` acts, asking first (`--yes` in
+  scripts). `deletion.dry_run_default` set to `no` makes acting the default; `--dry-run`
+  previews.
+- **Which copy stays:** `--keep oldest` (default) `| newest | shortest-path | first-path`,
+  `--keep-under PATH` preferred. **Which go:** `--remove-under PATH`, `--ext LIST`; groups by
+  `--min-size`, `--min-copies`, `--min-wasted`. With a path, only copies inside it count.
+- **Hard links:** another name for the kept file is `LINKED` and stays; a copy with several
+  names goes with all of them or not at all. The same file through two mounts is never moved.
+- **Re-checked before acting:** a group's copies move only if its kept copy is still as
+  indexed; each copy must be as indexed, hold the group's checksum, and not be the kept file
+  under another name.
+- **Plans:** `--plan FILE` (or `-`) writes every group as CSV; `--from-plan FILE` previews or
+  (`--apply`) acts on exactly that, edited or not. A group with no `KEEP` row is skipped.
+- The removed copies are one quarantine batch (reason `dedupe`): `quarantine restore` undoes
+  it, `quarantine purge` frees the space.
+- `quarantine add` now also drops a file's row from overlapping indexed paths that hold it.
+
 ## v6.0.0 — quarantine
 
 `diskunder quarantine add | list | show | restore | purge`: move files out of the way
