@@ -98,7 +98,9 @@ pub(crate) fn migrate_legacy_table(conn: &mut Connection, typed: &str, root: &st
 ///   3 — v5.3: path filter columns on `roots`
 ///   4 — v5.6: volume identity columns on `roots`
 ///   5 — v5.7: a `quick` hash column on every file table
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+///   6 — v6.0: quarantine tables (so earlier versions, which would index quarantined files,
+///       refuse to write to the database)
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 
 pub(crate) fn schema_version(conn: &Connection) -> DbResult<i64> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -204,6 +206,13 @@ pub(crate) fn migrate_schema(conn: &mut Connection) -> Result<Vec<String>, Strin
         if added > 0 {
             applied.push(format!("schema 5: added a quick-hash column to {} file tables", added));
         }
+    }
+
+    if version < 6 {
+        let tx = conn.transaction().map_err(db)?;
+        tx.execute_batch(crate::quarantine::SCHEMA).map_err(db)?;
+        tx.pragma_update(None, "user_version", 6).map_err(db)?;
+        tx.commit().map_err(db)?;
     }
 
     Ok(applied)

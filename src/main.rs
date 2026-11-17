@@ -13,6 +13,7 @@ mod maintenance;
 mod output;
 mod plain;
 mod progress;
+mod quarantine;
 mod query;
 mod report;
 mod run;
@@ -26,7 +27,7 @@ mod volume;
 use clap::{CommandFactory, Parser};
 use std::{fs, io::IsTerminal};
 
-use crate::cli::{Cli, Command, JobsAction, Mode, SettingsAction};
+use crate::cli::{Cli, Command, JobsAction, Mode, QuarantineAction, SettingsAction};
 use crate::dryrun::run_dry_run;
 use crate::jobs::{run_jobs_command, store_path, JobSettings, JobsCommand, LogArgs};
 use crate::maintenance::run_db_command;
@@ -98,6 +99,24 @@ fn main() {
                 Some(SettingsAction::Unset { key }) => SettingsCommand::Unset { key },
             };
             run_settings_command(&store, cmd)
+        }
+        Command::Quarantine { action } => {
+            use quarantine::QuarantineCommand as Q;
+            let cmd = match action {
+                QuarantineAction::Add { paths, stdin, null, reason, dry_run, yes } => {
+                    Q::Add { paths, stdin: *stdin, null: *null, reason: reason.as_deref(), dry_run: *dry_run, yes: *yes }
+                }
+                QuarantineAction::List => Q::List,
+                QuarantineAction::Show { batch } => Q::Show { batch },
+                QuarantineAction::Restore { batch, paths, dry_run } => Q::Restore { batch, paths, dry_run: *dry_run },
+                QuarantineAction::Purge { batch, older_than, dry_run, yes } => {
+                    Q::Purge { batch: batch.as_deref(), older_than: older_than.as_deref(), dry_run: *dry_run, yes: *yes }
+                }
+            };
+            let mut runlog = RunLog::new(&db, args.log.as_deref(), args.no_log);
+            let code = quarantine::run_quarantine_command(&db, cmd, &settings, &mut runlog);
+            report_log_failure(&runlog);
+            code
         }
         Command::Db { action } => {
             let mut runlog = RunLog::new(&db, args.log.as_deref(), args.no_log);

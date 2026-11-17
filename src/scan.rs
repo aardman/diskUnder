@@ -327,6 +327,10 @@ pub(crate) fn run_worker(
     // Excluded folders are never entered, unless an include pattern could match inside them
     let pruned = Cell::new(0usize);
     let walker = WalkDir::new(&path).into_iter().filter_entry(|e| {
+        // Quarantined files are never indexed: their rows left with them
+        if e.depth() > 0 && e.file_type().is_dir() && e.file_name() == crate::quarantine::FOLDER {
+            return false;
+        }
         let skip = e.depth() > 0 && e.file_type().is_dir() && filter.prunes_dir(e.path(), &root);
         if skip {
             pruned.set(pruned.get() + 1);

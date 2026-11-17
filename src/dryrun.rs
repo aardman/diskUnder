@@ -121,6 +121,10 @@ fn dry_run(
     let mut errors = 0i64;
     let pruned = std::cell::Cell::new(0i64); // folders the walk wouldn't enter
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+        // Quarantined files are never indexed: their rows left with them
+        if e.depth() > 0 && e.file_type().is_dir() && e.file_name() == crate::quarantine::FOLDER {
+            return false;
+        }
         let skip = e.depth() > 0 && e.file_type().is_dir() && filter.prunes_dir(e.path(), &root_path);
         if skip {
             pruned.set(pruned.get() + 1);

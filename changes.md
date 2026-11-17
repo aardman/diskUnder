@@ -1,5 +1,28 @@
 # diskUnder — Change Log
 
+## v6.0.0 — quarantine
+
+`diskunder quarantine add | list | show | restore | purge`: move files out of the way
+without deleting them — the first part of v6; dedupe (6.1) builds on it.
+
+- **Where:** `<indexed path>/.diskunder-quarantine/<batch>/<the file's path inside it>` — a
+  rename on the same volume, never a copy; a file that can't be renamed there is left alone.
+- **Checked first:** only indexed files, unchanged since indexed (size and modified time),
+  regular files (not symlinks). `--dry-run` previews. Paths can come from `search … -0`
+  with `--stdin -0`.
+- **Manifest before moving:** `manifest.tsv` in each batch folder (original, stored, size,
+  checksum), so a batch can be put back by hand.
+- **Out of the index:** a quarantined file's row moves to the `quarantined` table, so reports
+  and duplicate counts (and the duplicate summary) leave it out; runs and dry runs never
+  enter `.diskunder-quarantine` folders.
+- **`restore`** moves files and their rows back, never over something new at the original
+  path. **`purge`** deletes files quarantined longer than `--older-than` (default
+  `deletion.purge_after_days`, 7) after asking.
+- `add` asks unless `deletion.confirm_quarantine` is `no`; actions take the database lock and
+  are logged.
+- **Schema 6:** the quarantine tables. Earlier versions — which would index quarantined files
+  as new ones — refuse to write to a 6.0 database.
+
 ## v5.7.0 — read only possible copies
 
 ### Size first, then a quick hash, then a full hash

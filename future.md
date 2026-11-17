@@ -26,7 +26,7 @@ the same mount at once). Comparing several databases at query time (SQLite `ATTA
   by how many files match, and a fast `db info` (numbers in changes.md). Still to watch: a
   run checks its own unread files against every path (about a minute per 2.5 million files),
   and `report --by-directory` over every path takes about a minute at that size.
-- **v6 — quarantine, then dedupe:** volume identity decides what's possible. Copies on the
+- **v6 — quarantine (6.0, done), then dedupe (6.1–6.3):** see [Safe deletion](#safe-deletion). Volume identity decides what's possible. Copies on the
   same filesystem can share blocks (Linux `FIDEDUPERANGE` on XFS / Btrfs, run on the server:
   the kernel checks the bytes match before sharing them, so a changed file is never touched)
   or be hard-linked; copies on different volumes can only be kept once and the rest
@@ -90,9 +90,24 @@ equivalent CLI command. It also absorbs the dedupe "TUI selection" idea below fo
 
 ## Safe deletion
 
-**Planned for v6, in this order:** quarantine (with manifest, `purge`, `restore` and a
-`status` column), then `dedupe` built on it, with `--dry-run`. Default copy to keep: the
-oldest modified. The `dedupe` design is [below](#dedupe-command--design).
+**v6, agreed November 2026:**
+
+- **6.0 (done) — quarantine:** `quarantine add | list | show | restore | purge`. Files go to
+  `.diskunder-quarantine/<batch>/` at the top of their indexed path (a rename, never a copy);
+  a manifest is written first; rows move to a `quarantined` table rather than gaining a
+  status column, so every existing query leaves them out unchanged.
+- **6.1 — dedupe:** plans which copy to keep (default: oldest modified) and **previews by
+  default**; `--apply` acts (asking first unless `--yes`). `--plan FILE` writes a CSV to
+  review or edit, and `--from-plan FILE` acts on exactly that, re-checking each file. The
+  default action is quarantine.
+- **6.2 — share blocks and hard links:** `--action share` makes copies on the same volume share
+  their blocks — Linux `FIDEDUPERANGE` on XFS / Btrfs, run on the server itself; the kernel
+  checks the bytes match first, every path keeps working, and space is freed at once. Copies
+  on other volumes are still quarantined. Tested on XFS. `--action hardlink` too.
+- **6.3 — the app:** choose keep / remove per copy in the Duplicates view, and a Quarantine
+  view (list, restore, purge).
+
+The `dedupe` design is [below](#dedupe-command--design).
 
 Deletion is the most dangerous operation the tool could perform, especially on a network
 share where mistakes are hard to reverse. All deletion features should be off by default

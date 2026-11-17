@@ -206,7 +206,7 @@ fn db_drop(
 }
 
 /// Run a database-changing action between `start` and `end` run-log lines
-fn logged(runlog: &mut RunLog, action: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+pub(crate) fn logged(runlog: &mut RunLog, action: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
     runlog.start();
     let result = action();
     match &result {

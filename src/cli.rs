@@ -177,6 +177,62 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: DbAction,
     },
+    /// Move files out of the way without deleting them; restore them, or purge them later
+    Quarantine {
+        #[command(subcommand)]
+        action: QuarantineAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum QuarantineAction {
+    /// Quarantine indexed files: moved to .diskunder-quarantine at the top of their indexed path
+    Add {
+        /// Files to quarantine (or --stdin)
+        paths: Vec<String>,
+        /// Read file paths from stdin, one per line — e.g. from `search … --paths`
+        #[arg(long)]
+        stdin: bool,
+        /// With --stdin: paths are NUL-separated (from `search … -0`)
+        #[arg(short = '0', long = "null", requires = "stdin")]
+        null: bool,
+        /// Why, recorded with the batch
+        #[arg(long)]
+        reason: Option<String>,
+        /// Show what would be quarantined, without moving anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't ask (required when not run from a terminal, unless deletion.confirm_quarantine is no)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Quarantine batches: when, how many files, how much space
+    List,
+    /// The files in a batch
+    Show { batch: String },
+    /// Put a batch's files back where they were (all of them, or just the paths given)
+    Restore {
+        batch: String,
+        /// Only these files (their original paths)
+        paths: Vec<String>,
+        /// Show what would be restored, without moving anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Permanently delete files quarantined longer than AGE (default: the deletion.purge_after_days setting)
+    Purge {
+        /// Only this batch
+        batch: Option<String>,
+        /// e.g. 7d, 2w, 3m
+        #[arg(long, value_name = "AGE")]
+        older_than: Option<String>,
+        /// Show what would be deleted, without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't ask (required when not run from a terminal)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

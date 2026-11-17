@@ -7,7 +7,8 @@ LINUX    := target/x86_64-unknown-linux-musl/release/$(BIN)
 all: mac linux
 
 mac:
-	cargo build --release
+	@# Keep the home folder's path out of the binary
+	RUSTFLAGS="--remap-path-prefix=$(HOME)=~" cargo build --release
 	@# Remove first: overwriting a binary that has run makes macOS kill the new one
 	rm -f $(BIN)-macos
 	cp $(RELEASE) $(BIN)-macos

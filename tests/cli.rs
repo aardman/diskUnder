@@ -874,7 +874,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     let db = tmp.path().join("t.db");
     let db_s = db.to_str().unwrap();
     run_in(tmp.path(), &["index", "data", "--db", db_s]);
-    assert_eq!(user_version(&db), 5);
+    assert_eq!(user_version(&db), 6);
     let t = table_for(&data);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension IN ('jpg', 'mov')", t)), 2);
 
@@ -887,7 +887,7 @@ fn extensions_are_stored_lowercase_and_older_databases_migrated() {
     write(&data.join("c.PNG"), "c\n");
     let run = run_in(tmp.path(), &["update", "data", "--db", db_s]);
     assert!(run.stderr.contains("schema 1: stored 1 file extensions in lowercase"), "{}", run.stderr);
-    assert_eq!(user_version(&db), 5);
+    assert_eq!(user_version(&db), 6);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension != lower(extension)", t)), 0);
     assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {} WHERE extension = 'png'", t)), 1);
 
@@ -942,7 +942,7 @@ fn index_and_update_are_logged_with_a_summary() {
     assert_eq!(lines[0].0, lines[1].0, "start and end share a run id");
     assert_ne!(lines[0].0, lines[2].0, "each run has its own id");
     assert!(lines[0].2.starts_with(&format!("index 'my data' --db {} --no-tui  (user=", db_s)), "{}", lines[0].2);
-    assert!(lines[0].2.contains("version=5."), "{}", lines[0].2);
+    assert!(lines[0].2.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))), "{}", lines[0].2);
     assert!(lines[1].2.starts_with("completed in "), "{}", lines[1].2);
     assert!(lines[1].2.contains("— 3 found, 0 already indexed, 3 written, 0 removed, 0 errors, 0 duplicate groups"), "{}", lines[1].2);
     assert!(lines[3].2.contains("3 unchanged, 0 written"), "{}", lines[3].2);
@@ -1605,7 +1605,7 @@ fn dry_run_reports_what_the_run_would_do_first() {
     create_v3_table(&db, "data/", &[("data/a", "sum-a")]);
 
     let q = dry(&tmp, &["index", "data/", "--db", db.to_str().unwrap()]);
-    assert!(q.stdout.contains("would first update the database schema to version 5"), "{}", q.stdout);
+    assert!(q.stdout.contains("would first update the database schema to version 6"), "{}", q.stdout);
     assert!(q.stdout.contains("would first migrate 1 rows from the table for \"data/\""), "{}", q.stdout);
     assert_eq!(dry_value(&q.stdout, "Already indexed"), 1, "migrated rows aren't re-hashed");
     assert_eq!(dry_value(&q.stdout, "Would record"), 1);
@@ -1794,7 +1794,7 @@ fn schema_1_databases_are_read_and_upgraded() {
     assert_eq!(query(tmp.path(), &["search", "share", "--db", db_s]).code, 0);
     let upd = run_in(tmp.path(), &["update", "share", "--exclude-ext", "tmp", "--db", db_s]);
     assert!(upd.stderr.contains("schema 2: added file-type filter columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 5);
+    assert_eq!(user_version(&db), 6);
     assert_eq!(stored_filters(&db), (None, Some("tmp".to_string())));
 }
 
@@ -1980,7 +1980,7 @@ fn path_filters_show_in_db_info_and_queries_and_schema_2_upgrades() {
     assert_eq!(db_cmd(tmp.path(), &["info", "--db", db_s]).code, 0, "read-only commands cope");
     let upd = run_in(tmp.path(), &index_args("update", db_s, &["--exclude-path", "@eaDir"]));
     assert!(upd.stderr.contains("schema 3: added path filter columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 5);
+    assert_eq!(user_version(&db), 6);
 }
 
 // ─── Jobs (5.4) ──────────────────────────────────────────────────────────────
@@ -2381,7 +2381,7 @@ fn schema_4_records_volumes_on_the_next_run() {
     assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups"));
     let upd = run_in(tmp.path(), &["update", "share", "--db", db_s]);
     assert!(upd.stderr.contains("schema 4: added volume columns to the roots table"), "{}", upd.stderr);
-    assert_eq!(user_version(&db), 5);
+    assert_eq!(user_version(&db), 6);
     assert!(roots_volume(&db, &d).0.is_some());
 }
 
@@ -2577,4 +2577,167 @@ fn the_duplicate_summary_matches_a_full_recount() {
     assert_eq!(dropped.code, 0, "{}", dropped.stderr);
     check("after drop");
     assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("× 2 copies"), "b's copy went with it");
+}
+
+// ─── Quarantine (6.0) ────────────────────────────────────────────────────────
+
+/// `diskunder quarantine …` against `db`, stdin closed (not interactive)
+fn q(tmp: &TempDir, db: &Path, args: &[&str]) -> Query {
+    query(tmp.path(), &[&["quarantine"][..], args, &["--db", db.to_str().unwrap()]].concat())
+}
+
+fn qfolder(root: &Path) -> PathBuf {
+    root.join(".diskunder-quarantine")
+}
+
+fn batches(root: &Path) -> Vec<String> {
+    let mut b: Vec<String> =
+        fs::read_dir(qfolder(root)).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    b.sort();
+    b
+}
+
+#[test]
+fn quarantine_moves_files_aside_and_restore_puts_them_back() {
+    let tmp = TempDir::new();
+    let share = tmp.path().join("share");
+    write(&share.join("photos/a.jpg"), "photo one\n");
+    write(&share.join("backup/a.jpg"), "photo one\n");
+    write(&share.join("notes.txt"), "something else\n");
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "share", "--db", db.to_str().unwrap()]);
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups       : 1"));
+
+    let dry = ok(q(&tmp, &db, &["add", "share/backup/a.jpg", "--dry-run"]));
+    assert!(dry.stdout.contains("Would quarantine 1 file") && share.join("backup/a.jpg").exists(), "{}", dry.stdout);
+
+    let add = ok(q(&tmp, &db, &["add", "share/backup/a.jpg", "--reason", "backup copy", "--yes"]));
+    assert!(add.stdout.starts_with("quarantined 1 file (10 B) as "), "{}", add.stdout);
+    let batch = batches(&share).pop().expect("a batch folder");
+    let stored = qfolder(&share).join(&batch).join("backup/a.jpg");
+    assert!(!share.join("backup/a.jpg").exists() && stored.exists(), "moved, keeping its path inside the root");
+    let manifest = fs::read_to_string(qfolder(&share).join(&batch).join("manifest.tsv")).unwrap();
+    assert!(manifest.contains(&format!("{}\t{}", share.join("backup/a.jpg").display(), stored.display())), "{}", manifest);
+
+    // Out of the index: no duplicate any more, and runs don't pick it up again
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups       : 0"));
+    let upd = run_in(tmp.path(), &["update", "share", "--db", db.to_str().unwrap()]);
+    assert_eq!((upd.summary.found, upd.summary.written), (2, 0), "{}", upd.stderr);
+    let list = ok(q(&tmp, &db, &["list"]));
+    assert!(list.stdout.contains(&batch) && list.stdout.contains("backup copy"), "{}", list.stdout);
+    assert!(ok(q(&tmp, &db, &["show", &batch])).stdout.contains("quarantined"));
+
+    let back = ok(q(&tmp, &db, &["restore", &batch]));
+    assert!(back.stdout.contains("restored 1 file"), "{}", back.stdout);
+    assert!(share.join("backup/a.jpg").exists() && !qfolder(&share).exists(), "back, and the empty quarantine folder gone");
+    assert!(ok(report(&tmp, &db, &["--duplicates"])).stdout.contains("Duplicate groups       : 1"), "its row is back");
+    let log = fs::read_to_string(tmp.path().join("t.db.log")).unwrap();
+    assert!(log.contains("quarantine add") && log.contains("quarantine restore"), "{}", log);
+}
+
+#[test]
+fn quarantine_only_takes_indexed_unchanged_files() {
+    let tmp = TempDir::new();
+    let share = tmp.path().join("share");
+    write(&share.join("a.txt"), "a\n");
+    write(&share.join("b.txt"), "b\n");
+    write(&tmp.path().join("elsewhere.txt"), "x\n");
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "share", "--db", db.to_str().unwrap()]);
+    write(&share.join("new.txt"), "not indexed yet\n");
+    rewrite(&share.join("b.txt"), b"bb\n");
+    std::os::unix::fs::symlink(share.join("a.txt"), share.join("link.txt")).unwrap();
+
+    let r = q(&tmp, &db, &["add", "share/new.txt", "share/b.txt", "elsewhere.txt", "share/link.txt", "--yes"]);
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    assert!(r.stderr.contains("new.txt — not in the index"), "{}", r.stderr);
+    assert!(r.stderr.contains("b.txt — changed since it was indexed"), "{}", r.stderr);
+    assert!(r.stderr.contains("elsewhere.txt — not in an indexed path"), "{}", r.stderr);
+    assert!(r.stderr.contains("link.txt — not a regular file"), "{}", r.stderr);
+    assert!(!qfolder(&share).exists(), "nothing moved");
+
+    // Not from a terminal, it asks for --yes (deletion.confirm_quarantine is on by default)
+    let asked = q(&tmp, &db, &["add", "share/a.txt"]);
+    assert!(asked.code == 1 && asked.stderr.contains("pass --yes"), "{}", asked.stderr);
+    assert!(share.join("a.txt").exists());
+}
+
+#[test]
+fn quarantine_reads_paths_from_search() {
+    let tmp = TempDir::new();
+    let share = tmp.path().join("share");
+    write(&share.join("keep.txt"), "keep\n");
+    write(&share.join("old 1.tmp"), "one\n");
+    write(&share.join("sub/old 2.tmp"), "two\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    run_in(tmp.path(), &["index", "share", "--db", db_s]);
+    let found = bin().args(["search", "share", "--ext", "tmp", "-0", "--db", db_s]).current_dir(tmp.path()).output().unwrap();
+    let mut child = bin()
+        .args(["quarantine", "add", "--stdin", "-0", "--yes", "--db", db_s])
+        .current_dir(tmp.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&found.stdout).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("quarantined 2 files"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(share.join("keep.txt").exists() && !share.join("old 1.tmp").exists() && !share.join("sub/old 2.tmp").exists());
+}
+
+#[test]
+fn restore_never_overwrites_and_purge_deletes_for_good() {
+    let tmp = TempDir::new();
+    let share = tmp.path().join("share");
+    write(&share.join("a.txt"), "a\n");
+    write(&share.join("b.txt"), "b\n");
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "share", "--db", db.to_str().unwrap()]);
+    ok(q(&tmp, &db, &["add", "share/a.txt", "share/b.txt", "--yes"]));
+    let batch = batches(&share).pop().unwrap();
+
+    // Something new where a.txt was: a.txt stays in quarantine, b.txt comes back
+    write(&share.join("a.txt"), "a new file\n");
+    let r = ok(q(&tmp, &db, &["restore", &batch]));
+    assert!(r.stdout.contains("restored 1 file") && r.stdout.contains("1 file not restored"), "{}", r.stdout);
+    assert!(r.stderr.contains("a.txt — something is there now"), "{}", r.stderr);
+    assert_eq!(fs::read_to_string(share.join("a.txt")).unwrap(), "a new file\n");
+
+    let dry = ok(q(&tmp, &db, &["purge", "--older-than", "0d", "--dry-run"]));
+    assert!(dry.stdout.contains("Would permanently delete 1 file"), "{}", dry.stdout);
+    let asked = q(&tmp, &db, &["purge", "--older-than", "0d"]);
+    assert!(asked.code == 1 && asked.stderr.contains("pass --yes"), "{}", asked.stderr);
+    assert!(qfolder(&share).join(&batch).join("a.txt").exists(), "nothing deleted without --yes");
+    let fresh = ok(q(&tmp, &db, &["purge", "--yes"]));
+    assert!(fresh.stdout.contains("nothing quarantined longer than 7d"), "the default grace period: {}", fresh.stdout);
+
+    let p = ok(q(&tmp, &db, &["purge", "--older-than", "0d", "--yes"]));
+    assert!(p.stdout.contains("purged 1 file, freeing 2 B"), "{}", p.stdout);
+    assert!(!qfolder(&share).exists(), "gone, folders tidied");
+    let list = ok(q(&tmp, &db, &["list"]));
+    assert!(list.stdout.contains("1 restored, 1 purged"), "{}", list.stdout);
+}
+
+#[test]
+fn quarantine_settings_and_the_database_lock() {
+    use std::os::unix::io::AsRawFd;
+    let tmp = TempDir::new();
+    let share = tmp.path().join("share");
+    write(&share.join("a.txt"), "a\n");
+    let db = tmp.path().join("t.db");
+    let db_s = db.to_str().unwrap();
+    ok(jobs_cmd(&tmp, &["settings", "set", "deletion.confirm_quarantine", "no"]));
+    run_in(tmp.path(), &["index", "share", "--db", db_s]);
+
+    let lock = fs::File::create(tmp.path().join("t.db.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    let busy = jobs_cmd(&tmp, &["quarantine", "add", "share/a.txt", "--db", db_s]);
+    assert!(busy.code == 1 && busy.stderr.contains("is in use"), "{}", busy.stderr);
+    drop(lock);
+
+    // deletion.confirm_quarantine = no: no --yes needed
+    let r = jobs_cmd(&tmp, &["quarantine", "add", "share/a.txt", "--db", db_s]);
+    assert!(r.code == 0 && r.stdout.contains("quarantined 1 file"), "{}", r.stderr);
 }

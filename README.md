@@ -64,7 +64,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 5.7.0`:
+**Check it worked** — this should print `diskunder 6.0.0`:
 
 ```bash
 diskunder --version
@@ -432,6 +432,46 @@ servers do). Paths indexed before 5.6 get their volume on their next run.
 
 ---
 
+## Quarantine
+
+Move files out of the way without deleting them. A quarantined file goes to a folder at the
+top of its indexed path — `<indexed path>/.diskunder-quarantine/<batch>/` — keeping its path
+inside it. It's a rename on the same volume, so nothing is copied and it's instant however
+big the file; if a file can't simply be renamed there (another filesystem mounted inside the
+path), it's left where it is.
+
+```bash
+diskunder quarantine add /data/share/backup/render.mov --reason "old copy" --db /data/index.db
+diskunder search /data/share --ext tmp -0 --db /data/index.db | diskunder quarantine add --stdin -0 --db /data/index.db
+diskunder quarantine list --db /data/index.db
+diskunder quarantine show 2026-11-16-153201 --db /data/index.db
+diskunder quarantine restore 2026-11-16-153201 --db /data/index.db
+diskunder quarantine purge --dry-run --db /data/index.db
+```
+
+```text
+  BATCH              CREATED           FILES     SIZE  ALSO        REASON
+  2026-11-16-153201  2026-11-16 15:32     14   3.2 GB  2 restored  old copies
+```
+
+- **Only indexed, unchanged files.** Each file is checked against the index just before it
+  moves — same size and modified time — and skipped (with the reason) if it's changed, isn't
+  indexed, or isn't a regular file. `--dry-run` shows what would move.
+- **Out of the index while it's quarantined.** Its row moves to the `quarantined` table, so
+  reports, searches and duplicate counts leave it out, and runs never look inside
+  `.diskunder-quarantine`.
+- **A manifest first.** Each batch folder gets a `manifest.tsv` (original path, where it is
+  now, size, checksum) before anything moves — so a batch can be put back by hand, even
+  without the database.
+- **`restore`** moves a batch (or just the paths given) back, with its index row, and never
+  overwrites: if something new is at the original path, that file stays in quarantine.
+- **`purge`** permanently deletes files quarantined longer than `--older-than` (default: the
+  `deletion.purge_after_days` setting, 7 days). It asks first (`--yes` in scripts).
+- `add` asks first too, unless `deletion.confirm_quarantine` is `no`. Every action takes the
+  database lock (one at a time, like runs) and goes in the run log.
+
+---
+
 ## Interactive app
 
 Run `diskunder` with no command, in a terminal, to open the app — a front end to jobs and
@@ -443,7 +483,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Host  Settings  Help                 diskUnder v5.7.0 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v6.0.0 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -518,7 +558,8 @@ diskunder settings unset defaults.threads
 | `start.db`, `start.select_last_job` | the database the app opens (unless `--db` is given), and whether it selects the last-run job |
 | `defaults.mode`, `.threads`, `.include_ext`, `.exclude_ext`, `.exclude_paths` | what the app's New job form starts with |
 | `types.NAME` | file-type groups — `@NAME` in any type filter, on the command line or in the app |
-| `deletion.*` | how v6's quarantine and dedupe behave — stored now, used from v6 |
+| `deletion.confirm_quarantine`, `.purge_after_days` | whether `quarantine add` asks first (default yes), and how long `quarantine purge` waits (default 7 days) |
+| `deletion.dry_run_default` | dedupe (6.1) previews before it acts |
 | `log.folder`, `log.rotate_mb` | where run logs go (blank: next to each database) and when they rotate |
 
 **Type groups** come built in — `@images`, `@video`, `@audio`, `@documents`, `@archives`,
@@ -741,7 +782,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Test job — sample data to try the app on, created and removed from the Jobs menu | No | No | No | No | No | Yes (5.5.4) |
 | Duplicates across shares — volume identity, the same file via two mounts counted once, one run per database | No | No | No | No | No | Yes (5.6) |
 | Reads only possible copies — size first, then a quick hash, full hash last (`--hash-all` for every file) | No | No | No | No | No | Yes (5.7) |
-| Quarantine — move duplicates to a dated trash folder, with `purge` | No | No | No | No | No | Planned (v6) |
+| Quarantine — move files aside reversibly, with `restore` and `purge`; dedupe builds on it (6.1) | No | No | No | No | No | Yes (6.0) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
 ### Background
@@ -790,6 +831,7 @@ diskunder/
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   ├── host.rs        #   drives and mounts, host info
 │   ├── volume.rs      #   which volume a path is on
+│   ├── quarantine.rs  #   quarantine: add, list, show, restore, purge
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
 ├── diskunder-macos    # Compiled macOS binary (arm64)
