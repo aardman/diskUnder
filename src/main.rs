@@ -2,6 +2,7 @@
 // See changes.md for full change history
 
 mod app;
+mod blocks;
 mod cli;
 mod db;
 mod dedupe;

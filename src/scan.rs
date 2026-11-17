@@ -148,7 +148,7 @@ impl FileEntry {
 
 /// Open for reading without updating the file's access time where Linux allows it (files the
 /// user owns, or as root); otherwise a plain open
-fn open_for_reading(path: &Path) -> Result<File, std::io::Error> {
+pub(crate) fn open_for_reading(path: &Path) -> Result<File, std::io::Error> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;

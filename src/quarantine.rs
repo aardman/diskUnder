@@ -279,7 +279,7 @@ fn add(
 
     let _lock = lock_db(db_path, &format!("diskunder quarantine add ({})", batch))?;
     let result = crate::maintenance::logged(runlog, || {
-        let done = move_planned(&conn, db_path, &batch, reason, &planned)?;
+        let done = move_planned(&conn, db_path, &batch, reason, &planned.iter().collect::<Vec<_>>())?;
         Ok(done.message(&batch, skipped.len()))
     })?;
     println!("{}", result);
@@ -307,10 +307,10 @@ impl Moved {
 }
 
 /// Record the batch, then move each planned file into it — the caller holds the database lock
-pub(crate) fn move_planned(conn: &Connection, db_path: &str, batch: &str, reason: Option<&str>, planned: &[Planned]) -> Result<Moved, String> {
+pub(crate) fn move_planned(conn: &Connection, db_path: &str, batch: &str, reason: Option<&str>, planned: &[&Planned]) -> Result<Moved, String> {
     let mut by_root: BTreeMap<&str, Vec<&Planned>> = BTreeMap::new();
     for p in planned {
-        by_root.entry(&p.root).or_default().push(p);
+        by_root.entry(&p.root).or_default().push(*p);
     }
     conn.execute(
         "INSERT INTO quarantine_batches (batch, created, reason, command) VALUES (?1, datetime('now'), ?2, ?3)",
@@ -368,6 +368,25 @@ fn record_quarantined(conn: &Connection, batch: &str, p: &Planned) -> rusqlite::
         }
     }
     tx.commit()
+}
+
+/// After `copy` became a hard link to `keep`: its rows take the kept file's identity and dates,
+/// so it counts as the same copy
+pub(crate) fn relinked(conn: &Connection, copy: &Planned, keep: &Planned) -> rusqlite::Result<()> {
+    const TAKEN: [&str; 5] = ["modified_date", "access_date", "birth_date", "device", "inode"];
+    for t in std::iter::once(&copy.table).chain(&copy.also) {
+        if !table_exists(conn, t)? {
+            continue;
+        }
+        let cols: Vec<&str> = TAKEN.iter().copied().filter(|c| has_column(conn, t, c).unwrap_or(false)).collect();
+        let mut values: Vec<rusqlite::types::Value> = vec![copy.original.display().to_string().into()];
+        for c in &cols {
+            values.push(keep.row[ROW_COLUMNS.iter().position(|x| x == c).unwrap()].clone());
+        }
+        let sets: Vec<String> = cols.iter().enumerate().map(|(i, c)| format!("{c} = ?{}", i + 2)).collect();
+        conn.execute(&format!("UPDATE {t} SET {} WHERE path = ?1", sets.join(", ")), rusqlite::params_from_iter(values.iter()))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn plural(n: usize, word: &str) -> String {

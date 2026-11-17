@@ -2925,3 +2925,83 @@ fn dedupe_dry_run_setting() {
     let r = jobs_cmd(&tmp, &["dedupe", "--yes", "--db", db_s]);
     assert!(r.code == 0 && r.stdout.contains("quarantined 2 files"), "{}", r.stderr);
 }
+
+// ─── Dedupe actions (v6.2) ───────────────────────────────────────────────────
+
+fn inode(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(p).unwrap().ino()
+}
+
+#[test]
+fn dedupe_hardlinks_copies_after_comparing_them() {
+    let tmp = TempDir::new();
+    let (share, db) = dedupe_share(&tmp);
+    let preview = ok(dd(&tmp, &db, &["--action", "hardlink"]));
+    assert!(preview.stdout.contains("  LINK    ") && preview.stdout.contains("Would hard-link 2 files from 1 group"), "{}", preview.stdout);
+
+    // Changed without its size or modified time changing: only a byte-for-byte compare sees it
+    let temp = share.join("temp/render.mov");
+    let when = fs::metadata(&temp).unwrap().modified().unwrap();
+    fs::write(&temp, "b render\n").unwrap();
+    set_mtime(&temp, when);
+
+    // Not undoable, so it asks even when quarantine doesn't
+    ok(jobs_cmd(&tmp, &["settings", "set", "deletion.confirm_quarantine", "no"]));
+    let asked = jobs_cmd(&tmp, &["dedupe", "--action", "hardlink", "--apply", "--db", db.to_str().unwrap()]);
+    assert!(asked.code == 1 && asked.stderr.contains("pass --yes"), "{}", asked.stderr);
+
+    let r = ok(dd(&tmp, &db, &["--action", "hardlink", "--apply", "--yes"]));
+    assert!(r.stdout.contains("replaced 1 file with hard links, freeing 9 B") && r.stdout.contains("1 file skipped"), "{}", r.stdout);
+    assert!(r.stderr.contains("temp/render.mov — differs from the kept copy, byte for byte"), "{}", r.stderr);
+    let kept = share.join("backup/render.mov");
+    assert_eq!(inode(&share.join("projects/render.mov")), inode(&kept));
+    assert_ne!(inode(&temp), inode(&kept));
+    assert_eq!(fs::read_to_string(&temp).unwrap(), "b render\n", "left as it was");
+    assert!(!qfolder(&share).exists(), "nothing quarantined");
+    // The link now counts as the kept copy, so only the changed file is still a duplicate
+    let after = plan_roles(&share, &ok(dd(&tmp, &db, &["--plan", "-"])).stdout);
+    assert!(after.contains(&("LINKED".to_string(), "projects/render.mov".to_string())), "{:?}", after);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn dedupe_share_needs_linux() {
+    let tmp = TempDir::new();
+    let (share, db) = dedupe_share(&tmp);
+    let preview = ok(dd(&tmp, &db, &["--action", "share"]));
+    assert!(preview.stdout.contains("  SHARE   ") && preview.stdout.contains("Would share blocks for 2 files"), "{}", preview.stdout);
+    let r = dd(&tmp, &db, &["--action", "share", "--apply", "--yes"]);
+    assert!(r.code == 1 && r.stderr.contains("needs Linux"), "{}", r.stderr);
+    assert!(share.join("temp/render.mov").exists() && !qfolder(&share).exists());
+}
+
+/// Runs for real where the temporary folder is on XFS (with reflink) or Btrfs — e.g.
+/// TMPDIR on an XFS mount; elsewhere the kernel refuses and the test says so
+#[cfg(target_os = "linux")]
+#[test]
+fn dedupe_shares_blocks() {
+    let tmp = TempDir::new();
+    let share = tmp.path().join("share");
+    let data: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+    for p in ["a/big.bin", "b/big.bin", "c/big.bin"] {
+        write(&share.join(p), &data);
+    }
+    set_mtime(&share.join("a/big.bin"), days_ago(30));
+    let db = tmp.path().join("t.db");
+    run_in(tmp.path(), &["index", "share", "--db", db.to_str().unwrap()]);
+    let r = dd(&tmp, &db, &["--action", "share", "--apply", "--yes"]);
+    if r.stderr.contains("not supported") || r.stderr.contains("Invalid argument") {
+        eprintln!("skipped: this filesystem can't share blocks ({})", r.stderr.trim());
+        return;
+    }
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("shared blocks for 2 files, freeing"), "{}", r.stdout);
+    for p in ["a/big.bin", "b/big.bin", "c/big.bin"] {
+        assert_eq!(fs::read_to_string(share.join(p)).unwrap(), data, "every path keeps its data");
+    }
+    assert_ne!(inode(&share.join("a/big.bin")), inode(&share.join("b/big.bin")), "still separate files");
+    assert!(!qfolder(&share).exists());
+    let again = ok(dd(&tmp, &db, &["--action", "share", "--apply", "--yes"]));
+    assert!(again.stdout.contains("shared blocks for 0 files") && again.stdout.contains("2 files already shared"), "{}", again.stdout);
+}

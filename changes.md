@@ -1,5 +1,18 @@
 # diskUnder — Change Log
 
+## v6.2.0 — dedupe by sharing blocks
+
+- **`dedupe --action share`:** copies on the kept copy's volume share its blocks (Linux
+  `FIDEDUPERANGE`, XFS with reflink or Btrfs, run on the server). Every path stays, nothing
+  moves, the space is freed at once; the kernel compares the bytes first. Copies already
+  sharing blocks (checked with `FIEMAP`) are skipped, so re-runs are quick. Tested on XFS:
+  two 100 MB copies freed 200 MB, and editing one copy later didn't touch the others.
+- **`dedupe --action hardlink`:** copies on the kept copy's volume become hard links to it,
+  after a byte-for-byte compare; atomic (a link renamed over the copy), always asks, can't be
+  undone. Their index rows take the kept file's identity, so they count as one copy.
+- With either, copies on another volume are quarantined as before. Previews mark the copies
+  acted on in place `SHARE` or `LINK`.
+
 ## v6.1.0 — dedupe
 
 `diskunder dedupe [PATH]`: keep one copy of each duplicate and quarantine the rest.

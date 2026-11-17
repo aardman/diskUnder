@@ -4,7 +4,7 @@ Inspired by feature parity with [Diskover](https://diskoverdata.com/). Items are
 
 **Done in v5** (small releases — see [changes.md](changes.md)): 5.0 run log, `search` and `export` (**done**) · 5.1 `report` with duplicate filtering (**done**) · 5.2
 include/exclude file types and `--dry-run` preview (**done**) · 5.3 path patterns (Ignore) (**done**) · 5.4 Jobs (**done**) ·
-5.5 interactive app (TUI) (**done**). **v6:** quarantine (6.0) and `dedupe` (6.1) are done; sharing blocks (6.2) and the app (6.3) are next. The sections below are the
+5.5 interactive app (TUI) (**done**). **v6:** quarantine (6.0), `dedupe` (6.1) and sharing blocks (6.2) are done; the app (6.3) is next. The sections below are the
 original ideas.
 
 ### Plan for large estates (hundreds of TB, 10–20 servers)
@@ -26,7 +26,7 @@ the same mount at once). Comparing several databases at query time (SQLite `ATTA
   by how many files match, and a fast `db info` (numbers in changes.md). Still to watch: a
   run checks its own unread files against every path (about a minute per 2.5 million files),
   and `report --by-directory` over every path takes about a minute at that size.
-- **v6 — quarantine (6.0) and dedupe (6.1) done; 6.2–6.3 next:** see [Safe deletion](#safe-deletion). Volume identity decides what's possible. Copies on the
+- **v6 — quarantine (6.0), dedupe (6.1) and sharing blocks (6.2) done; 6.3 next:** see [Safe deletion](#safe-deletion). Volume identity decides what's possible. Copies on the
   same filesystem can share blocks (Linux `FIDEDUPERANGE` on XFS / Btrfs, run on the server:
   the kernel checks the bytes match before sharing them, so a changed file is never touched)
   or be hard-linked; copies on different volumes can only be kept once and the rest
@@ -100,7 +100,7 @@ equivalent CLI command. It also absorbs the dedupe "TUI selection" idea below fo
   **previews by default**; `--apply` acts (asking first unless `--yes`). `--plan FILE` writes
   a CSV to review or edit, and `--from-plan FILE` acts on exactly that, re-checking each file.
   The action is quarantine; see the README's Dedupe section.
-- **6.2 — share blocks and hard links:** `--action share` makes copies on the same volume share
+- **6.2 (done) — share blocks and hard links:** `--action share` makes copies on the same volume share
   their blocks — Linux `FIDEDUPERANGE` on XFS / Btrfs, run on the server itself; the kernel
   checks the bytes match first, every path keeps working, and space is freed at once. Copies
   on other volumes are still quarantined. Tested on XFS. `--action hardlink` too.

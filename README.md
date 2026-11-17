@@ -64,7 +64,7 @@ mkdir -p ~/.local/bin
 install -m 755 diskunder-linux ~/.local/bin/diskunder
 ```
 
-**Check it worked** — this should print `diskunder 6.1.0`:
+**Check it worked** — this should print `diskunder 6.2.0`:
 
 ```bash
 diskunder --version
@@ -519,6 +519,41 @@ Would quarantine 2 files from 1 group, freeing 3.2 GB (preview — nothing was c
   `deletion.dry_run_default` setting set to `no` makes `dedupe` act without `--apply` (still
   asking); `--dry-run` then previews.
 
+### Sharing blocks instead (XFS, Btrfs)
+
+`--action share` keeps every copy where it is but stores the data once: each copy on the
+kept copy's volume is made to share its blocks (Linux `FIDEDUPERANGE`). Every path keeps
+working, nothing moves, and the space is freed at once — there's nothing to restore or purge.
+
+```bash
+# On the server that has the XFS volume, against its local path
+diskunder-linux dedupe /srv/projects --action share --db /srv/index.db            # preview: SHARE rows
+diskunder-linux dedupe /srv/projects --action share --apply --db /srv/index.db
+```
+
+```text
+dedupe: shared blocks for 2 files, freeing 200.0 MB
+```
+
+- **The kernel checks first:** it compares the bytes and shares nothing if they differ, so a
+  file changed since indexing is safe.
+- **Edits stay separate:** later writing to one copy gives just the changed part its own
+  blocks; the other copies don't change.
+- **Where it works:** Linux, on XFS with reflink (`xfs_info` shows `reflink=1`, the default
+  for recent `mkfs.xfs`) or Btrfs — and run **on the server itself**: block sharing doesn't
+  work over SMB or NFS. On other filesystems each file is reported as not supported.
+- **Already shared copies are skipped** (their blocks are compared via `FIEMAP`), so running
+  it again is quick.
+- Copies on another volume can't share blocks, so they're quarantined, as without `--action`.
+- Reports still list shared copies as duplicates — the paths are still copies, but no longer
+  take space of their own.
+
+`--action hardlink` replaces each copy on the kept copy's volume with a hard link to it.
+Each is first compared byte for byte (both files are read in full), and the swap is atomic —
+a link made beside the copy is renamed over it. It can't be undone, so it always asks
+(`--yes` to skip), and the paths then share one file: one set of permissions and owner, and
+an edit through any name changes them all. Use it where `share` isn't available.
+
 ---
 
 ## Interactive app
@@ -532,7 +567,7 @@ diskunder --db /data/index.db
 ```
 
 ```text
- Jobs  Results  Database  Host  Settings  Help                 diskUnder v6.1.0 · /data/index.db
+ Jobs  Results  Database  Host  Settings  Help                 diskUnder v6.2.0 · /data/index.db
 ┌ Jobs ─────────────────────────────────┐┌ nas-nightly ────────────────────────────────────────┐
 │▸ nas-nightly    ✓ 2026-10-23 02:14    ││update · threads 4                                   │
 │  projects       ✗ failed 2026-10-19   ││path      /Volumes/NAS                               │
@@ -833,6 +868,7 @@ counted in the summary, not listed. Read-only commands (`search`, `export`, `db 
 | Reads only possible copies — size first, then a quick hash, full hash last (`--hash-all` for every file) | No | No | No | No | No | Yes (5.7) |
 | Quarantine — move files aside reversibly, with `restore` and `purge` | No | No | No | No | No | Yes (6.0) |
 | Dedupe — keep one copy per group, quarantine the rest; previews, plans, re-checks | No | No | No | No | No | Yes (6.1) |
+| Dedupe by sharing blocks (XFS, Btrfs) or hard links — every path stays | No | No | No | No | No | Yes (6.2) |
 | Backup — rename redundant copies to `.bak` in place | No | No | No | No | No | Planned (v6) |
 
 ### Background
@@ -881,7 +917,8 @@ diskunder/
 │   ├── maintenance.rs #   db info / drop / vacuum / check
 │   ├── host.rs        #   drives and mounts, host info
 │   ├── volume.rs      #   which volume a path is on
-│   ├── dedupe.rs      #   dedupe: plan, preview, re-check, quarantine
+│   ├── dedupe.rs      #   dedupe: plan, preview, re-check, act
+│   ├── blocks.rs      #   sharing blocks (FIDEDUPERANGE) and hard-linking copies
 │   ├── quarantine.rs  #   quarantine: add, list, show, restore, purge
 │   └── fmt.rs         #   formatting helpers
 ├── tests/cli.rs       # End-to-end tests (cargo test)
